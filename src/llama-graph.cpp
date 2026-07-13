@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-moe-stream.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1566,6 +1567,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
+    // async MoE expert cache (per-layer, drop-on-miss): create the layer cache now so the
+    // expert matmuls below can remap routing ids through its slot table. A missing expert
+    // resolves to a zero sentinel slot (dropped) instead of a wrong one, keeping output
+    // coherent at small cache sizes. Created and fed during prefill too, so the prompt's
+    // experts warm the cache before decode starts (the cache is only used for the decode
+    // matmuls below, but publishing the prefill selection lets the loader prefetch them).
+    llama_moe_layer_cache * moe_lc = nullptr;
+    if (cparams.moe_stream && cparams.moe_stream_async && getenv("LLAMA_MOE_ASYNC")) {
+        ggml_tensor * projs[4];
+        int np = 0;
+        if (gate_up_exps) { projs[np++] = gate_up_exps; }
+        if (gate_exps)    { projs[np++] = gate_exps; }
+        if (up_exps)      { projs[np++] = up_exps; }
+        if (down_exps)    { projs[np++] = down_exps; }
+        const char * cap_env = getenv("LLAMA_MOE_CACHE_CAP");
+        const int    cap     = cap_env ? atoi(cap_env) : 0; // 0 => full (n_expert)
+        moe_lc = llama_moe_layer_cache_get(sched, projs, np, selected_experts, cap);
+        if (moe_lc) {
+            if (n_tokens > 1) {
+                // prefill: synchronously warm the cache with the prompt's hot experts
+                llama_moe_layer_cache_warm(moe_lc, ctx0, gf, selected_experts);
+            } else {
+                // decode: feed the latest selection to the background loader
+                llama_moe_layer_cache_publish(moe_lc, ctx0, gf, selected_experts);
+            }
+        }
+    }
+
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
@@ -1612,9 +1641,84 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    // MoE expert streaming (opt-in): run each expert matmul over a compacted
+    // tensor holding only the experts selected this step, so the full
+    // [.,.,n_expert] weights never need to be resident. Routing ids are remapped
+    // into the compact tensor's slots; downstream bias/scale/weight ops keep
+    // using the original selected_experts (per-(used,token) positions are
+    // preserved). Expert LoRA is not applied on the streamed path.
+    const bool moe_stream       = cparams.moe_stream;
+    const bool moe_stream_async = cparams.moe_stream_async;
+    ggml_tensor * stream_ids = moe_stream ?
+        ggml_map_custom1(ctx0, selected_experts, llama_moe_remap_cb, 1, nullptr) : nullptr;
+    // Remap the routing ids through the async cache's slot table exactly ONCE per layer
+    // and share the result across all projections. If each projection re-read the slot
+    // table, the background loader could change it between the gate/up and down reads,
+    // routing the same position to different experts and corrupting the output.
+    ggml_tensor * moe_cache_ids = nullptr;
+    if (moe_lc && moe_stream_async && n_tokens <= 1) {
+        ggml_tensor * st = llama_moe_layer_cache_slot_table(moe_lc);
+        // Remap through the [1, n_expert] slot table. Flatten the selection to a 1D index
+        // list so ggml_get_rows uses the plain (non-batched) form, which is valid for any
+        // token count: llama-server can emit n_outputs==0 prefill ubatches (selection
+        // [n_used, 0]) that the batched form would reject. An empty or unexpected batch
+        // falls back to the compaction path below instead of aborting inside ggml.
+        const int64_t n_sel = selected_experts->ne[0] * selected_experts->ne[1];
+        if (st && n_sel > 0 && selected_experts->ne[2] == 1 && selected_experts->ne[3] == 1) {
+            ggml_tensor * flat = ggml_reshape_1d(ctx0, selected_experts, n_sel);
+            ggml_tensor * gr   = ggml_get_rows(ctx0, st, flat); // [1, n_sel]
+            moe_cache_ids      = ggml_reshape_2d(ctx0, gr, selected_experts->ne[0], selected_experts->ne[1]);
+        }
+    }
+    auto mm_id_exps = [&](ggml_tensor * exps, ggml_tensor * input) -> ggml_tensor * {
+        if (!moe_stream) {
+            return build_lora_mm_id(exps, input, selected_experts);
+        }
+        // Persistent VRAM expert cache (decode only): keep recently-used experts
+        // resident so they are not re-streamed every token (see llama-moe-stream.*).
+        if (moe_stream_async && n_tokens <= 1) {
+            // per-layer async cache with drop-on-miss (the practical async path)
+            if (moe_lc && moe_cache_ids) {
+                ggml_tensor * dev = llama_moe_layer_cache_dev(moe_lc, exps);
+                if (dev) {
+                    return ggml_mul_mat_id(ctx0, dev, input, moe_cache_ids);
+                }
+            }
+            const char * cap_env = getenv("LLAMA_MOE_CACHE_CAP");
+            const int    cap     = cap_env ? atoi(cap_env) : 0; // 0 => full (n_expert)
+            ggml_tensor * cache_ids = nullptr;
+            ggml_tensor * cache     = nullptr;
+            if (getenv("LLAMA_MOE_CACHE_GETROWS")) {
+                // ceiling test: full-resident cache + GPU-side get_rows remap (correct)
+                cache = llama_moe_cache_build_getrows(ctx0, sched, exps, selected_experts, &cache_ids);
+            } else {
+                // default: synchronous VRAM cache (correct, VRAM-tunable via LLAMA_MOE_CACHE_CAP)
+                cache = llama_moe_cache_build(ctx0, sched, exps, selected_experts, cap, false, &cache_ids);
+            }
+            if (cache && cache_ids) {
+                return ggml_mul_mat_id(ctx0, cache, input, cache_ids);
+            }
+        }
+        // Compact the expert set only for pure decode (n_tokens == 1): there the
+        // device mul_mat_id uses an ne02-invariant vector kernel (MMVQ), so running
+        // over the compacted tensor is bit-identical to the full one. For larger
+        // batches (prefill) the tiled MMQ path is ne02-sensitive and shrinking the
+        // expert count perturbs the logits, so keep the full expert count there
+        // (experts are still streamed from CPU, just not compacted).
+        int64_t k_max = n_expert;
+        if (n_tokens <= 1) {
+            const int64_t uniq = selected_experts->ne[0] * selected_experts->ne[1];
+            k_max = uniq < n_expert ? uniq : n_expert;
+        }
+        ggml_tensor * args[2] = { selected_experts, exps };
+        ggml_tensor * compact = ggml_custom_4d(ctx0, exps->type, exps->ne[0], exps->ne[1], k_max, 1,
+                                               args, 2, llama_moe_gather_cb, 1, nullptr);
+        return ggml_mul_mat_id(ctx0, compact, input, stream_ids);
+    };
+
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = mm_id_exps(gate_up_exps, cur); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (gate_up_exps_b) {
@@ -1638,7 +1742,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        up = mm_id_exps(up_exps, cur); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_b) {
@@ -1656,7 +1760,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            cur = mm_id_exps(gate_exps, cur); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -1746,7 +1850,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    experts = mm_id_exps(down_exps, cur); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {

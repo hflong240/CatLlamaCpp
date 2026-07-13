@@ -199,6 +199,10 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    // opt-in MoE expert streaming, gated by env to avoid churning the public API
+    cparams.moe_stream = getenv("LLAMA_MOE_STREAM") != nullptr;
+    cparams.moe_stream_async = getenv("LLAMA_MOE_STREAM_ASYNC") != nullptr;
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -405,6 +409,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // stop the MoE async streaming loader (if running) before tearing down buffers
+    extern void llama_moe_cache_shutdown(void);
+    llama_moe_cache_shutdown();
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];

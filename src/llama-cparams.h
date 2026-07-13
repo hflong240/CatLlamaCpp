@@ -43,6 +43,8 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool moe_stream;         // stream MoE routed experts: run matmuls over a compacted per-step tensor
+    bool moe_stream_async;   // keep experts in a persistent VRAM cache, refreshed async (stale on miss)
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;

@@ -2348,6 +2348,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-stream"},
+        "stream MoE routed-expert weights from disk on demand instead of keeping them all resident (opt-in, experimental)",
+        [](common_params & params) {
+            params.moe_stream = true;
+            // streaming compacts experts per step; keep the full expert tensors off
+            // the GPU (mmap-backed CPU) so only the selected experts reach VRAM
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM"));
+    add_opt(common_arg(
+        {"--moe-stream-cache"}, "N[MB|GB]",
+        "resident byte budget for the MoE streaming expert cache (bare number = GiB; 0 = auto)",
+        [](common_params & params, const std::string & value) {
+            // parse a size with optional MB/GB suffix; bare number is GiB
+            std::string num = value;
+            uint64_t    mult = 1024ull * 1024ull * 1024ull; // default GiB
+            auto has_suffix = [&](char a, char b) {
+                const size_t n = num.size();
+                return n >= 2 && toupper((unsigned char) num[n - 2]) == a && toupper((unsigned char) num[n - 1]) == b;
+            };
+            if (has_suffix('G', 'B')) { mult = 1024ull * 1024ull * 1024ull; num = num.substr(0, num.size() - 2); }
+            else if (has_suffix('M', 'B')) { mult = 1024ull * 1024ull; num = num.substr(0, num.size() - 2); }
+            params.moe_stream = true;
+            params.moe_stream_cache_bytes = (uint64_t) std::stoull(num) * mult;
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_CACHE"));
+    add_opt(common_arg(
+        {"--moe-stream-async"},
+        "experimental: keep routed experts in a persistent VRAM cache refreshed asynchronously; on a cache miss the "
+        "previous (stale) expert is used instead of blocking. Faster but output diverges from the non-streamed run.",
+        [](common_params & params) {
+            params.moe_stream = true;
+            params.moe_stream_async = true;
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_ASYNC"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
