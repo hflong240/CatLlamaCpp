@@ -500,6 +500,11 @@ struct common_params {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
+    // MoE routed-expert SSD streaming (opt-in); 0 cache budget means auto
+    bool     moe_stream             = false;
+    bool     moe_stream_async       = false; // stale-expert async VRAM cache (experimental, changes output)
+    uint64_t moe_stream_cache_bytes = 0;
+
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 

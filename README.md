@@ -12,6 +12,134 @@
 
 LLM inference in C/C++
 
+> [!NOTE]
+> This is the **CatEngine** fork of `llama.cpp`. In addition to everything upstream provides, it adds
+> **on-demand MoE expert streaming from disk** (run Mixture-of-Experts models whose expert weights are
+> far larger than your VRAM/RAM) and support for the **Hunyuan-v3 (`hy_v3`)** architecture. See
+> [CatEngine fork additions](#catengine-fork-additions) below. All upstream functionality is unchanged.
+
+## CatEngine fork additions
+
+This fork lets you run very large Mixture-of-Experts (MoE) models on modest hardware by keeping the
+routed expert weights **out of VRAM** and pulling only the experts each token actually needs, on the fly.
+As a milestone, it runs a **170 GB / 299B-parameter Hunyuan-v3 MoE on a single 32 GB GPU** by streaming
+experts from an SSD.
+
+### Technical background
+
+In a MoE layer only a handful of experts (e.g. 8 of 192) are active per token, yet upstream keeps the
+entire `[n_embd, n_ff, n_expert]` expert tensor resident. For large models that tensor dwarfs the rest of
+the weights, which is what forces huge VRAM/RAM requirements. This fork treats the experts as a
+three-tier cache instead:
+
+```
+SSD (mmap, full weights)  ->  RAM (OS page cache)  ->  VRAM (routing-driven expert cache)
+```
+
+Each MoE step, the router's selection drives which experts are materialized on the compute device. The
+implementation lives in [src/llama-moe-stream.cpp](src/llama-moe-stream.cpp) and hooks into
+`build_moe_ffn` in [src/llama-graph.cpp](src/llama-graph.cpp). It stays compatible with the stock
+`ggml_mul_mat_id` kernels (no custom CUDA kernels): experts are either **compacted** into a small tensor
+of just the selected experts with routing ids remapped, or served from a **persistent VRAM cache** whose
+slot table is remapped on the GPU via `get_rows`. Prefill reads are parallelized and prefetched across a
+disk-read thread pool. The design is inspired by SSD expert-streaming engines (three-tier expert cache,
+routing-driven residency) adapted to ggml's single-3D-expert-tensor layout.
+
+This coexists with the fork's existing `-fit` device-memory fitting (which spills whole layers to system
+RAM); the two spill mechanisms are independent and can be combined.
+
+### What's new
+
+- **MoE expert streaming** (opt-in, off by default): stream routed experts from disk instead of keeping
+  them resident. Three modes, see [Usage](#moe-streaming-usage).
+- **Parallel, prefetched disk I/O** for the prefill expert reads (thread pool + OS prefetch + offset-sorted
+  reads), tuned for high-throughput NVMe.
+- **Hunyuan-v3 (`hy_v3`) architecture support** ([src/models/hy-v3.cpp](src/models/hy-v3.cpp)): sigmoid
+  gating with expert-probability bias, shared experts, Q/K-norm GQA, YaRN rope. Base decoder graph only
+  (no MTP/speculative head). Reference: [ggml-org/llama.cpp#25395](https://github.com/ggml-org/llama.cpp/pull/25395).
+
+### MoE streaming usage
+
+All modes are opt-in. When streaming is enabled, the full expert tensors are forced to mmap-backed CPU
+memory (via a `--cpu-moe`-style override) so only the selected/cached experts occupy VRAM.
+
+| Flag | What it does | Correctness | Notes |
+|------|--------------|-------------|-------|
+| `--moe-stream` | **Compaction.** Each step, only the experts selected that step are copied to VRAM. | Byte-identical to a non-streamed run | Largest VRAM saving, lowest throughput (experts move over PCIe every token). |
+| `--moe-stream-async` | **Persistent VRAM expert cache** (despite the name, the default sub-mode is *synchronous* and correct). Hot experts stay resident and are reused across tokens. | Byte-identical | Size it with `LLAMA_MOE_CACHE_CAP`. Best balance of VRAM vs speed. |
+| `--moe-stream-cache N[MB\|GB]` | Implies `--moe-stream` and records a resident byte budget. | Byte-identical | Reserved knob; today cache sizing is done in experts-per-layer via `LLAMA_MOE_CACHE_CAP`. |
+
+Two environment sub-modes layer on top of `--moe-stream-async`:
+
+- `LLAMA_MOE_CACHE_GETROWS=1` - full-resident cache with a GPU-side `get_rows` remap. Fastest **correct**
+  path (close to non-streamed speed) but uses full expert VRAM.
+- `LLAMA_MOE_ASYNC=1` - **experimental** per-layer cache refreshed by a background loader. On a cache miss
+  the expert is *dropped* (zeroed) rather than blocking, so throughput stays high at small cache sizes but
+  the output diverges from a non-streamed run. This is the path that runs the 170 GB model on 32 GB VRAM.
+  It works well on **robust** production MoEs (they degrade gracefully to occasional word glitches) but
+  produces garbage on **fragile** merged models that cannot tolerate any dropped expert. Prefill still
+  synchronously warms the cache with the prompt's hot experts, so the divergence only affects generation.
+
+Example (large MoE that exceeds VRAM, streaming experts from disk):
+
+```sh
+# Persistent VRAM cache, 24 experts/layer resident, async drop-on-miss loader
+set LLAMA_MOE_ASYNC=1
+set LLAMA_MOE_CACHE_CAP=24
+llama-cli -m big-moe.gguf -ngl 99 --moe-stream-async -p "Hello"
+
+# Correct, byte-identical persistent cache (no dropping); tune VRAM with the cap
+set LLAMA_MOE_CACHE_CAP=64
+llama-cli -m moe.gguf -ngl 99 --moe-stream-async -p "Hello"
+
+# Maximum VRAM saving, byte-identical, slowest
+llama-cli -m moe.gguf -ngl 99 --moe-stream -p "Hello"
+```
+
+> [!NOTE]
+> Streaming engages on the real inference graph. This fork's `-fit` device-fitting runs a separate
+> measurement pass first; pass `-fit off` if you want to rule it out when benchmarking streaming.
+
+> [!IMPORTANT]
+> **`llama-server`: run with `-np 1`.** The persistent VRAM cache and async fast paths only engage on
+> single-token decode steps (`n_tokens <= 1`). `llama-server`'s continuous batching processes all parallel
+> slots in one step, so with `-np N` (N > 1) - or whenever multiple requests are batched together - each
+> step has `n_tokens > 1` and **bypasses the fast cache path**, falling back to per-step compaction. That
+> is still correct but much slower, and with `LLAMA_MOE_ASYNC=1` it re-runs the synchronous prompt warm
+> every step (very slow). Use `-np 1` so decode stays single-token; be aware concurrent clients still get
+> batched and lose the fast path. Server use of these features is otherwise validated only for single-stream
+> decode (`llama-cli`/`llama-completion`) - treat it as experimental.
+
+### Tuning (environment variables)
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `LLAMA_MOE_CACHE_CAP=N` | `0` (all experts) | Experts-per-layer kept resident in the VRAM cache. Trades VRAM for speed/quality. |
+| `LLAMA_MOE_CACHE_GETROWS=1` | off | With `--moe-stream-async`: full-resident cache, GPU `get_rows` remap (fastest correct path). |
+| `LLAMA_MOE_ASYNC=1` | off | With `--moe-stream-async`: experimental drop-on-miss async loader. |
+| `LLAMA_MOE_IO_THREADS=N` | `16` | Parallel disk-read threads for prefill expert warm/gather. Raise on fast NVMe. |
+| `LLAMA_MOE_NOLOADER=1` | off | Diagnostic: freeze the cache (disable background loading). |
+
+### Performance and caveats
+
+Measured on an RTX 5090 (32 GB), greedy decode:
+
+- **gemma-style MoE, 128 experts / 8 used** (fits in VRAM; used to validate correctness):
+  `--moe-stream` ~2.8 GB VRAM; `--moe-stream-async` at `CAP=64` ~10 GB VRAM; `+LLAMA_MOE_CACHE_GETROWS=1`
+  (full) approaches the non-streamed throughput. All three are **byte-identical** to the non-streamed run.
+- **Hunyuan-v3, 192 experts / 8 used, 170 GB Q4** (does not fit in VRAM *or* RAM):
+  `--moe-stream-async` + `LLAMA_MOE_ASYNC=1` + `CAP=24` fits in ~30.7 GB VRAM with coherent, correct
+  output and ~53 tok/s decode.
+
+Caveats:
+
+- **Decode is fast once warm; prefill is disk-bound.** On a SATA SSD the prompt's expert reads saturate at
+  roughly the drive's scattered-read bandwidth. The I/O path (parallel + prefetched + offset-sorted) is
+  built to exploit NVMe, where scattered reads run at full bandwidth; raise `LLAMA_MOE_IO_THREADS` there.
+- The `LLAMA_MOE_ASYNC=1` drop-on-miss path is **experimental** and only suitable for robust MoEs.
+- Expert LoRA is not applied on the streamed path.
+- These features are a fork-local addition and are **not** proposed upstream.
+
 ## Recent API changes
 
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
@@ -143,7 +271,7 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 - [X] [Trillion-7B-preview](https://huggingface.co/trillionlabs/Trillion-7B-preview)
 - [x] [Ling models](https://huggingface.co/collections/inclusionAI/ling-67c51c85b34a7ea0aba94c32)
 - [x] [LFM2 models](https://huggingface.co/collections/LiquidAI/lfm2-686d721927015b2ad73eaa38)
-- [x] [Hunyuan models](https://huggingface.co/collections/tencent/hunyuan-dense-model-6890632cda26b19119c9c5e7)
+- [x] [Hunyuan models](https://huggingface.co/collections/tencent/hunyuan-dense-model-6890632cda26b19119c9c5e7) (incl. Hunyuan-v3 `hy_v3`, CatEngine fork)
 - [x] [BailingMoeV2 (Ring/Ling 2.0) models](https://huggingface.co/collections/inclusionAI/ling-v2-68bf1dd2fc34c306c1fa6f86)
 - [x] [Mellum models](https://huggingface.co/JetBrains/models?search=mellum)
 

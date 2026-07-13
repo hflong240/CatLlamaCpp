@@ -1586,6 +1586,29 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 
+    // MoE expert streaming is read from the environment by llama_context; set it
+    // here so it is in place before the context is created.
+    if (params.moe_stream) {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            LOG_WRN("MoE expert streaming enabled (experimental): routed experts stay in CPU/RAM (mmap) and are "
+                    "compacted per step to the compute device; only the selected experts reach VRAM\n");
+        }
+#ifdef _WIN32
+        _putenv_s("LLAMA_MOE_STREAM", "1");
+#else
+        setenv("LLAMA_MOE_STREAM", "1", 1);
+#endif
+    }
+    if (params.moe_stream_async) {
+#ifdef _WIN32
+        _putenv_s("LLAMA_MOE_STREAM_ASYNC", "1");
+#else
+        setenv("LLAMA_MOE_STREAM_ASYNC", "1", 1);
+#endif
+    }
+
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
