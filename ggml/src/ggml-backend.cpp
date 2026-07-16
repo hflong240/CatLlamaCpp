@@ -1546,10 +1546,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // MoE split-tax diagnostic (GGML_MOE_SPLIT_DIAG=1): per compute-splits call, accumulate wall time in
+    // (a) the input-copy+sync prologue of CPU-backend splits vs GPU-backend splits, and (b) the
+    // compute-async of each, plus the number of splits. Single-token decode has one splits call per
+    // token, so this prints the per-token breakdown: how much of the ~546ms "split tax" is the device
+    // synchronize/input-copy before a CPU (map_custom) split vs the GPU compute itself. Off by default.
+    static const bool split_diag = getenv("GGML_MOE_SPLIT_DIAG") != nullptr;
+    static int64_t sd_cpu_copy_ns = 0, sd_gpu_copy_ns = 0, sd_cpu_comp_ns = 0, sd_gpu_comp_ns = 0;
+    static int64_t sd_calls = 0, sd_cpu_splits = 0, sd_gpu_splits = 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const bool sd_is_cpu = split_diag && (split_backend_id == sched->n_backends - 1); // last backend is CPU
+        const int64_t sd_copy0 = split_diag ? ggml_time_us() : 0;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1674,11 +1685,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (split_diag) {
+            const int64_t now = ggml_time_us();
+            if (sd_is_cpu) { sd_cpu_copy_ns += now - sd_copy0; sd_cpu_splits++; }
+            else           { sd_gpu_copy_ns += now - sd_copy0; sd_gpu_splits++; }
+        }
+        const int64_t sd_comp0 = split_diag ? ggml_time_us() : 0;
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
+            // for the diagnostic, force the async compute to settle so the timer reflects real GPU time
+            // (only when diag is on; normal runs keep the async overlap). CPU splits are already sync.
+            if (split_diag && !sd_is_cpu) { ggml_backend_synchronize(split_backend); }
         } else {
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
@@ -1718,6 +1739,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
+        }
+
+        if (split_diag) {
+            const int64_t now = ggml_time_us();
+            if (sd_is_cpu) { sd_cpu_comp_ns += now - sd_comp0; }
+            else           { sd_gpu_comp_ns += now - sd_comp0; }
+        }
+    }
+
+    if (split_diag && sched->n_splits > 1) {
+        sd_calls++;
+        if (sd_calls % 64 == 0) {
+            const double f = 1000.0 * 64.0; // us -> ms, averaged over 64 calls
+            GGML_LOG_WARN("MoE split-diag/64-calls: %d splits (%d CPU + %d GPU) | "
+                          "CPU-split copy/sync %.1fms compute %.1fms | GPU-split copy/sync %.1fms compute %.1fms\n",
+                          (int)((sd_cpu_splits + sd_gpu_splits)/64), (int)(sd_cpu_splits/64), (int)(sd_gpu_splits/64),
+                          sd_cpu_copy_ns/f, sd_cpu_comp_ns/f, sd_gpu_copy_ns/f, sd_gpu_comp_ns/f);
+            sd_cpu_copy_ns = sd_gpu_copy_ns = sd_cpu_comp_ns = sd_gpu_comp_ns = 0;
+            sd_cpu_splits = sd_gpu_splits = 0;
         }
     }
 

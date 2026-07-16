@@ -2022,6 +2022,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    // MoE token-boundary backpressure sync (fork): on the single-token decode path, if
+    // LLAMA_MOE_SYNC_BOUNDARY=N is set, force this token's compute to finish and then synchronously
+    // load any of each layer's top-N (highest-weight) experts the background loader has not kept
+    // resident, before the next token's graph is built. This bounds how far generation can drift on
+    // stale experts to one token while decode itself stays on the pure-GPU path. Only forces the
+    // (otherwise deferred) sync when enabled, so the default async overlap is unaffected. Reading the
+    // graph output on the next step would sync anyway, so the added cost here is ~nil.
+    if (n_tokens_all == 1 && cparams.moe_stream_async) {
+        static const int moe_boundary_budget = []() {
+            const char * e = getenv("LLAMA_MOE_SYNC_BOUNDARY");
+            const int b = e ? atoi(e) : 0;
+            return b > 0 ? b : 0;
+        }();
+        if (moe_boundary_budget > 0) {
+            extern int llama_moe_boundary_sync(int budget);
+            synchronize();
+            llama_moe_boundary_sync(moe_boundary_budget);
+        }
+    }
+
     return 0;
 }
 

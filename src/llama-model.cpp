@@ -1612,6 +1612,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // Register expert weight tensors' on-disk locations so the MoE streaming cache can read experts
+    // directly from the model file (no-mmap takeover), bypassing the OS page cache. Only meaningful
+    // for the fork's MoE streaming; harmless otherwise (the cache only consults this if LLAMA_MOE_NOMMAP
+    // is set). Uses each tensor's file index + absolute data offset from the loader's weights map.
+    {
+        extern void llama_moe_register_expert_file(const struct ggml_tensor * exps, const char * path, uint64_t file_offset);
+        auto reg = [&](const ggml_tensor * t) {
+            if (!t) { return; }
+            const auto * w = ml.get_weight(ggml_get_name(t));
+            if (!w) { return; }
+            if (w->idx >= ml.file_paths.size() || ml.file_paths[w->idx].empty()) { return; }
+            llama_moe_register_expert_file(t, ml.file_paths[w->idx].c_str(), (uint64_t) w->offs);
+        };
+        for (auto & layer : layers) {
+            reg(layer.ffn_gate_exps);
+            reg(layer.ffn_up_exps);
+            reg(layer.ffn_down_exps);
+            reg(layer.ffn_gate_up_exps);
+        }
+    }
+
     return true;
 }
 

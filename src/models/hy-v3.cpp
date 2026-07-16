@@ -153,6 +153,24 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
         cur = build_norm(ffn_inp, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
+        // MoE routing-lookahead probe (fork, LLAMA_MOE_LOOKAHEAD_PROBE): predict layer il+1's expert
+        // routing from THIS layer's just-computed normalized hidden `cur` (NeutronStar-style one-layer
+        // lookahead). This is a self-contained pure-GPU subgraph (gate matmul + sigmoid + bias + top-k)
+        // that feeds NOTHING downstream, so it cannot perturb real output. Tagged ffn_moe_topk_pred so
+        // the debug eval callback dumps it; diff against the actual ffn_moe_topk-(il+1) to measure how
+        // well one-layer-ahead prediction works on hy3 (the go/no-go for real lookahead prefetch).
+        if (getenv("LLAMA_MOE_LOOKAHEAD_PROBE") && il + 1 < n_layer &&
+            model.layers[il + 1].ffn_gate_inp != nullptr) {
+            ggml_tensor * pl = build_lora_mm(model.layers[il + 1].ffn_gate_inp, cur); // [n_expert, n_tokens]
+            pl = ggml_sigmoid(ctx0, pl);
+            if (model.layers[il + 1].ffn_exp_probs_b != nullptr) {
+                pl = ggml_add(ctx0, pl, model.layers[il + 1].ffn_exp_probs_b);
+            }
+            ggml_tensor * pred = ggml_argsort_top_k(ctx0, pl, n_expert_used); // [n_expert_used, n_tokens]
+            cb(pred, "ffn_moe_topk_pred", il + 1); // tag with the PREDICTED layer's index
+            ggml_build_forward_expand(gf, pred);   // keep it in the graph though nothing consumes it
+        }
+
         if (model.layers[il].ffn_gate_inp == nullptr) {
             // dense FFN (leading dense block)
             cur = build_ffn(cur,

@@ -160,3 +160,5 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+start_claude_code.cmd
+start_claude_code.ps1
