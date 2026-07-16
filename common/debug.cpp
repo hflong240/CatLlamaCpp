@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstring>
 #include <regex>
 #include <string>
 #include <vector>
@@ -179,6 +180,28 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         auto n_bytes = ggml_nbytes(t);
         pimpl->data.resize(n_bytes);
         ggml_backend_tensor_get(t, pimpl->data.data(), 0, n_bytes);
+    }
+
+    // MoE routing-stability probe (fork): dump the ffn_moe_topk-<il> node (i32 [n_expert_used, n_tokens],
+    // argsort descending so position 0 = top-1) as clean, machine-parseable lines - one per (layer, token
+    // position) - so two runs (stale vs correct expert residency) over the SAME prompt can be diffed
+    // per-(layer,pos) to measure how much stale experts perturb routing. Layer index comes from the node
+    // name (graph_get_cb formats "<name>-<il>"). No effect unless the tensor name starts with ffn_moe_topk.
+    if (t->type == GGML_TYPE_I32 && strncmp(t->name, "ffn_moe_topk", 12) == 0) {
+        const bool is_pred = strncmp(t->name, "ffn_moe_topk_pred", 17) == 0;
+        const int il = [&]() { const char * d = strrchr(t->name, '-'); return d ? atoi(d + 1) : -1; }();
+        const int32_t * ids = (const int32_t *) (is_host ? (const uint8_t *) t->data : pimpl->data.data());
+        const int64_t n_used = t->ne[0];
+        const int64_t n_pos  = t->ne[1];
+        for (int64_t p = 0; p < n_pos; ++p) {
+            std::string line;
+            for (int64_t u = 0; u < n_used; ++u) {
+                if (u) { line += ','; }
+                line += std::to_string(ids[p * n_used + u]);
+            }
+            LOG("MOE_TOPK kind=%s layer=%d pos=%lld ids=%s\n", is_pred ? "pred" : "real",
+                il, (long long) p, line.c_str());
+        }
     }
 
     if (!ggml_is_quantized(t->type) && matches_filter) {

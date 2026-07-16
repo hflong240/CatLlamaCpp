@@ -1406,6 +1406,45 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// Static per-layer hybrid decode probe (LLAMA_MOE_CPU_LAYERS): decide whether layer `il` takes the
+// CPU-sync path. `spec` is fixed for the whole run so the decode topology stays stable. Accepts:
+//   "even" / "odd"        - alternating layers
+//   "firstN" / "lastN"    - the first / last N MoE-eligible layers (by absolute index over n_layer)
+//   "A,B,C" / "A B C"      - an explicit list of layer indices
+// Returns true if il is in the CPU set. Parsed once and cached (thread-safe static init).
+static bool llama_moe_layer_is_cpu_set(const std::string & spec, int il, int n_layer) {
+    struct parsed {
+        int mode = 0; // 0=list, 1=even, 2=odd, 3=first, 4=last
+        int n = 0;
+        std::vector<int> list;
+    };
+    static const parsed p = [&]() {
+        parsed r;
+        if (spec == "even")      { r.mode = 1; }
+        else if (spec == "odd")  { r.mode = 2; }
+        else if (spec.rfind("first", 0) == 0) { r.mode = 3; r.n = atoi(spec.c_str() + 5); }
+        else if (spec.rfind("last", 0) == 0)  { r.mode = 4; r.n = atoi(spec.c_str() + 4); }
+        else {
+            std::string cur;
+            for (char ch : spec) {
+                if (ch == ',' || ch == ' ') { if (!cur.empty()) { r.list.push_back(atoi(cur.c_str())); cur.clear(); } }
+                else { cur += ch; }
+            }
+            if (!cur.empty()) { r.list.push_back(atoi(cur.c_str())); }
+        }
+        return r;
+    }();
+    switch (p.mode) {
+        case 1: return (il % 2) == 0;
+        case 2: return (il % 2) == 1;
+        case 3: return il < p.n;
+        case 4: return il >= n_layer - p.n;
+        default:
+            for (int x : p.list) { if (x == il) { return true; } }
+            return false;
+    }
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -1568,12 +1607,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // async MoE expert cache (per-layer, drop-on-miss): create the layer cache now so the
-    // expert matmuls below can remap routing ids through its slot table. A missing expert
-    // resolves to a zero sentinel slot (dropped) instead of a wrong one, keeping output
-    // coherent at small cache sizes. Created and fed during prefill too, so the prompt's
-    // experts warm the cache before decode starts (the cache is only used for the decode
-    // matmuls below, but publishing the prefill selection lets the loader prefetch them).
+    // expert matmuls below can remap routing ids through it. A CPU remap callback resolves each
+    // routed expert to its resident cache slot; a missing expert resolves to a zero sentinel slot
+    // (dropped) unless this step's miss fraction exceeds a threshold, in which case the missing
+    // experts are synchronously loaded first. This runs for prefill too: the cold first step
+    // sync-loads the prompt's hot experts (replacing the old separate warm pass), so a long prompt
+    // no longer reads ~every expert of every layer from disk - it is bounded to `capacity`.
     llama_moe_layer_cache * moe_lc = nullptr;
+    float moe_sync_threshold = 0.5f;
     if (cparams.moe_stream && cparams.moe_stream_async && getenv("LLAMA_MOE_ASYNC")) {
         ggml_tensor * projs[4];
         int np = 0;
@@ -1583,15 +1624,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (down_exps)    { projs[np++] = down_exps; }
         const char * cap_env = getenv("LLAMA_MOE_CACHE_CAP");
         const int    cap     = cap_env ? atoi(cap_env) : 0; // 0 => full (n_expert)
+        const char * thr_env = getenv("LLAMA_MOE_SYNC_THRESHOLD");
+        if (thr_env) { moe_sync_threshold = (float) atof(thr_env); }
         moe_lc = llama_moe_layer_cache_get(sched, projs, np, selected_experts, cap);
-        if (moe_lc) {
-            if (n_tokens > 1) {
-                // prefill: synchronously warm the cache with the prompt's hot experts
-                llama_moe_layer_cache_warm(moe_lc, ctx0, gf, selected_experts);
-            } else {
-                // decode: feed the latest selection to the background loader
-                llama_moe_layer_cache_publish(moe_lc, ctx0, gf, selected_experts);
-            }
+        if (moe_lc && n_tokens <= 1) {
+            // decode: feed the latest selection to the background loader so it can warm the
+            // sub-threshold misses this step dropped, keeping later tokens near-resident
+            llama_moe_layer_cache_publish(moe_lc, ctx0, gf, selected_experts);
         }
     }
 
@@ -1651,52 +1690,101 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const bool moe_stream_async = cparams.moe_stream_async;
     ggml_tensor * stream_ids = moe_stream ?
         ggml_map_custom1(ctx0, selected_experts, llama_moe_remap_cb, 1, nullptr) : nullptr;
-    // Remap the routing ids through the async cache's slot table exactly ONCE per layer
-    // and share the result across all projections. If each projection re-read the slot
-    // table, the background loader could change it between the gate/up and down reads,
-    // routing the same position to different experts and corrupting the output.
+    // Remap the routing ids through the async cache exactly ONCE per layer and share the result
+    // across all projections. If each projection re-resolved residency, the background loader
+    // could change slots between the gate/up and down reads, routing the same position to
+    // different experts and corrupting the output.
+    //
+    // PREFILL (n_tokens>1): a CPU remap that synchronously sync-loads the prompt's hot experts
+    // when the miss fraction is high (the cold first step), bounding disk reads to `capacity`.
+    // A CPU op is fine here - prefill is throughput-bound, not per-token-latency-bound.
+    //
+    // DECODE (n_tokens<=1): default is a pure on-device get_rows over the slot table, NO CPU op in
+    // the critical path (a map_custom op forces a CPU/GPU scheduler split per MoE layer, which hurts
+    // decode throughput). The background loader keeps hot experts resident and rare misses drop to the
+    // sentinel. Opt into an in-line decode sync-load for better coherence on churny prompts:
+    //   LLAMA_MOE_SYNC_BUDGET=N - sync-load only the N highest-weight positions' misses (top-K), rest drop
+    //   LLAMA_MOE_SYNC_DECODE=1 - threshold-gated all-or-nothing sync (heavier)
+    // With a warm RAM tier these syncs read from locked RAM, not disk, so the CPU-op cost is far lower
+    // than the disk-bound worst case.
     ggml_tensor * moe_cache_ids = nullptr;
-    if (moe_lc && moe_stream_async && n_tokens <= 1) {
-        ggml_tensor * st = llama_moe_layer_cache_slot_table(moe_lc);
-        // Remap through the [1, n_expert] slot table. Flatten the selection to a 1D index
-        // list so ggml_get_rows uses the plain (non-batched) form, which is valid for any
-        // token count: llama-server can emit n_outputs==0 prefill ubatches (selection
-        // [n_used, 0]) that the batched form would reject. An empty or unexpected batch
-        // falls back to the compaction path below instead of aborting inside ggml.
+    if (moe_lc && moe_stream_async) {
         const int64_t n_sel = selected_experts->ne[0] * selected_experts->ne[1];
-        if (st && n_sel > 0 && selected_experts->ne[2] == 1 && selected_experts->ne[3] == 1) {
-            ggml_tensor * flat = ggml_reshape_1d(ctx0, selected_experts, n_sel);
-            ggml_tensor * gr   = ggml_get_rows(ctx0, st, flat); // [1, n_sel]
-            moe_cache_ids      = ggml_reshape_2d(ctx0, gr, selected_experts->ne[0], selected_experts->ne[1]);
+        const bool ok_shape = n_sel > 0 && selected_experts->ne[2] == 1 && selected_experts->ne[3] == 1;
+        bool decode_cpu_sync = getenv("LLAMA_MOE_SYNC_DECODE") || getenv("LLAMA_MOE_SYNC_BUDGET");
+        // Static per-layer hybrid probe (LLAMA_MOE_CPU_LAYERS): a fixed, run-constant set of layer
+        // indices that take the CPU-sync path on decode; all other layers take the pure-GPU stale
+        // path. The set is fixed for the whole run so the graph topology stays stable (graph reuse +
+        // CUDA-graph warmup preserved) - this isolates "does the split tax scale with the CPU-layer
+        // count" and "can any fixed partition stay coherent" without paying per-token rebuild churn.
+        // Accepts a comma/space list, or "even"/"odd", or "firstN"/"lastN" (N = count). il-gated.
+        if (!decode_cpu_sync && n_tokens <= 1) {
+            static const std::string spec = []() {
+                const char * e = getenv("LLAMA_MOE_CPU_LAYERS");
+                return std::string(e ? e : "");
+            }();
+            if (!spec.empty() && llama_moe_layer_is_cpu_set(spec, il, n_layer)) {
+                decode_cpu_sync = true;
+            }
+        }
+        if (n_tokens > 1 || decode_cpu_sync) {
+            moe_cache_ids = llama_moe_layer_cache_remap(moe_lc, ctx0, selected_experts, moe_sync_threshold);
+        } else if (ok_shape) {
+            // decode: device get_rows over the [1,n_expert] STALE table (no CPU split). Flatten to
+            // 1D so get_rows uses the plain (non-batched) form, valid for any token count. Unlike the
+            // slot table, every stale-table entry is a real slot in [0,capacity): a non-resident expert
+            // reuses a real (stale) expert instead of the zero sentinel, so the FFN branch is never
+            // zeroed. The background loader (and the optional token-boundary sync) keep it current.
+            ggml_tensor * st = llama_moe_layer_cache_stale_table(moe_lc);
+            if (st) {
+                ggml_tensor * flat = ggml_reshape_1d(ctx0, selected_experts, n_sel);
+                ggml_tensor * gr   = ggml_get_rows(ctx0, st, flat); // [1, n_sel]
+                moe_cache_ids      = ggml_reshape_2d(ctx0, gr, selected_experts->ne[0], selected_experts->ne[1]);
+            }
+        }
+        if (getenv("LLAMA_MOE_DIAG") && n_tokens <= 1) {
+            static bool logged = false;
+            if (!logged) { logged = true;
+                LLAMA_LOG_WARN("MoE DIAG decode path: moe_lc=%d ok_shape=%d stale_table=%d moe_cache_ids=%d "
+                               "(cache_ids!=null => pure-GPU get_rows; null => SLOW fallback)\n",
+                               moe_lc != nullptr, (int) ok_shape,
+                               llama_moe_layer_cache_stale_table(moe_lc) != nullptr, moe_cache_ids != nullptr);
+            }
         }
     }
     auto mm_id_exps = [&](ggml_tensor * exps, ggml_tensor * input) -> ggml_tensor * {
         if (!moe_stream) {
             return build_lora_mm_id(exps, input, selected_experts);
         }
-        // Persistent VRAM expert cache (decode only): keep recently-used experts
-        // resident so they are not re-streamed every token (see llama-moe-stream.*).
-        if (moe_stream_async && n_tokens <= 1) {
-            // per-layer async cache with drop-on-miss (the practical async path)
+        // Per-layer async cache (the practical async path). The remap above froze one slot
+        // assignment for the whole layer (moe_cache_ids), shared across gate/up/down: a CPU
+        // threshold sync-load on prefill, a pure-GPU get_rows on decode.
+        if (moe_stream_async) {
             if (moe_lc && moe_cache_ids) {
                 ggml_tensor * dev = llama_moe_layer_cache_dev(moe_lc, exps);
                 if (dev) {
                     return ggml_mul_mat_id(ctx0, dev, input, moe_cache_ids);
                 }
             }
-            const char * cap_env = getenv("LLAMA_MOE_CACHE_CAP");
-            const int    cap     = cap_env ? atoi(cap_env) : 0; // 0 => full (n_expert)
-            ggml_tensor * cache_ids = nullptr;
-            ggml_tensor * cache     = nullptr;
-            if (getenv("LLAMA_MOE_CACHE_GETROWS")) {
-                // ceiling test: full-resident cache + GPU-side get_rows remap (correct)
-                cache = llama_moe_cache_build_getrows(ctx0, sched, exps, selected_experts, &cache_ids);
-            } else {
-                // default: synchronous VRAM cache (correct, VRAM-tunable via LLAMA_MOE_CACHE_CAP)
-                cache = llama_moe_cache_build(ctx0, sched, exps, selected_experts, cap, false, &cache_ids);
-            }
-            if (cache && cache_ids) {
-                return ggml_mul_mat_id(ctx0, cache, input, cache_ids);
+            // per-layer cache unavailable (LLAMA_MOE_ASYNC off, creation failed, or an empty
+            // ubatch where moe_cache_ids is null): the per-tensor caches below assume decode
+            // (n_tokens<=1) - keep them as the decode fallback exactly as before. Prefill without
+            // a usable layer cache falls through to the compaction gather.
+            if (n_tokens <= 1) {
+                const char * cap_env = getenv("LLAMA_MOE_CACHE_CAP");
+                const int    cap     = cap_env ? atoi(cap_env) : 0; // 0 => full (n_expert)
+                ggml_tensor * cache_ids = nullptr;
+                ggml_tensor * cache     = nullptr;
+                if (getenv("LLAMA_MOE_CACHE_GETROWS")) {
+                    // ceiling test: full-resident cache + GPU-side get_rows remap (correct)
+                    cache = llama_moe_cache_build_getrows(ctx0, sched, exps, selected_experts, &cache_ids);
+                } else {
+                    // default: synchronous VRAM cache (correct, VRAM-tunable via LLAMA_MOE_CACHE_CAP)
+                    cache = llama_moe_cache_build(ctx0, sched, exps, selected_experts, cap, false, &cache_ids);
+                }
+                if (cache && cache_ids) {
+                    return ggml_mul_mat_id(ctx0, cache, input, cache_ids);
+                }
             }
         }
         // Compact the expert set only for pure decode (n_tokens == 1): there the

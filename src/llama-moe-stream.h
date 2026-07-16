@@ -117,6 +117,23 @@ int llama_moe_compaction(const int32_t * ids,
                          int32_t       * slot_of_pos,
                          int32_t       * expert_of_slot);
 
+// Decide whether a step's routed experts require a synchronous sync-load, given a per-expert
+// selection frequency table `freq[n_expert]` and the cache's current residency `expert_slot`
+// (slot per expert, or -1 if not resident). Fills the count of unique selected experts and of
+// misses (non-resident uniques), and writes ALL selected expert ids into `out_ranked`
+// (size >= n_expert) ordered by descending frequency then ascending id, with `out_n_ranked`
+// == n_unique. The caller keeps the top `capacity` of `out_ranked` resident and drops the rest.
+// Returns true when the miss fraction exceeds `threshold` (i.e. sync-load is warranted).
+bool llama_moe_plan_remap(const int * freq,
+                          int         n_expert,
+                          const int32_t * expert_slot,
+                          float       threshold,
+                          int *       out_n_unique,
+                          int *       out_n_miss,
+                          int32_t *   out_ranked,
+                          int *       out_n_ranked);
+
+
 // ggml custom-op callbacks, registered by the graph builder.
 struct ggml_tensor;
 
@@ -178,6 +195,24 @@ ggml_tensor * llama_moe_cache_build_async(ggml_context *       ctx0,
 // Stop the async loader thread (call before the model/CUDA context is destroyed).
 void llama_moe_cache_shutdown(void);
 
+// Token-boundary backpressure sync (decode only). Call once per generated token AFTER the graph has
+// computed and the GPU is synced, BEFORE the next token's graph is built. Synchronously loads the
+// top-`budget` (highest-weight) experts of every layer that the background loader has not kept
+// resident, blocking the next token until they land - so generation drifts on stale experts by at most
+// one token. Decode itself stays on the pure-GPU stale_table path (no per-layer CPU op); this is a
+// once-per-token backstop that only stalls when the loader fell behind. Returns experts loaded (0 => no
+// stall). No-op if budget<=0. Safe to call unconditionally on the single-token decode path.
+int llama_moe_boundary_sync(int budget);
+
+// Register the on-disk location of an expert weight tensor so the layer cache can read experts
+// directly from the model file (fread) instead of from the tensor's mmap-backed `data` pointer.
+// This is the "no-mmap takeover" path: it lets the cache avoid touching the OS page cache for
+// experts entirely (the page cache cannot be evicted per-expert on Windows, so leaving experts
+// there thrashes RAM when the model is larger than RAM). `file_offset` is the absolute byte
+// offset of expert 0 of `exps` in `path`. Call once per expert tensor after model load, before
+// the first graph build. Only consulted when LLAMA_MOE_NOMMAP is set.
+void llama_moe_register_expert_file(const ggml_tensor * exps, const char * path, uint64_t file_offset);
+
 //
 // Per-layer async expert cache with drop-on-miss (the practical async path).
 //
@@ -205,6 +240,11 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
 // Device slot table [1,n_expert] i32 (expert -> cache slot, sentinel `capacity` if missing).
 ggml_tensor * llama_moe_layer_cache_slot_table(llama_moe_layer_cache * c);
 
+// Device stale table [1,n_expert] i32 (expert -> a REAL settled slot in [0,capacity), never sentinel).
+// The pure-GPU decode remap reads this so a non-resident expert reuses a real (stale) expert instead of
+// zeroing the FFN branch. Kept consistent with slot_table by the loader and the boundary sync.
+ggml_tensor * llama_moe_layer_cache_stale_table(llama_moe_layer_cache * c);
+
 // Device cache tensor [ne0,ne1,capacity+1] for one projection (matched by its `exps`).
 ggml_tensor * llama_moe_layer_cache_dev(llama_moe_layer_cache * c, const ggml_tensor * exps);
 
@@ -214,9 +254,16 @@ void llama_moe_layer_cache_publish(llama_moe_layer_cache * c,
                                    ggml_cgraph *           gf,
                                    ggml_tensor *           selected_experts);
 
-// Synchronously warm the cache from a prefill selection (loads the most-frequent experts
-// in the compute stream). Call during prefill so decode starts with a hot, correct cache.
-void llama_moe_layer_cache_warm(llama_moe_layer_cache * c,
-                                ggml_context *          ctx0,
-                                ggml_cgraph *           gf,
-                                ggml_tensor *           selected_experts);
+// Remap `selected_experts` [n_used,n_tokens] to cache-slot ids [n_used,n_tokens] i32 via a CPU
+// op (map_custom1). Resident experts resolve to their slot; misses resolve to the zero sentinel
+// slot (`capacity`, dropped) UNLESS this step's miss fraction exceeds `threshold`, in which case
+// the missing experts are synchronously loaded into free/LRU slots first (bounded by capacity).
+// Works for prefill (n_tokens>1) and decode (n_tokens<=1): the cold first step sync-loads the
+// prompt's experts, later steps run near-resident and drop rare misses. The returned ids tensor
+// is shared across all projections of the layer (a single frozen slot assignment per step). The
+// slots it resolves are pinned so the background loader will not evict them before the matmul
+// that consumes these ids has run. Returns nullptr if the cache/selection is unusable.
+ggml_tensor * llama_moe_layer_cache_remap(llama_moe_layer_cache * c,
+                                          ggml_context *          ctx0,
+                                          ggml_tensor *           selected_experts,
+                                          float                   threshold);

@@ -102,6 +102,58 @@ int main() {
         CHECK(slot_of_pos[0] == 0 && slot_of_pos[1] == 0 && slot_of_pos[2] == 0);
     }
 
+    // --- threshold remap planning (llama_moe_plan_remap) ---
+    {
+        const int n_expert = 8;
+        // freq: experts 1,3,4,7 selected; 4 is hottest (3x), then 1 (2x), then 3,7 (1x)
+        int freq[8] = { 0, 2, 0, 1, 3, 0, 0, 1 };
+
+        // residency: experts 1 and 4 resident (slots 0,2); 3 and 7 are misses => 2/4 = 0.5 miss
+        int32_t expert_slot[8] = { -1, 0, -1, -1, 2, -1, -1, -1 };
+        int n_unique = 0, n_miss = 0, n_ranked = 0;
+        int32_t ranked[8] = {};
+
+        // threshold 0.5: miss fraction (0.5) is NOT > 0.5 => no sync
+        bool sync = llama_moe_plan_remap(freq, n_expert, expert_slot, 0.5f,
+                                         &n_unique, &n_miss, ranked, &n_ranked);
+        CHECK(n_unique == 4);
+        CHECK(n_miss == 2);
+        CHECK(n_ranked == 4);
+        CHECK(sync == false);
+        // ranked by descending freq, ties by ascending id: 4(3),1(2),3(1),7(1)
+        CHECK(ranked[0] == 4);
+        CHECK(ranked[1] == 1);
+        CHECK(ranked[2] == 3);
+        CHECK(ranked[3] == 7);
+
+        // threshold 0.4: 0.5 > 0.4 => sync
+        sync = llama_moe_plan_remap(freq, n_expert, expert_slot, 0.4f,
+                                    &n_unique, &n_miss, ranked, &n_ranked);
+        CHECK(sync == true);
+
+        // cold cache: nothing resident => 4/4 = 1.0 miss => sync at any threshold < 1
+        int32_t cold[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+        sync = llama_moe_plan_remap(freq, n_expert, cold, 0.5f,
+                                    &n_unique, &n_miss, ranked, &n_ranked);
+        CHECK(n_miss == 4 && n_unique == 4);
+        CHECK(sync == true);
+
+        // fully resident => 0 misses => never sync
+        int32_t hot[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+        sync = llama_moe_plan_remap(freq, n_expert, hot, 0.0f,
+                                    &n_unique, &n_miss, ranked, &n_ranked);
+        CHECK(n_miss == 0);
+        CHECK(sync == false); // n_miss (0) > 0.0*n_unique (0) is false
+
+        // no experts selected => no sync, no unique
+        int zero_freq[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        sync = llama_moe_plan_remap(zero_freq, n_expert, cold, 0.5f,
+                                    &n_unique, &n_miss, ranked, &n_ranked);
+        CHECK(n_unique == 0);
+        CHECK(sync == false);
+    }
+
+
     if (g_fail == 0) {
         printf("ALL PASS\n");
         return 0;
