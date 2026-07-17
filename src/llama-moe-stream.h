@@ -237,6 +237,17 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
                                                   ggml_tensor *         selected_experts,
                                                   int                   capacity);
 
+// Auto-choose the resident experts-per-layer (CACHE_CAP) from free VRAM when the user did not set
+// LLAMA_MOE_CACHE_CAP. `n_moe_layers` is the count of layers that build a streamed MoE cache (total
+// layers minus the leading dense block). Returns a capacity in [n_used, n_expert], or 0 if it cannot
+// measure (caller keeps its own default). Tune the VRAM fraction with LLAMA_MOE_VRAM_FRAC (default 0.80).
+int llama_moe_auto_capacity(ggml_backend_sched_t  sched,
+                            ggml_tensor * const * exps_list,
+                            int                   n_proj,
+                            int                   n_expert,
+                            int                   n_used,
+                            int                   n_moe_layers);
+
 // Device slot table [1,n_expert] i32 (expert -> cache slot, sentinel `capacity` if missing).
 ggml_tensor * llama_moe_layer_cache_slot_table(llama_moe_layer_cache * c);
 

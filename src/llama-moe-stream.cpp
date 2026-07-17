@@ -451,6 +451,79 @@ static ggml_backend_t llama_moe_pick_device_backend(ggml_backend_sched_t sched) 
     return nullptr;
 }
 
+// Auto-pick the per-layer resident expert count (CACHE_CAP) from VRAM, so users need not compute it by
+// hand (the old default of "full n_expert" silently OOMs / spills to CUDA system-memory-fallback on
+// models whose experts far exceed VRAM - a ~10x slowdown that looks mysterious). Budgeting is subtle:
+// this runs at the FIRST MoE layer's cache creation, when the other (n_moe_layers-1) layer caches are
+// NOT yet allocated, so dev_free is transiently large. We must therefore budget for ALL layers up front
+// AND reserve headroom for the KV cache + compute graph buffers that also grow on-device. We size the
+// TOTAL expert-cache footprint to (dev_free - reserve) * frac, then divide by layers. Returns a capacity
+// in [n_used, n_expert]; 0 if it cannot measure. Env overrides:
+//   LLAMA_MOE_CACHE_CAP set (>0) -> honored verbatim, this is not called
+//   LLAMA_MOE_VRAM_FRAC=F        -> fraction of the (free - reserve) budget for the cache (default 0.90)
+//   LLAMA_MOE_VRAM_RESERVE_MB=N  -> MiB kept free as a fragmentation margin (default 1024; KV/compute are
+//                                   already allocated + excluded from the measured free, so this is small)
+int llama_moe_auto_capacity(ggml_backend_sched_t sched,
+                            ggml_tensor * const * exps_list, int n_proj,
+                            int n_expert, int n_used, int n_moe_layers) {
+    if (n_moe_layers <= 0 || n_proj <= 0) { return 0; }
+    ggml_backend_t backend = llama_moe_pick_device_backend(sched);
+    if (!backend) { return 0; }
+    size_t dev_free = 0, dev_total = 0;
+    ggml_backend_dev_memory(ggml_backend_get_device(backend), &dev_free, &dev_total);
+    if (dev_free == 0) { return 0; }
+
+    // bytes one resident expert costs across all projections of a layer
+    uint64_t per_expert = 0;
+    for (int i = 0; i < n_proj; ++i) {
+        if (!exps_list[i]) { return 0; }
+        per_expert += (uint64_t) exps_list[i]->nb[2];
+    }
+    if (per_expert == 0) { return 0; }
+
+    double frac = 0.92;
+    if (const char * fe = getenv("LLAMA_MOE_VRAM_FRAC")) {
+        const double f = atof(fe);
+        if (f > 0.05 && f < 0.98) { frac = f; }
+    }
+    // Headroom kept free out of dev_free. dev_free is measured at the first MoE layer's cache creation,
+    // during the first real decode graph, so the non-expert weights, KV cache and compute buffers are
+    // ALREADY allocated and excluded from dev_free - the reserve is only a small fragmentation margin,
+    // NOT a weights/KV/compute budget. (The pinned H2D staging arena is a single global buffer, not
+    // per-layer, and shows up as "Shared GPU memory" on Windows since pinned host RAM is GPU-addressable;
+    // it is host memory, NOT a dedicated-VRAM spill, so it does not enter this budget. A plain mmap'd
+    // file's page-cache working set is NOT cudaHostRegister'd and does NOT count as GPU shared memory.)
+    uint64_t reserve = (uint64_t) 1024 * 1024 * 1024;
+    if (const char * re = getenv("LLAMA_MOE_VRAM_RESERVE_MB")) {
+        const long long r = atoll(re);
+        if (r >= 0) { reserve = (uint64_t) r * 1024 * 1024; }
+    }
+    // TOTAL device budget for the whole expert cache (all layers). Use dev_free (measured at the first
+    // layer's cache creation, before the other layer caches allocate) minus the reserve for KV/compute.
+    // dev_free ~= dev_total here since streaming keeps expert weights off-device, so this is close to
+    // the real ceiling; the reserve absorbs the KV + compute buffers that grow afterward.
+    const uint64_t usable = dev_free > reserve ? (uint64_t) (frac * (double) (dev_free - reserve)) : 0;
+    if (usable == 0) { return 0; }
+    // each layer holds (cap + 1 sentinel) slabs; total = n_moe_layers * (cap+1) * per_expert <= usable
+    const uint64_t denom = (uint64_t) n_moe_layers * per_expert;
+    long long cap = (long long) (usable / denom) - 1; // -1 for the per-layer sentinel slab
+
+    if (cap < n_used)   { cap = n_used; }     // below the per-token activation is unusable; clamp up
+    if (cap > n_expert) { cap = n_expert; }   // no point exceeding the whole layer
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        const double gib = 1024.0*1024.0*1024.0;
+        const double cache_gib = (double) ((uint64_t)(cap + 1) * denom) / gib;
+        // WARN level so it is visible before llama-completion pauses the log for generation.
+        LLAMA_LOG_WARN("MoE stream: auto CACHE_CAP=%lld -> ~%.1f GiB expert cache across %d MoE layers "
+                       "(free %.1f GiB, reserve %.1f GiB for KV/compute, frac %.2f, %.1f MiB/expert). "
+                       "Override with LLAMA_MOE_CACHE_CAP; tune LLAMA_MOE_VRAM_FRAC / LLAMA_MOE_VRAM_RESERVE_MB.\n",
+                       cap, cache_gib, n_moe_layers, dev_free/gib, reserve/gib, frac, per_expert/(1024.0*1024.0));
+    }
+    return (int) cap;
+}
+
 static llama_moe_cache_pool * llama_moe_cache_get_or_create(ggml_backend_sched_t sched,
                                                             ggml_tensor *        exps,
                                                             int                  capacity,
@@ -665,17 +738,13 @@ struct llama_moe_layer_cache {
     ggml_context *        ctx    = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
 
-    // Pinned (page-locked) host staging arena for the CPU-remap sync path (LLAMA_MOE_PINNED_STAGE). One
-    // stride-sized slot per (io-thread, projection) so a non-mmap expert read lands in pinned memory and
-    // the following H2D runs at full PCIe rate instead of the pageable-memory rate. Allocated via the
-    // backend-agnostic host-buffer type (real pinned memory when the device is CUDA; harmless plain host
-    // memory otherwise). Sized on first use in parallel_load; freed at shutdown.
+    // Device handles for the pinned-staging H2D path (LLAMA_MOE_PINNED_STAGE). The pinned arena itself is
+    // a single GLOBAL buffer shared by every layer (see g_moe_stage_* below), not one per layer - all
+    // staging happens in parallel_load, which runs one layer at a time under g_moe_layer_mutex, so a
+    // single arena is race-free and avoids replicating ~250 MiB x 80 layers of pinned host memory (which
+    // Windows counts as "Shared GPU memory" since pinned host RAM is GPU-addressable).
     ggml_backend_dev_t    stage_dev  = nullptr; // device whose host-buffer type backs the pinned arena
     ggml_backend_t        dev_backend = nullptr; // device backend handle (for async H2D + one synchronize)
-    ggml_backend_buffer_t stage_buf  = nullptr; // owns the pinned bytes
-    char *                stage_base = nullptr; // stage_buf base ptr
-    size_t                stage_slot = 0;        // bytes per staging slot (== max proj stride)
-    int                   stage_nthread = 0;     // io threads the arena is sized for
 
     ggml_tensor * slot_table = nullptr; // [1,n_expert] i32: expert -> slot (sentinel `capacity` if missing)
     ggml_tensor * sel_buf    = nullptr; // [n_used,n_tokens] i32: latest selection
@@ -732,6 +801,17 @@ struct llama_moe_layer_cache {
 
 static std::mutex g_moe_layer_mutex;
 static std::unordered_map<const ggml_tensor *, llama_moe_layer_cache *> g_moe_layer_caches;
+
+// Single GLOBAL pinned host staging arena shared by all layers (LLAMA_MOE_PINNED_STAGE). Expert reads on
+// the no-mmap path land here before the H2D copy so the transfer runs at full PCIe rate. Only ever touched
+// inside parallel_load, which runs one layer at a time under g_moe_layer_mutex, so one arena suffices - a
+// per-layer arena would replicate ~250 MiB x 80 layers of pinned RAM (all counted as Windows "Shared GPU
+// memory"). Sized to its high-water (io-threads x max-projection-stride) and freed in llama_moe_cache_shutdown.
+static ggml_backend_buffer_t g_moe_stage_buf     = nullptr; // owns the pinned bytes
+static char *                g_moe_stage_base    = nullptr; // g_moe_stage_buf base ptr
+static size_t                g_moe_stage_slot    = 0;        // bytes per staging slot (== max proj stride seen)
+static int                   g_moe_stage_nthread = 0;        // io threads the arena is currently sized for
+static int                   g_moe_stage_nproj   = 0;        // projections the arena is currently sized for
 
 // Registered on-disk location of each expert tensor (no-mmap takeover). exps -> (path, offset0).
 struct llama_moe_expert_file { std::string path; uint64_t offset0 = 0; };
@@ -890,8 +970,13 @@ static std::atomic<bool> g_moe_loader_run{false};
 // during the unlocked write, so it never reads half-written bytes.
 static void llama_moe_loader_fill_ram(std::vector<char> & scratch) {
     (void) scratch;
-    const int fill_budget_env = getenv("LLAMA_MOE_RAM_FILL") ? atoi(getenv("LLAMA_MOE_RAM_FILL")) : 64;
-    int fill_budget = fill_budget_env > 0 ? fill_budget_env : 64; // experts promoted per loader tick (all caches)
+    // Experts promoted into the locked RAM pool per loader tick, across ALL caches. The slow disk read
+    // runs WITHOUT the mutex (see below), so a large budget does not lengthen any lock-hold; it only
+    // fills the pool faster. The old default of 64/tick across ~80 layers was <1 expert/layer/tick, so
+    // a large model's RAM pool took thousands of ticks to fill and mostly sat empty during a run (the
+    // callback then missed to disk instead of RAM). 1024 fills a big pool within the first seconds.
+    const int fill_budget_env = getenv("LLAMA_MOE_RAM_FILL") ? atoi(getenv("LLAMA_MOE_RAM_FILL")) : 1024;
+    int fill_budget = fill_budget_env > 0 ? fill_budget_env : 1024; // experts promoted per loader tick (all caches)
 
     // snapshot the cache list under the mutex (map itself is populated-once at graph build, but be safe)
     std::vector<llama_moe_layer_cache *> caches;
@@ -1557,25 +1642,36 @@ void llama_moe_layer_cache_publish(llama_moe_layer_cache * c,
 // slot per (thread, projection)). Backend-agnostic: uses the device's host-buffer type, which is real
 // page-locked memory on CUDA. Returns the base ptr and per-slot stride via the cache fields, or leaves
 // stage_base=nullptr on failure (caller falls back to a pageable heap buffer). Caller holds the mutex.
+// page-locked memory on CUDA. Grows the single GLOBAL arena (g_moe_stage_*) to fit this layer's needs and
+// leaves g_moe_stage_base=nullptr on failure (caller falls back to a pageable heap buffer). Caller holds
+// g_moe_layer_mutex, and parallel_load runs one layer at a time under it, so the shared arena is race-free.
 static void llama_moe_ensure_stage(llama_moe_layer_cache * c, int n_threads) {
     if (!c->stage_dev || n_threads < 1) { return; }
     // per-slot bytes = max projection stride (so any proj's expert fits)
     size_t slot = 0;
     for (auto & pr : c->proj) { if (pr.stride > slot) { slot = (size_t) pr.stride; } }
     if (slot == 0) { return; }
-    const size_t n_slots = (size_t) n_threads * c->proj.size();
-    if (c->stage_base && c->stage_slot >= slot && c->stage_nthread >= n_threads) {
+    const int n_proj = (int) c->proj.size();
+    // High-water sizing: keep whichever of slot / n_threads / n_proj is largest across all layers, so the
+    // single global arena is reused rather than reallocated per layer (and never shrinks under a layer).
+    if (g_moe_stage_base &&
+        g_moe_stage_slot >= slot && g_moe_stage_nthread >= n_threads && g_moe_stage_nproj >= n_proj) {
         return; // already big enough
     }
-    if (c->stage_buf) { ggml_backend_buffer_free(c->stage_buf); c->stage_buf = nullptr; c->stage_base = nullptr; }
+    const size_t new_slot   = slot        > g_moe_stage_slot    ? slot        : g_moe_stage_slot;
+    const int    new_thread = n_threads   > g_moe_stage_nthread ? n_threads   : g_moe_stage_nthread;
+    const int    new_proj   = n_proj      > g_moe_stage_nproj   ? n_proj      : g_moe_stage_nproj;
+    if (g_moe_stage_buf) { ggml_backend_buffer_free(g_moe_stage_buf); g_moe_stage_buf = nullptr; g_moe_stage_base = nullptr; }
     ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(c->stage_dev);
     if (!hbuft) { return; } // device has no pinned host buffer type; caller uses pageable fallback
-    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(hbuft, n_slots * slot);
+    const size_t n_slots = (size_t) new_thread * (size_t) new_proj;
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(hbuft, n_slots * new_slot);
     if (!buf) { return; }
-    c->stage_buf     = buf;
-    c->stage_base    = (char *) ggml_backend_buffer_get_base(buf);
-    c->stage_slot    = slot;
-    c->stage_nthread = n_threads;
+    g_moe_stage_buf     = buf;
+    g_moe_stage_base    = (char *) ggml_backend_buffer_get_base(buf);
+    g_moe_stage_slot    = new_slot;
+    g_moe_stage_nthread = new_thread;
+    g_moe_stage_nproj   = new_proj;
 }
 
 
@@ -1636,9 +1732,9 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
         n_threads = 1;
     }
 
-    // pinned staging arena (one stride slot per thread*proj); if it fails, threads use a pageable buffer
+    // pinned staging arena (global, shared across layers); if it fails, threads use a pageable buffer
     if (fast) { llama_moe_ensure_stage(c, n_threads); }
-    const bool use_pinned = fast && c->stage_base != nullptr;
+    const bool use_pinned = fast && g_moe_stage_base != nullptr;
 
     // Async-H2D batching (default on): the old path issued a synchronous ggml_backend_tensor_set per
     // expert-projection, and the CUDA backend does cudaMemcpy + cudaStreamSynchronize on EVERY call
@@ -1685,7 +1781,7 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
                 char * stg = nullptr;
                 if (use_pinned) {
                     const size_t si = ((size_t) tid * c->proj.size() + pi); // unique per (thread,proj)
-                    stg = c->stage_base + si * c->stage_slot;
+                    stg = g_moe_stage_base + si * g_moe_stage_slot;
                 } else {
                     scratch.resize(stride);
                     stg = scratch.data();
@@ -2249,10 +2345,14 @@ void llama_moe_cache_shutdown(void) {
                 pr.fp_ld = nullptr;
             }
         }
-        if (c->stage_buf) {
-            ggml_backend_buffer_free(c->stage_buf);
-            c->stage_buf  = nullptr;
-            c->stage_base = nullptr;
-        }
+    }
+    // free the single global pinned staging arena (loader stopped, mutex held: no concurrent access)
+    if (g_moe_stage_buf) {
+        ggml_backend_buffer_free(g_moe_stage_buf);
+        g_moe_stage_buf     = nullptr;
+        g_moe_stage_base    = nullptr;
+        g_moe_stage_slot    = 0;
+        g_moe_stage_nthread = 0;
+        g_moe_stage_nproj   = 0;
     }
 }
