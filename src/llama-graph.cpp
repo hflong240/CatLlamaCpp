@@ -1623,7 +1623,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (up_exps)      { projs[np++] = up_exps; }
         if (down_exps)    { projs[np++] = down_exps; }
         const char * cap_env = getenv("LLAMA_MOE_CACHE_CAP");
-        const int    cap     = cap_env ? atoi(cap_env) : 0; // 0 => full (n_expert)
+        int          cap     = cap_env ? atoi(cap_env) : 0; // 0 => auto (from free VRAM) below
+        if (!cap_env || cap <= 0) {
+            // No explicit cap: size the resident expert cache to fit free VRAM automatically, instead
+            // of the old "full n_expert" default that silently spills a large model to system RAM.
+            const int n_moe_layers = (int) hparams.n_layer() - (int) hparams.n_layer_dense_lead;
+            const int auto_cap = llama_moe_auto_capacity(sched, projs, np, n_expert, n_expert_used, n_moe_layers);
+            if (auto_cap > 0) { cap = auto_cap; }
+        }
         const char * thr_env = getenv("LLAMA_MOE_SYNC_THRESHOLD");
         if (thr_env) { moe_sync_threshold = (float) atof(thr_env); }
         moe_lc = llama_moe_layer_cache_get(sched, projs, np, selected_experts, cap);
