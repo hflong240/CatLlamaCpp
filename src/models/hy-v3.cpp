@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include "llama-moe-stream.h" // fork: cross-layer expert prefetch (llama_moe_layer_cache_lookup/_prefetch)
+
 // Tencent Hy3 (hy_v3): standard GQA attention with q/k norms, a leading dense block,
 // then DeepSeek-style MoE layers (sigmoid router + expert-selection bias, ungated shared
 // expert). The trailing NextN/MTP block is loaded but not executed here (the base decoder
@@ -169,6 +171,34 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
             ggml_tensor * pred = ggml_argsort_top_k(ctx0, pl, n_expert_used); // [n_expert_used, n_tokens]
             cb(pred, "ffn_moe_topk_pred", il + 1); // tag with the PREDICTED layer's index
             ggml_build_forward_expand(gf, pred);   // keep it in the graph though nothing consumes it
+        }
+
+        // MoE cross-layer prefetch (fork, LLAMA_MOE_PREFETCH): on decode, predict layer il+1's routing
+        // from THIS layer's normalized hidden `cur` (projected through il+1's gate_inp) and publish the
+        // top-K candidates into il+1's cache so the background loader warms them during this layer's
+        // compute - hiding il+1's disk read. Purely speculative: a wrong prediction only wastes a load,
+        // never corrupts output (il+1 still runs its real selection + SYNC_BUDGET). Prediction is
+        // approximate (one attention block separates cur from il+1's real gate input), so publish a WIDER
+        // top-K than n_expert_used (LLAMA_MOE_PREFETCH_K, default 2x n_used) to raise the chance the real
+        // top-2 are among the warmed candidates. Decode only (prefill streams everything anyway).
+        if (n_tokens <= 1 && getenv("LLAMA_MOE_PREFETCH") && il + 1 < n_layer &&
+            model.layers[il + 1].ffn_gate_inp != nullptr && model.layers[il + 1].ffn_gate_exps != nullptr) {
+            int k = 2 * n_expert_used;
+            if (const char * ke = getenv("LLAMA_MOE_PREFETCH_K")) { const int v = atoi(ke); if (v > 0) { k = v; } }
+            if (k > n_expert)      { k = n_expert; }
+            if (k < n_expert_used) { k = n_expert_used; }
+            // il+1's cache is keyed by its first projection tensor (gate_exps, matching build_moe_ffn's
+            // projs[] order gate/up/down). It exists by decode (created during prefill); null => skip.
+            llama_moe_layer_cache * next_c = llama_moe_layer_cache_lookup(model.layers[il + 1].ffn_gate_exps);
+            if (next_c) {
+                ggml_tensor * pl = build_lora_mm(model.layers[il + 1].ffn_gate_inp, cur); // [n_expert, n_tokens]
+                pl = ggml_sigmoid(ctx0, pl);
+                if (model.layers[il + 1].ffn_exp_probs_b != nullptr) {
+                    pl = ggml_add(ctx0, pl, model.layers[il + 1].ffn_exp_probs_b);
+                }
+                ggml_tensor * pred = ggml_argsort_top_k(ctx0, pl, k); // [k, n_tokens], highest-weight first
+                llama_moe_layer_cache_prefetch(next_c, ctx0, gf, pred);
+            }
         }
 
         if (model.layers[il].ffn_gate_inp == nullptr) {

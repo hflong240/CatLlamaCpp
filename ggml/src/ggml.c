@@ -1078,9 +1078,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_FFN",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1188,9 +1190,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_ffn(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6055,6 +6059,41 @@ struct ggml_tensor * ggml_custom_inplace(
 
     return result;
 }
+
+// ggml_moe_ffn (fork)
+
+struct ggml_tensor * ggml_moe_ffn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * sel,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * gate_dev,
+        struct ggml_tensor  * up_dev,
+        struct ggml_tensor  * down_dev,
+        ggml_moe_ffn_sync_fn  sync_fn,
+        ggml_moe_ffn_cpu_fn   cpu_fn,
+        void                * cache) {
+    GGML_ASSERT(cur && sel && gate_dev && up_dev && down_dev);
+    // output is [n_embd, n_tokens] - n_embd is the down proj's output dim (down_dev->ne[1])
+    const int64_t n_embd   = down_dev->ne[1];
+    const int64_t n_tokens = cur->ne[1];
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+
+    // stash {sync_fn, cpu_fn, cache} in op_params (3 pointers = 24 bytes, fits GGML_MAX_OP_PARAMS = 64)
+    void * params[3] = { (void *) sync_fn, (void *) cpu_fn, cache };
+    ggml_set_op_params(result, &params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_FFN;
+    result->src[0] = cur;
+    result->src[1] = sel;
+    result->src[2] = weights;
+    result->src[3] = gate_dev;
+    result->src[4] = up_dev;
+    result->src[5] = down_dev;
+
+    return result;
+}
+
 // ggml_cross_entropy_loss
 
 struct ggml_tensor * ggml_cross_entropy_loss(

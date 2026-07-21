@@ -1607,6 +1607,28 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 #else
         setenv("LLAMA_MOE_STREAM_ASYNC", "1", 1);
 #endif
+        // --moe-stream-async enables the recommended async-streaming configuration by default: the
+        // per-layer cache (ASYNC), off-page-cache expert reads (NOMMAP), and the startup RAM-pool prefill
+        // (PREFILL). Set only when the user has not already set the var, so an explicit value (including
+        // NAME=0 to opt out) always wins. SYNC_BUDGET is deliberately NOT set here - it is resolved as an
+        // integer at the graph/cache sites so that the default of 2 and an explicit =0 both behave;
+        // putenv-ing "2" would defeat a user's =0. FUSED is deliberately NOT defaulted either: although it
+        // collapses the per-layer scheduler splits (160->4/token) and is quality-identical, measured decode
+        // is ~20% SLOWER with it on because the single fused op serializes the expert load with compute,
+        // losing the implicit load//compute overlap the per-layer split provided on this disk/H2D-bound
+        // path. It stays opt-in via LLAMA_MOE_FUSED=1.
+        auto set_if_unset = [](const char * k, const char * v) {
+            if (getenv(k) == nullptr) {
+#ifdef _WIN32
+                _putenv_s(k, v);
+#else
+                setenv(k, v, 1);
+#endif
+            }
+        };
+        set_if_unset("LLAMA_MOE_ASYNC",   "1");
+        set_if_unset("LLAMA_MOE_NOMMAP",  "1");
+        set_if_unset("LLAMA_MOE_PREFILL", "1");
     }
 
     cparams.type_k = params.cache_type_k;

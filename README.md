@@ -52,6 +52,18 @@ RAM); the two spill mechanisms are independent and can be combined.
 
 - **MoE expert streaming** (opt-in, off by default): stream routed experts from disk instead of keeping
   them resident. Two flags (`--moe-stream`, `--moe-stream-async`), see [Usage](#moe-streaming-usage).
+- **Auto-sized cache tiers**: both the VRAM expert cache (`LLAMA_MOE_CACHE_CAP`) and the host-RAM pool
+  (`LLAMA_MOE_RAM_CAP`) size themselves from free VRAM / available system RAM at startup - you normally set
+  neither. They fill the device and host uniformly across all MoE layers (see the sizing note below).
+- **Fused CUDA MoE-FFN op** (opt-in, `LLAMA_MOE_FUSED=1`, CUDA only): a single CUDA-native op does the
+  per-layer expert sync-load + gate/up + SwiGLU + down + weighted sum, replacing a per-layer CPU op (and its
+  scheduler split, 160 splits/token -> 4). Quality-identical to the default path, but measured decode is
+  **slower** on the disk/H2D-bound streaming path (the fused op serializes the expert load with compute,
+  losing the implicit load//compute overlap the split provided), so it is **off by default**. Kept for CUDA
+  setups where the split, not the load, dominates.
+- **Startup RAM-pool prefill** (on by default with `--moe-stream-async`): fills the host-RAM expert pool at
+  full NVMe bandwidth during the prompt-eval window instead of letting decode warm it token by token, so the
+  decode rate reflects the warm steady state from the first token. Set `LLAMA_MOE_PREFILL=0` to disable.
 - **Parallel, prefetched disk I/O** for the prefill expert reads (thread pool + OS prefetch + offset-sorted
   reads), tuned for high-throughput NVMe.
 - **Hunyuan-v3 (`hy_v3`) architecture support** ([src/models/hy-v3.cpp](src/models/hy-v3.cpp)): sigmoid
@@ -66,32 +78,45 @@ memory, so only the experts selected or cached each step occupy VRAM. There are 
 | Flag | What it does | Correctness |
 |------|--------------|-------------|
 | `--moe-stream` | **Compaction.** Each step copies only the experts selected that step to VRAM and runs the stock kernels over that small tensor. | Byte-identical to a non-streamed run. Largest VRAM saving, lowest throughput (experts cross PCIe every token). |
-| `--moe-stream-async` | **Persistent VRAM expert cache.** Hot experts stay resident and are reused across tokens. Synchronous and correct on its own; add `LLAMA_MOE_ASYNC=1` for the per-layer streaming cache used when a model exceeds VRAM *and* RAM. | Byte-identical by default. Best balance of VRAM vs speed. |
+| `--moe-stream-async` | **Persistent VRAM expert cache.** Hot experts stay resident and reused across tokens. Enables the recommended async-streaming config by default (per-layer cache, off-page-cache reads, top-2 sync budget, RAM-pool prefill) - the per-layer streaming cache needed when a model exceeds VRAM *and* RAM. | Diverges from a non-streamed run (opt-in via this flag). For byte-identical output use `--moe-stream` or run non-streamed. Best balance of VRAM vs speed. Set any `LLAMA_MOE_*=0` to opt out of a piece. |
 
-`LLAMA_MOE_CACHE_CAP` (experts/layer kept resident) is **auto-sized to fit VRAM** - you normally never set
-it. For a model that fits in VRAM, or one only modestly larger, plain `--moe-stream-async` is all you need
-and stays byte-identical.
+`LLAMA_MOE_CACHE_CAP` (VRAM experts/layer) and `LLAMA_MOE_RAM_CAP` (host-RAM experts/layer) are both
+**auto-sized** - you normally set neither. For a model that fits in VRAM, or one only modestly larger,
+plain `--moe-stream-async` is all you need and stays byte-identical.
 
 #### Recommended: a model larger than VRAM *and* RAM
 
 For the headline case - a MoE whose expert weights dwarf both VRAM and system RAM (e.g. Hunyuan-v3 Q4,
-~170 GB, on a 24 GB GPU + 64 GB RAM) - enable the per-layer streaming cache with a host-RAM tier and a
-small synchronous expert budget:
+~170 GB, on a 24 GB GPU + 64 GB RAM) - enable the per-layer streaming cache with a small synchronous
+expert budget. The VRAM cache and host-RAM pool auto-size to fill the device and host:
 
 ```bat
-set LLAMA_MOE_ASYNC=1            & rem per-layer streaming cache (drops/streams experts on demand)
-set LLAMA_MOE_NOMMAP=1           & rem read experts by offset, bypassing the OS page cache
-set LLAMA_MOE_RAM_CAP=60         & rem experts/layer in a locked host-RAM pool; size to your RAM
-set LLAMA_MOE_SYNC_BUDGET=2      & rem load each layer's true top-2 experts before its matmul
 llama-completion -m hy3-q4.gguf -ngl 99 --moe-stream-async -fit off -no-cnv -p "..."
 ```
 
-`SYNC_BUDGET=2` is what keeps output coherent on hard prompts: it guarantees each layer's two
-highest-weight experts are resident before the matmul, while the rest reuse the previous (still-valid)
-expert. Dropping `SYNC_BUDGET` lets decode run pure-GPU and much faster (~50 tok/s on this model) but the
-stale reuse **degrades quality on hard prompts** - keep the budget for correct output. Measured on an
-RTX 4090D (24 GB) + 64 GB RAM, Hunyuan-v3 Q4: roughly **4 tok/s decode, 15 tok/s prefill**, coherent
-through long generations. Raise `LLAMA_MOE_RAM_CAP` toward your available RAM to lift decode.
+`--moe-stream-async` enables the recommended async-streaming configuration by default: the per-layer
+streaming cache + background loader, off-page-cache expert reads, a top-2 synchronous expert budget, and a
+one-shot startup RAM-pool prefill. `CACHE_CAP` fills VRAM and `RAM_CAP` fills host RAM automatically (both
+printed at startup as `auto CACHE_CAP=N` / `auto RAM_CAP=N`). The top-2 `SYNC_BUDGET` is what keeps output
+coherent on hard prompts: it guarantees each layer's two highest-weight experts are resident before the
+matmul, while the rest reuse the previous (still-valid) expert.
+
+To opt out of any single piece, set that switch to `0` (e.g. `LLAMA_MOE_NOMMAP=0`, or
+`LLAMA_MOE_SYNC_BUDGET=0` to let decode run pure-GPU and much faster - though the stale reuse then
+**degrades quality on hard prompts**). An explicit value always wins over the default. To try the fused
+CUDA op, add `LLAMA_MOE_FUSED=1` (off by default - see below).
+
+Measured on an RTX 4090D (24 GB) + 64 GB RAM, coherent and non-degenerate through long generations:
+
+| Model | Fits in | Decode | Prefill |
+|-------|---------|--------|---------|
+| Hunyuan-v3 **IQ2** (~92 GB) | neither VRAM nor RAM | **~13 tok/s** | ~20-40 tok/s |
+| Hunyuan-v3 **Q4** (~170 GB) | neither VRAM nor RAM | **~3.8 tok/s** | ~10-15 tok/s |
+
+Q4 is slower than IQ2 because each expert slab is ~1.8x the bytes, so fewer experts fit resident (both
+tiers hold fewer) and the working set overflows VRAM+RAM further - decode is bounded by NVMe read
+bandwidth. Both figures are the correct-quality (`SYNC_BUDGET=2`) path; the pure-GPU stale path is much
+faster but degrades on hard prompts.
 
 > [!NOTE]
 > Streaming engages on the real inference graph. This fork's `-fit` device-fitting runs a separate
@@ -102,7 +127,7 @@ through long generations. Raise `LLAMA_MOE_RAM_CAP` toward your available RAM to
 > single-token decode steps (`n_tokens <= 1`). `llama-server`'s continuous batching processes all parallel
 > slots in one step, so with `-np N` (N > 1) - or whenever multiple requests are batched together - each
 > step has `n_tokens > 1` and **bypasses the fast cache path**, falling back to per-step compaction. That
-> is still correct but much slower, and with `LLAMA_MOE_ASYNC=1` it re-runs the synchronous prompt warm
+> is still correct but much slower, and with the async cache active it re-runs the synchronous prompt warm
 > every step (very slow). Use `-np 1` so decode stays single-token; be aware concurrent clients still get
 > batched and lose the fast path. Server use of these features is otherwise validated only for single-stream
 > decode (`llama-cli`/`llama-completion`) - treat it as experimental.
@@ -113,18 +138,23 @@ through long generations. Raise `LLAMA_MOE_RAM_CAP` toward your available RAM to
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `LLAMA_MOE_ASYNC=1` | off | With `--moe-stream-async`: enable the per-layer streaming cache + background loader. Required to run a model that exceeds VRAM *and* RAM; without it `--moe-stream-async` is a plain byte-identical resident cache. |
-| `LLAMA_MOE_CACHE_CAP=N` | auto | Experts-per-layer kept resident in the VRAM cache. **Unset = auto:** sized from free VRAM so the cache fits without spilling to system memory (adapts to `-c` context size and card). Set `N` to override; trades VRAM for quality. |
-| `LLAMA_MOE_SYNC_BUDGET=N` | off | With `LLAMA_MOE_ASYNC=1`: on decode, synchronously load each layer's `N` highest-weight missing experts (the true top-N) before its matmul, reusing the previous (real, stale) expert for the rest. This is what makes decode **correct on hard prompts**; `N=2` is the quality knee for Hunyuan-v3. Slower than the pure-GPU stale path but coherent. |
-| `LLAMA_MOE_RAM_CAP=N` | `0` (off) | Experts-per-layer held in a locked host-RAM pool (three-tier: VRAM cache -> RAM pool -> disk). A VRAM miss reads from RAM (~25 GB/s) instead of faulting the model file from disk. Size as large as host RAM allows (leave ~6-8 GB headroom); fills on demand toward the highest-weight experts. |
-| `LLAMA_MOE_NOMMAP=1` | off | Read experts from the model file by offset (own file handles) instead of the mmap pointer, bypassing the OS page cache so host RAM stays under the locked pool's control rather than an unbounded page cache that thrashes when the model is larger than RAM. Recommended with `LLAMA_MOE_RAM_CAP`. |
+| `LLAMA_MOE_ASYNC` | on with `--moe-stream-async` | The per-layer streaming cache + background loader - required to run a model that exceeds VRAM *and* RAM. On by default with `--moe-stream-async`; set `LLAMA_MOE_ASYNC=0` to fall back to a plain resident cache. |
+| `LLAMA_MOE_CACHE_CAP=N` | auto | Experts-per-layer kept resident in the VRAM cache. **Unset = auto:** sized from free VRAM so the cache fills the device without spilling to system memory (adapts to `-c` context size and card). Set `N` to override; trades VRAM for quality. |
+| `LLAMA_MOE_SYNC_BUDGET=N` | `2` with `--moe-stream-async` | On decode, synchronously load each layer's `N` highest-weight missing experts (the true top-N) before its matmul, reusing the previous (real, stale) expert for the rest. This is what makes decode **correct on hard prompts**; `N=2` is the quality knee for Hunyuan-v3. Set `0` to disable (decode runs pure-GPU and much faster, but stale reuse degrades quality on hard prompts). |
+| `LLAMA_MOE_RAM_CAP=N` | auto | Experts-per-layer held in a locked host-RAM pool (three-tier: VRAM cache -> RAM pool -> disk). A VRAM miss reads from RAM (~25 GB/s) instead of faulting the model file from disk. **Unset = auto:** sized from available system RAM to fill the host, leaving headroom for the OS + mmap working set. Set `0` to disable the tier, or `N` to override. |
+| `LLAMA_MOE_NOMMAP` | on with `--moe-stream-async` | Read experts from the model file by offset (own file handles) instead of the mmap pointer, bypassing the OS page cache so host RAM stays under the locked pool's control rather than an unbounded page cache that thrashes when the model is larger than RAM. Set `LLAMA_MOE_NOMMAP=0` to use the mmap path. |
+| `LLAMA_MOE_FUSED=1` | off | Use the fused CUDA MoE-FFN op on the async decode path: one CUDA-native op does the expert sync-load + gate/up + SwiGLU + down + weighted sum, instead of a per-layer CPU remap op that forces a scheduler split (160 splits/token -> 4). Quality-identical, but measured decode is **~20% slower** on this disk/H2D-bound path (the fused op serializes the load with compute, losing the split's load//compute overlap), so it is **off by default**. Decode only; prefill, non-hy3 layers, and non-CUDA backends fall back automatically. |
+| `LLAMA_MOE_PREFILL` | on with `--moe-stream-async` | Fill the host-RAM expert pool at full NVMe bandwidth once, during the prompt-eval window, instead of letting decode warm it token by token. The decode rate then reflects the warm steady state from the first token. Set `LLAMA_MOE_PREFILL=0` to disable. |
+| `LLAMA_MOE_PREFILL_VRAM` | on with `--moe-stream-async` | After the RAM pool is warm, also fill each layer's VRAM slot cache with its top-scoring experts from the RAM pool (~25 GB/s) before decode, instead of warming VRAM one miss at a time over the first tokens. Quality-safe (VRAM is a subset of the RAM set; a wrong pick is just LRU-evicted). Set `LLAMA_MOE_PREFILL_VRAM=0` to disable. |
 
-**Auto-cache sizing** (only if the auto `CACHE_CAP` needs nudging):
+**Auto-sizing** (only if the auto `CACHE_CAP` / `RAM_CAP` needs nudging):
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `LLAMA_MOE_VRAM_FRAC=F` | `0.90` | Fraction of free VRAM (minus the reserve) the auto cache may use. Raise toward 1.0 to hold more experts resident; lower if you see a system-memory spill. Ignored when `LLAMA_MOE_CACHE_CAP` is set. |
-| `LLAMA_MOE_VRAM_RESERVE_MB=N` | `1024` | VRAM (MiB) the auto cache keeps free as a fragmentation margin. KV/compute are already excluded from the measured free, so this is small; raise only if a spill persists. |
+| `LLAMA_MOE_VRAM_FRAC=F` | `0.97` | Fraction of free VRAM (minus the reserve) the auto VRAM cache may use. Lower it if you see a system-memory spill. Ignored when `LLAMA_MOE_CACHE_CAP` is set. |
+| `LLAMA_MOE_VRAM_RESERVE_MB=N` | `512` | VRAM (MiB) the auto cache keeps free as a fragmentation margin. KV/compute are already excluded from the measured free, so this is small; raise only if a spill persists. |
+| `LLAMA_MOE_RAM_FRAC=F` | `0.90` | Fraction of (available RAM - reserve) the auto RAM pool may use. Ignored when `LLAMA_MOE_RAM_CAP` is set. |
+| `LLAMA_MOE_RAM_RESERVE_MB=N` | `5120` | System RAM (MiB) the auto pool keeps free for the OS + the growing mmap working set. Raise it if you see paging or a runtime slowdown as the pool fills. |
 
 **Loader / performance** (sensible defaults; rarely changed):
 
@@ -142,20 +172,20 @@ through long generations. Raise `LLAMA_MOE_RAM_CAP` toward your available RAM to
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `LLAMA_MOE_DIAG=1` | off | Print decode miss-rate, per-token load/lock-wait timing, and top-2 residency. |
-| `LLAMA_MOE_NOLOADER=1` | off | Freeze the cache (disable background loading). |
 | `GGML_MOE_SPLIT_DIAG=1` | off | Per-token breakdown of scheduler split time (CPU-split vs GPU-split copy/sync and compute). |
 
 > [!IMPORTANT]
-> **`LLAMA_MOE_CACHE_CAP` is auto-sized by default so the cache fits in VRAM** - you normally do not set
-> it. The resident cache uses about `(CACHE_CAP + LLAMA_MOE_SENTINELS) x n_moe_layers x per_expert_slab_bytes`
-> of VRAM; if it overflows the device the driver does **not** error - it silently spills to system RAM (CUDA
-> "system memory fallback"), and decode becomes PCIe-bound and can be ~10x slower. The auto sizing measures
-> free VRAM at startup (after KV/compute are allocated, so it adapts to `-c` context size and card) and picks
-> the largest `CACHE_CAP` that fits under `LLAMA_MOE_VRAM_FRAC` (default 0.90) with a small reserve; the chosen
-> value is printed at startup (`auto CACHE_CAP=N -> ~X GiB ...`). If you still see a spill, lower
-> `LLAMA_MOE_VRAM_FRAC` or raise `LLAMA_MOE_VRAM_RESERVE_MB`. To pin it manually: Hunyuan-v3 Q4 has an ~11.7 MiB
-> per-expert slab (~0.9 GiB per cap unit across its 80 MoE layers), so `CACHE_CAP=16` (~22 GB) fits a 24 GB
-> card, `CACHE_CAP=24` spills a 24 GB card but fits 32 GB.
+> **`LLAMA_MOE_CACHE_CAP` and `LLAMA_MOE_RAM_CAP` are auto-sized by default** - you normally set neither.
+> The VRAM cache uses about `(CACHE_CAP + LLAMA_MOE_SENTINELS) x n_moe_layers x per_expert_slab_bytes`; if
+> it overflows the device the driver does **not** error - it silently spills to system RAM (CUDA "system
+> memory fallback"), and decode becomes PCIe-bound and can be ~10x slower. The auto sizing measures free
+> VRAM / available RAM once at the first MoE layer (before any cache allocates, so the reading is the true
+> ceiling) and applies the **same** cap to every layer, filling the device and host uniformly - it adapts
+> to `-c` context size, card, and quantization (a bigger per-expert slab yields a smaller cap). The chosen
+> values print at startup (`auto CACHE_CAP=N -> ~X GiB`, `auto RAM_CAP=N -> ~Y GiB`). If you see a VRAM
+> spill, lower `LLAMA_MOE_VRAM_FRAC`; if the RAM pool starves the OS, raise `LLAMA_MOE_RAM_RESERVE_MB`. For
+> reference, Hunyuan-v3 Q4 has an ~11.7 MiB per-expert slab (~0.9 GiB per cap unit across its 80 MoE
+> layers), so `CACHE_CAP=16` (~21.5 GB) fills a 24 GB card; IQ2's ~6.4 MiB slab lets ~36 experts/layer fit.
 
 
 ### Performance and caveats
@@ -163,22 +193,26 @@ through long generations. Raise `LLAMA_MOE_RAM_CAP` toward your available RAM to
 - **A MoE that fits in VRAM** (used to validate correctness): `--moe-stream` and `--moe-stream-async` are
   both **byte-identical** to a non-streamed run. Async keeps hot experts resident and approaches
   non-streamed throughput; `--moe-stream` uses the least VRAM but moves experts over PCIe every token.
-- **Hunyuan-v3 Q4, ~170 GB, on an RTX 4090D (24 GB) + 64 GB RAM** (exceeds VRAM *and* RAM), using the
-  recommended config above: roughly **4 tok/s decode, 15 tok/s prefill**, coherent and non-degenerate
-  through long generations. Decode is lower than the pure-GPU stale path (~50 tok/s) because correct
-  quality forces each layer's true top-2 experts resident before its matmul; it is bounded by NVMe read
-  bandwidth (the per-token working set exceeds VRAM+RAM) and the per-layer scheduler split the sync load
-  needs. Raise `LLAMA_MOE_RAM_CAP` toward your available RAM to lift it.
+- **Hunyuan-v3 on an RTX 4090D (24 GB) + 64 GB RAM** (model exceeds VRAM *and* RAM), correct-quality
+  (`SYNC_BUDGET=2`) path: **IQ2 (~92 GB) ~13 tok/s decode, Q4 (~170 GB) ~3.8 tok/s decode**, coherent and
+  non-degenerate through long generations. Decode is far below the pure-GPU stale path because correct
+  quality forces each layer's true top-2 experts resident before its matmul, and it is bounded by NVMe
+  read bandwidth: the per-token working set overflows VRAM+RAM, so misses fault from disk. A smaller
+  quantization (more experts fit resident) or more VRAM/RAM is the lever, not the execution model.
 
 Caveats:
 
-- **Prefill is disk-bound; decode is loader/PCIe-bound.** The I/O path (parallel + prefetched +
+- **Prefill is disk-bound; decode is loader/PCIe/disk-bound.** The I/O path (parallel + prefetched +
   offset-sorted) is built for NVMe, where scattered reads run near full bandwidth; on a SATA SSD prefill
-  saturates at the drive's scattered-read rate. Raise `LLAMA_MOE_IO_THREADS` on fast NVMe.
-- The `LLAMA_MOE_ASYNC=1` cache reuses a **stale** expert on a miss rather than blocking. With
-  `LLAMA_MOE_SYNC_BUDGET` set this stays coherent on **robust** production MoEs; without it, or on
-  **fragile** merged models that cannot tolerate any stale expert, output can degrade. Verify quality on
+  saturates at the drive's scattered-read rate. Raise `LLAMA_MOE_IO_THREADS` on fast NVMe. Decode rate
+  also **slides with generation length** as a longer output routes to a wider expert set (more disk misses).
+- The async streaming cache reuses a **stale** expert on a miss rather than blocking. With the default
+  top-2 `SYNC_BUDGET` this stays coherent on **robust** production MoEs; with `LLAMA_MOE_SYNC_BUDGET=0`, or
+  on **fragile** merged models that cannot tolerate any stale expert, output can degrade. Verify quality on
   your model before relying on it.
+- The fused CUDA MoE-FFN op (`LLAMA_MOE_FUSED=1`) is quality-identical to the default path and eliminates
+  the per-layer scheduler split, but measured decode is slower on this disk/H2D-bound path, so it is off by
+  default. Enable it only where the split, not the expert load, dominates. Skipped on non-CUDA backends.
 - Expert LoRA is not applied on the streamed path.
 - These features are a fork-local addition and are **not** proposed upstream.
 

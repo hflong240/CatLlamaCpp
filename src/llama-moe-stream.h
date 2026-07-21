@@ -2,8 +2,31 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <list>
 #include <unordered_map>
+
+// Env-switch truthiness with a caller-supplied default. Used so a switch can be defaulted ON (when the
+// user passed --moe-stream-async) yet still be turned OFF with NAME=0. Unset -> default_on; "0"/"false"/
+// "off" (case-insensitive) -> false; any other value -> true. Centralizes the semantics for every
+// recommended-config switch so a bare presence check (which can never honor NAME=0) is not reintroduced.
+static inline bool moe_env_on(const char * name, bool default_on) {
+    const char * v = getenv(name);
+    if (!v) {
+        return default_on;
+    }
+#ifdef _WIN32
+    #define moe_strcasecmp _stricmp
+#else
+    #define moe_strcasecmp strcasecmp
+#endif
+    if ((v[0] == '0' && v[1] == '\0') || moe_strcasecmp(v, "false") == 0 || moe_strcasecmp(v, "off") == 0) {
+        return false;
+    }
+#undef moe_strcasecmp
+    return true;
+}
 
 //
 // SSD streaming cache for MoE routed-expert weights.
@@ -145,6 +168,20 @@ void llama_moe_gather_cb(ggml_tensor * dst, int ith, int nth, void * userdata);
 // each routing position in src `a`.
 void llama_moe_remap_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
 
+// fork: host sync callback for the fused CUDA GGML_OP_MOE_FFN op (see ggml_moe_ffn). Signature must match
+// ggml_moe_ffn_sync_fn in ggml.h. llama_moe_layer_cache_sync_fn() returns the concrete callback pointer to
+// hand to ggml_moe_ffn; the callback plans residency + sync-loads missing experts + fills the slot ids.
+typedef void (*llama_moe_ffn_sync_fn_t)(void * cache, const int32_t * sel_host, int32_t * ids_host,
+                                        int n_used, int n_tokens);
+llama_moe_ffn_sync_fn_t llama_moe_layer_cache_sync_fn(void);
+
+// fork: CPU expert lane callback (see ggml_moe_ffn_cpu_fn in ggml.h). llama_moe_layer_cache_cpu_fn()
+// returns it; pass to ggml_moe_ffn to compute RAM-resident experts on the CPU instead of the GPU.
+typedef int (*llama_moe_ffn_cpu_fn_t)(void * cache, const float * cur_host, float * weights_host,
+                                      const int32_t * sel_host, int32_t * ids_host, float * partial_host,
+                                      int n_used, int n_tokens, int n_embd, int n_ff, int gpu_skip_slot);
+llama_moe_ffn_cpu_fn_t llama_moe_layer_cache_cpu_fn(void);
+
 //
 // Persistent VRAM expert cache (for --moe-stream-async, decode only).
 //
@@ -237,6 +274,10 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
                                                   ggml_tensor *         selected_experts,
                                                   int                   capacity);
 
+// Look up an existing per-layer cache by its first projection tensor (no creation). Returns null if not
+// yet created. Used by the cross-layer prefetch to reach layer L+1's cache from layer L's graph build.
+llama_moe_layer_cache * llama_moe_layer_cache_lookup(const ggml_tensor * exps0);
+
 // Auto-choose the resident experts-per-layer (CACHE_CAP) from free VRAM when the user did not set
 // LLAMA_MOE_CACHE_CAP. `n_moe_layers` is the count of layers that build a streamed MoE cache (total
 // layers minus the leading dense block). Returns a capacity in [n_used, n_expert], or 0 if it cannot
@@ -259,11 +300,36 @@ ggml_tensor * llama_moe_layer_cache_stale_table(llama_moe_layer_cache * c);
 // Device cache tensor [ne0,ne1,capacity+1] for one projection (matched by its `exps`).
 ggml_tensor * llama_moe_layer_cache_dev(llama_moe_layer_cache * c, const ggml_tensor * exps);
 
+// True if this cache's resident device backend is CUDA. The fused GGML_OP_MOE_FFN op is a CUDA-only fork
+// op (CPU aborts, no Vulkan/Metal/SYCL case), so the fused decode path must be gated on this: on a non-CUDA
+// GPU build llama_moe_pick_device_backend still returns the (non-CPU) backend and builds the cache, but
+// emitting the fused op there would crash the scheduler. Callers fall back to the per-projection path.
+bool llama_moe_layer_cache_backend_is_cuda(llama_moe_layer_cache * c);
+
+// fork: read-only gate-weight distribution probe (LLAMA_MOE_WEIGHT_DIAG). Attaches a no-op map_custom on
+// the normalized `weights` [1, n_expert_used, n_tokens] that bins the per-token top-1/top-2 weight, to
+// measure how often hy3's routing is "flat" (top-2 low). Its output is discarded (never consumed), so it
+// cannot affect the model computation. No-op unless LLAMA_MOE_WEIGHT_DIAG is set.
+void llama_moe_weight_diag_probe(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * weights);
+
 // Publish this step's selection into the loader-visible buffer (adds a cpy to `gf`).
 void llama_moe_layer_cache_publish(llama_moe_layer_cache * c,
                                    ggml_context *          ctx0,
                                    ggml_cgraph *           gf,
                                    ggml_tensor *           selected_experts);
+
+// fork: cross-layer lookahead prefetch. While building layer L's graph, publish a PREDICTED expert
+// selection for layer L+1 into L+1's cache sel_buf, so the background loader can warm those experts
+// during L's compute (hiding L+1's disk read). The prediction is L's hidden projected through L+1's
+// gate_inp (cheap, on-GPU) - approximate, so pass a WIDER top-K than n_used (more candidates => higher
+// chance the real top-2 are already warm). Purely speculative: a wrong prediction just wastes a load,
+// never corrupts output (L+1 still runs its real selection + SYNC_BUDGET). No-op if next_c is null or
+// pred's shape does not fit sel_buf. `pred` is [k, n_tokens] i32 (k may exceed sel_buf->ne[0]; only the
+// leading sel_buf->ne[0] rows are published, so pass the argsort so the highest-weight candidates lead).
+void llama_moe_layer_cache_prefetch(llama_moe_layer_cache * next_c,
+                                    ggml_context *          ctx0,
+                                    ggml_cgraph *           gf,
+                                    ggml_tensor *           pred);
 
 // Remap `selected_experts` [n_used,n_tokens] to cache-slot ids [n_used,n_tokens] i32 via a CPU
 // op (map_custom1). Resident experts resolve to their slot; misses resolve to the zero sentinel
@@ -277,4 +343,6 @@ void llama_moe_layer_cache_publish(llama_moe_layer_cache * c,
 ggml_tensor * llama_moe_layer_cache_remap(llama_moe_layer_cache * c,
                                           ggml_context *          ctx0,
                                           ggml_tensor *           selected_experts,
-                                          float                   threshold);
+                                          ggml_tensor *           weights,
+                                          float                   threshold,
+                                          int                     sync_budget);

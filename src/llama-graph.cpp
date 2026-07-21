@@ -1615,7 +1615,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // no longer reads ~every expert of every layer from disk - it is bounded to `capacity`.
     llama_moe_layer_cache * moe_lc = nullptr;
     float moe_sync_threshold = 0.5f;
-    if (cparams.moe_stream && cparams.moe_stream_async && getenv("LLAMA_MOE_ASYNC")) {
+    if (cparams.moe_stream && cparams.moe_stream_async && moe_env_on("LLAMA_MOE_ASYNC", cparams.moe_stream_async)) {
         ggml_tensor * projs[4];
         int np = 0;
         if (gate_up_exps) { projs[np++] = gate_up_exps; }
@@ -1675,6 +1675,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // fork: read-only gate-weight distribution probe (LLAMA_MOE_WEIGHT_DIAG). Measures how flat hy3's
+    // routing is (top-1/top-2 magnitude), to test whether forcing a top-2 sync-load is worth it when the
+    // distribution is near-uniform. No-op unless the env is set; its output is discarded.
+    llama_moe_weight_diag_probe(ctx0, gf, weights);
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -1718,7 +1723,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (moe_lc && moe_stream_async) {
         const int64_t n_sel = selected_experts->ne[0] * selected_experts->ne[1];
         const bool ok_shape = n_sel > 0 && selected_experts->ne[2] == 1 && selected_experts->ne[3] == 1;
-        bool decode_cpu_sync = getenv("LLAMA_MOE_SYNC_DECODE") || getenv("LLAMA_MOE_SYNC_BUDGET");
+        // Resolve the decode sync budget once, here, so both the path selection below and the cache-side
+        // remap agree. Env value wins (atoi, clamped >=0); unset defaults to 2 on the async path (the
+        // Hunyuan-v3 quality knee) and 0 otherwise. decode_cpu_sync is derived from budget>0 - NOT from
+        // env presence - so LLAMA_MOE_SYNC_BUDGET=0 truly disables the CPU-sync decode path (a presence
+        // check would leave it on with budget 0, forcing the ~100x-slower per-layer CPU remap).
+        const char * sb_env = getenv("LLAMA_MOE_SYNC_BUDGET");
+        int moe_sync_budget = sb_env ? atoi(sb_env) : (moe_stream_async ? 2 : 0);
+        if (moe_sync_budget < 0) { moe_sync_budget = 0; }
+        bool decode_cpu_sync = getenv("LLAMA_MOE_SYNC_DECODE") || (moe_sync_budget > 0);
         // Static per-layer hybrid probe (LLAMA_MOE_CPU_LAYERS): a fixed, run-constant set of layer
         // indices that take the CPU-sync path on decode; all other layers take the pure-GPU stale
         // path. The set is fixed for the whole run so the graph topology stays stable (graph reuse +
@@ -1735,7 +1748,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
         if (n_tokens > 1 || decode_cpu_sync) {
-            moe_cache_ids = llama_moe_layer_cache_remap(moe_lc, ctx0, selected_experts, moe_sync_threshold);
+            moe_cache_ids = llama_moe_layer_cache_remap(moe_lc, ctx0, selected_experts, weights, moe_sync_threshold, moe_sync_budget);
         } else if (ok_shape) {
             // decode: device get_rows over the [1,n_expert] STALE table (no CPU split). Flatten to
             // 1D so get_rows uses the plain (non-batched) form, valid for any token count. Unlike the
@@ -1759,6 +1772,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
     }
+
+    // fork: fused MoE FFN (GGML_OP_MOE_FFN) - single CUDA-native op replacing the per-layer CPU remap
+    // (map_custom1) + gate/up/SwiGLU/down/weight/sum sequence, eliminating the scheduler split that
+    // dominates streaming decode. Guarded tightly to the shape this op implements: async layer cache
+    // active, decode (n_tokens<=1), separate gate/up/down projections, SILU/SwiGLU activation, and no
+    // per-expert bias/scale (which the op does not fold in). Any other shape falls through to the
+    // existing per-projection path below. Opt-in via LLAMA_MOE_FUSED=1 (default OFF: it is quality-
+    // identical and removes the per-layer scheduler split, but measured decode is ~20% slower because the
+    // fused op serializes the expert load with compute, losing the load//compute overlap the split gave on
+    // this disk/H2D-bound path).
+    if (moe_lc && moe_stream_async && n_tokens <= 1 &&
+        moe_env_on("LLAMA_MOE_FUSED", false) && llama_moe_layer_cache_backend_is_cuda(moe_lc) &&
+        gate_exps && up_exps && down_exps && !gate_up_exps &&
+        !gate_exps_b && !up_exps_b && !down_exps_b &&
+        !gate_exps_s && !up_exps_s && !down_exps_s &&
+        type_op == LLM_FFN_SILU && !weight_before_ffn) {
+        ggml_tensor * gate_d = llama_moe_layer_cache_dev(moe_lc, gate_exps);
+        ggml_tensor * up_d   = llama_moe_layer_cache_dev(moe_lc, up_exps);
+        ggml_tensor * down_d = llama_moe_layer_cache_dev(moe_lc, down_exps);
+        if (gate_d && up_d && down_d) {
+            // CPU expert lane: opt-in via LLAMA_MOE_CPU_LANE, and only meaningful with a RAM pool
+            // (LLAMA_MOE_RAM_CAP / auto) since it computes RAM-resident experts on the CPU.
+            static const bool cpu_lane = getenv("LLAMA_MOE_CPU_LANE") != nullptr;
+            ggml_moe_ffn_cpu_fn cpu_fn = cpu_lane ? llama_moe_layer_cache_cpu_fn() : nullptr;
+            ggml_tensor * fused = ggml_moe_ffn(ctx0, cur, selected_experts, weights,
+                                               gate_d, up_d, down_d,
+                                               llama_moe_layer_cache_sync_fn(), cpu_fn, moe_lc);
+            cb(fused, "ffn_moe_out", il);
+            return fused;
+        }
+    }
+
     auto mm_id_exps = [&](ggml_tensor * exps, ggml_tensor * input) -> ggml_tensor * {
         if (!moe_stream) {
             return build_lora_mm_id(exps, input, selected_experts);

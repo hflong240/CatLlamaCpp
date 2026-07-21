@@ -583,6 +583,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_FFN, // fork: fused MoE FFN with on-device expert sync-load (CUDA only, decode path)
+
         GGML_OP_COUNT,
     };
 
@@ -2635,6 +2637,48 @@ extern "C" {
             ggml_custom_op_t      fun,
             int                   n_tasks,
             void                * userdata);
+
+    // fork: fused MoE FFN for the streaming decode path. Given routing ids `sel` [n_used, n_tokens],
+    // router `weights` [1, n_used, n_tokens], and the per-layer VRAM expert-cache projection tensors
+    // (gate/up/down), a single CUDA-native op syncs the token's missing top-N experts into the cache
+    // and runs gate/up/down + SwiGLU + weighted sum - so the per-layer CPU remap op (and its scheduler
+    // split) is gone. `cache` is an opaque llama_moe_layer_cache* forwarded to the CUDA op; `sync_fn` is
+    // the host callback the CUDA op invokes to plan residency + sync-load missing experts + fill the slot
+    // ids (host array). Output is [n_embd, n_tokens] F32. CUDA only (CPU backend aborts); decode only.
+    //
+    // sync_fn contract: fill ids_host[n_used*n_tokens] with the cache slot index for each routing
+    // position, having loaded any missing top-N experts into the device cache first. sel_host holds the
+    // routing ids (host copy). Runs on the host inside the CUDA op, before the expert matmuls.
+    typedef void (*ggml_moe_ffn_sync_fn)(void * cache, const int32_t * sel_host, int32_t * ids_host,
+                                         int n_used, int n_tokens);
+
+    // fork: optional CPU expert lane (Pulsar-style). Computes the FULL FFN of any routed expert that is
+    // resident in the host RAM pool directly on the CPU (ggml AVX2 vec_dot), instead of uploading it to
+    // the GPU - so those experts stop competing for H2D bandwidth and VRAM slots, and the CPU dots
+    // overlap the in-flight GPU matmuls of the remaining (VRAM/disk-miss) experts. Runs on the host
+    // inside the CUDA op, issued BEFORE it waits on the GPU MoE kernels so the two lanes overlap.
+    //   in:  cur_host [n_embd*n_tokens] f32 input activations, weights_host [n_used*n_tokens] f32 router
+    //        weights, sel_host [n_used*n_tokens] routing ids, ids_host (the GPU slot ids from sync_fn).
+    //   out: writes the CPU-lane experts' weighted FFN contribution into partial_host [n_embd*n_tokens]
+    //        (zero-initialized by the op), and ZEROES weights_host[p] for every position it handled so
+    //        the GPU weighted-sum excludes them (the op uploads the modified weights + adds partial_host).
+    //   returns: number of positions handled on the CPU (0 => lane inactive, op skips the add).
+    //   gpu_skip_slot is unused by the weight-zeroing contract but kept for flexibility.
+    typedef int (*ggml_moe_ffn_cpu_fn)(void * cache, const float * cur_host, float * weights_host,
+                                       const int32_t * sel_host, int32_t * ids_host, float * partial_host,
+                                       int n_used, int n_tokens, int n_embd, int n_ff, int gpu_skip_slot);
+
+    GGML_API struct ggml_tensor * ggml_moe_ffn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,        // [n_embd, n_tokens] input hidden
+            struct ggml_tensor  * sel,        // [n_used, n_tokens] i32 routing ids
+            struct ggml_tensor  * weights,    // [1, n_used, n_tokens] f32 router weights (already norm/scaled)
+            struct ggml_tensor  * gate_dev,   // [n_embd, n_ff, n_slots] cache gate proj
+            struct ggml_tensor  * up_dev,     // [n_embd, n_ff, n_slots] cache up proj
+            struct ggml_tensor  * down_dev,   // [n_ff, n_embd, n_slots] cache down proj
+            ggml_moe_ffn_sync_fn  sync_fn,    // host residency/sync-load callback
+            ggml_moe_ffn_cpu_fn   cpu_fn,     // optional CPU expert lane (nullptr = off)
+            void                * cache);     // llama_moe_layer_cache*
 
     // loss function
 

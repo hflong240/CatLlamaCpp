@@ -84,6 +84,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -2826,6 +2827,250 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// fork: fused MoE FFN (GGML_OP_MOE_FFN) - see ggml_moe_ffn in ggml.c / ggml.h.
+// Replaces the per-layer CPU map_custom1 remap (which forces a scheduler split) with a single CUDA-native
+// op: host callback plans residency + sync-loads missing experts, then gate/up + SwiGLU + down + weighted
+// sum all run on the op's stream. Reuses the static ggml_cuda_mul_mat_id for the three expert matmuls.
+
+// silu(gate) * up, elementwise over [n_ff, n_used, n_tokens]
+static __global__ void k_moe_swiglu(const float * gate, const float * up, float * dst, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) { return; }
+    const float g = gate[i];
+    dst[i] = (g / (1.0f + expf(-g))) * up[i];
+}
+
+// weighted sum over the expert dim: out[e_out, t] = sum_u down[e_out, u, t] * w[u, t]
+// down is [n_embd, n_used, n_tokens], w is [n_used, n_tokens] (router weights, one per used expert)
+static __global__ void k_moe_weighted_sum(const float * down, const float * w, float * dst,
+                                          int n_embd, int n_used, int n_tokens) {
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t) n_embd * n_tokens) { return; }
+    const int e_out = (int) (idx % n_embd);
+    const int t     = (int) (idx / n_embd);
+    float acc = 0.0f;
+    for (int u = 0; u < n_used; ++u) {
+        const float dv = down[((int64_t) t * n_used + u) * n_embd + e_out];
+        acc += dv * w[(int64_t) t * n_used + u];
+    }
+    dst[idx] = acc;
+}
+
+// dst[i] += src[i] (add the CPU expert lane's partial into the GPU MoE output)
+static __global__ void k_moe_add_inplace(float * dst, const float * src, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { dst[i] += src[i]; }
+}
+
+static void ggml_cuda_op_moe_ffn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * cur      = dst->src[0]; // [n_embd, n_tokens] f32
+    const ggml_tensor * sel      = dst->src[1]; // [n_used, n_tokens] i32
+    const ggml_tensor * weights  = dst->src[2]; // [1, n_used, n_tokens] f32
+    ggml_tensor *       gate_dev = dst->src[3]; // [n_embd, n_ff, n_slots]
+    ggml_tensor *       up_dev   = dst->src[4]; // [n_embd, n_ff, n_slots]
+    ggml_tensor *       down_dev = dst->src[5]; // [n_ff, n_embd, n_slots]
+
+    void * pp[3];
+    memcpy(pp, dst->op_params, sizeof(pp));
+    ggml_moe_ffn_sync_fn sync_fn = (ggml_moe_ffn_sync_fn) pp[0];
+    ggml_moe_ffn_cpu_fn  cpu_fn  = (ggml_moe_ffn_cpu_fn)  pp[1];
+    void *               cache   = pp[2];
+
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && sel->type == GGML_TYPE_I32);
+    GGML_ASSERT(sync_fn != nullptr);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+    const int64_t n_used   = sel->ne[0];
+    const int64_t n_ff     = gate_dev->ne[1];
+
+    // 1) plan residency + sync-load missing experts on the host, producing the per-position slot ids.
+    // Copy sel D2H, run the callback (which loads missing experts into the *_dev caches on this stream's
+    // device via ggml_backend_tensor_set), then upload the resolved ids.
+    const int64_t n_sel = n_used * n_tokens;
+    std::vector<int32_t> sel_host((size_t) n_sel), ids_host((size_t) n_sel);
+    CUDA_CHECK(cudaMemcpyAsync(sel_host.data(), sel->data, n_sel * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // Diagnostic (LLAMA_MOE_FUSED_NOSYNC): skip the residency plan + expert sync-load, just route each
+    // position to its expert id mod capacity (stale, wrong-quality). Isolates the matmul/kernel cost of
+    // this op from the sync-load cost - if decode is still slow with this, the slowness is the matmuls,
+    // not the H2D sync wall.
+    static const bool nosync = getenv("LLAMA_MOE_FUSED_NOSYNC") != nullptr;
+    if (nosync) {
+        const int cap = (int) gate_dev->ne[2];
+        for (int64_t i = 0; i < n_sel; ++i) {
+            const int32_t e = sel_host[(size_t) i];
+            ids_host[(size_t) i] = (e >= 0 && cap > 0) ? (e % cap) : 0;
+        }
+    } else {
+        sync_fn(cache, sel_host.data(), ids_host.data(), (int) n_used, (int) n_tokens);
+    }
+
+    // CPU expert lane (Pulsar-style, opt-in via cpu_fn != nullptr): compute the FULL FFN of any routed
+    // expert resident in the host RAM pool on the CPU, so it neither uploads nor competes for a VRAM
+    // slot. The CPU dots run on a BACKGROUND THREAD spawned here; the GPU gate/up/down matmuls launch
+    // async on `stream` immediately below and run concurrently (they need only ids_t, not the CPU work).
+    // We join the thread just before the weighted-sum, which needs the CPU-zeroed router weights. cpu_fn
+    // zeroes w_host for handled positions and fills cpu_partial; the op uploads the modified weights and
+    // adds cpu_partial into dst at the end.
+    const int64_t n_out = n_embd * n_tokens;
+    std::vector<float> cpu_partial;
+    std::vector<float> w_host;
+    std::vector<float> cur_host;
+    std::thread        cpu_thread;
+    int                cpu_handled = 0;
+    const bool         cpu_active  = (cpu_fn != nullptr) && !nosync;
+    if (cpu_active) {
+        cur_host.assign((size_t) (n_embd * n_tokens), 0.0f);
+        w_host.assign((size_t) n_sel, 0.0f);
+        CUDA_CHECK(cudaMemcpyAsync(cur_host.data(), cur->data, (size_t) n_embd * n_tokens * sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(w_host.data(), weights->data, (size_t) n_sel * sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream)); // cur_host / w_host ready before the CPU thread reads
+        cpu_partial.assign((size_t) n_out, 0.0f);
+        const int gpu_skip_slot = (int) gate_dev->ne[2] - 1;
+        // Spawn the CPU FFN in the background; it does not touch any GPU tensor, so it overlaps the GPU
+        // matmuls queued below. sel_host/ids_host are finalized by sync_fn above and only read here.
+        cpu_thread = std::thread([&, gpu_skip_slot]() {
+            cpu_handled = cpu_fn(cache, cur_host.data(), w_host.data(), sel_host.data(), ids_host.data(),
+                                 cpu_partial.data(), (int) n_used, (int) n_tokens, (int) n_embd, (int) n_ff,
+                                 gpu_skip_slot);
+        });
+    }
+
+    // device ids tensor [n_used, n_tokens] i32 for mul_mat_id
+    ggml_cuda_pool_alloc<int32_t> ids_dev(ctx.pool(), (size_t) n_sel);
+    CUDA_CHECK(cudaMemcpyAsync(ids_dev.get(), ids_host.data(), n_sel * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    ggml_tensor ids_t;
+    memset(&ids_t, 0, sizeof(ids_t));
+    ids_t.type = GGML_TYPE_I32;
+    ids_t.ne[0] = n_used; ids_t.ne[1] = n_tokens; ids_t.ne[2] = 1; ids_t.ne[3] = 1;
+    ids_t.nb[0] = sizeof(int32_t);
+    ids_t.nb[1] = ids_t.ne[0]*ids_t.nb[0];
+    ids_t.nb[2] = ids_t.ne[1]*ids_t.nb[1];
+    ids_t.nb[3] = ids_t.ne[2]*ids_t.nb[2];
+    ids_t.data  = ids_dev.get();
+
+    // b input for mul_mat_id: cur reshaped to [n_embd, 1, n_tokens] (one row per token, broadcast over used)
+    ggml_tensor b_t = *cur;
+    b_t.ne[0] = n_embd; b_t.ne[1] = 1; b_t.ne[2] = n_tokens; b_t.ne[3] = 1;
+    b_t.nb[0] = cur->nb[0];
+    b_t.nb[1] = b_t.ne[0]*b_t.nb[0];
+    b_t.nb[2] = cur->nb[1]; // stride from token to token == cur's row stride
+    b_t.nb[3] = b_t.ne[2]*b_t.nb[2];
+    b_t.op = GGML_OP_NONE; b_t.view_src = nullptr;
+
+    // helper to run one expert matmul: as[*, *, n_slots] x b -> out[as->ne[1], n_used, n_tokens] f32
+    auto run_mm_id = [&](ggml_tensor * as, ggml_tensor * b, float * out_data) {
+        ggml_tensor out_t;
+        memset(&out_t, 0, sizeof(out_t));
+        out_t.type = GGML_TYPE_F32;
+        out_t.ne[0] = as->ne[1]; out_t.ne[1] = n_used; out_t.ne[2] = n_tokens; out_t.ne[3] = 1;
+        out_t.nb[0] = sizeof(float);
+        out_t.nb[1] = out_t.ne[0]*out_t.nb[0];
+        out_t.nb[2] = out_t.ne[1]*out_t.nb[1];
+        out_t.nb[3] = out_t.ne[2]*out_t.nb[2];
+        out_t.data  = out_data;
+        out_t.op    = GGML_OP_MUL_MAT_ID;
+        out_t.src[0] = as; out_t.src[1] = b; out_t.src[2] = &ids_t;
+        ggml_cuda_mul_mat_id(ctx, &out_t);
+        CUDA_CHECK(cudaGetLastError());
+    };
+
+    // 2) gate and up projections -> [n_ff, n_used, n_tokens]
+    const int64_t n_gu = n_ff * n_used * n_tokens;
+    ggml_cuda_pool_alloc<float> gate_out(ctx.pool(), (size_t) n_gu);
+    ggml_cuda_pool_alloc<float> up_out  (ctx.pool(), (size_t) n_gu);
+    run_mm_id(gate_dev, &b_t, gate_out.get());
+    run_mm_id(up_dev,   &b_t, up_out.get());
+
+    // 3) SwiGLU: act = silu(gate) * up
+    ggml_cuda_pool_alloc<float> act(ctx.pool(), (size_t) n_gu);
+    {
+        const int64_t nthreads = 256;
+        const int64_t nblocks  = (n_gu + nthreads - 1) / nthreads;
+        k_moe_swiglu<<<nblocks, nthreads, 0, stream>>>(gate_out.get(), up_out.get(), act.get(), n_gu);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // 4) down projection over the activation -> [n_embd, n_used, n_tokens]
+    // b for down is the activation [n_ff, n_used, n_tokens] reshaped to [n_ff, 1, n_used*n_tokens]?  No:
+    // mul_mat_id wants b as [k, 1, n_tokens] with one id-row per token. Here each (used,token) position
+    // has its own expert, so we treat the activation as n_used*n_tokens independent rows: b=[n_ff,1,M],
+    // ids=[1,M] mapping each row to its slot. Rebuild a flat ids of length M=n_used*n_tokens.
+    const int64_t M = n_used * n_tokens;
+    ggml_tensor ids_flat = ids_t;
+    ids_flat.ne[0] = 1; ids_flat.ne[1] = M; ids_flat.ne[2] = 1; ids_flat.ne[3] = 1;
+    ids_flat.nb[0] = sizeof(int32_t);
+    ids_flat.nb[1] = ids_flat.ne[0]*ids_flat.nb[0];
+    ids_flat.nb[2] = ids_flat.ne[1]*ids_flat.nb[1];
+    ids_flat.nb[3] = ids_flat.ne[2]*ids_flat.nb[2];
+
+    ggml_tensor act_b;
+    memset(&act_b, 0, sizeof(act_b));
+    act_b.type = GGML_TYPE_F32;
+    act_b.ne[0] = n_ff; act_b.ne[1] = 1; act_b.ne[2] = M; act_b.ne[3] = 1;
+    act_b.nb[0] = sizeof(float);
+    act_b.nb[1] = act_b.ne[0]*act_b.nb[0];
+    act_b.nb[2] = act_b.ne[1]*act_b.nb[1];
+    act_b.nb[3] = act_b.ne[2]*act_b.nb[2];
+    act_b.data  = act.get();
+
+    ggml_cuda_pool_alloc<float> down_out(ctx.pool(), (size_t) n_embd * M);
+    {
+        ggml_tensor out_t;
+        memset(&out_t, 0, sizeof(out_t));
+        out_t.type = GGML_TYPE_F32;
+        out_t.ne[0] = n_embd; out_t.ne[1] = 1; out_t.ne[2] = M; out_t.ne[3] = 1;
+        out_t.nb[0] = sizeof(float);
+        out_t.nb[1] = out_t.ne[0]*out_t.nb[0];
+        out_t.nb[2] = out_t.ne[1]*out_t.nb[1];
+        out_t.nb[3] = out_t.ne[2]*out_t.nb[2];
+        out_t.data  = down_out.get();
+        out_t.op    = GGML_OP_MUL_MAT_ID;
+        out_t.src[0] = down_dev; out_t.src[1] = &act_b; out_t.src[2] = &ids_flat;
+        ggml_cuda_mul_mat_id(ctx, &out_t);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // 5) weighted sum over the used dim -> dst [n_embd, n_tokens]. Join the CPU lane first (it zeroed the
+    // router weights of positions it handled and filled cpu_partial). The GPU gate/up/down matmuls above
+    // ran concurrently with the CPU dots; this join is where the two lanes rendezvous.
+    if (cpu_thread.joinable()) { cpu_thread.join(); }
+    {
+        const float * w_dev = (const float *) weights->data;
+        ggml_cuda_pool_alloc<float> w_mod;
+        if (cpu_handled > 0) {
+            w_mod.alloc(ctx.pool(), (size_t) n_sel);
+            CUDA_CHECK(cudaMemcpyAsync(w_mod.get(), w_host.data(), (size_t) n_sel * sizeof(float),
+                                       cudaMemcpyHostToDevice, stream));
+            w_dev = w_mod.get();
+        }
+        const int64_t total = n_embd * n_tokens;
+        const int64_t nthreads = 256;
+        const int64_t nblocks  = (total + nthreads - 1) / nthreads;
+        k_moe_weighted_sum<<<nblocks, nthreads, 0, stream>>>(
+            down_out.get(), w_dev, (float *) dst->data,
+            (int) n_embd, (int) n_used, (int) n_tokens);
+        CUDA_CHECK(cudaGetLastError());
+
+        // add the CPU lane's contribution (uploaded to a scratch, then add into dst)
+        if (cpu_handled > 0) {
+            ggml_cuda_pool_alloc<float> cpu_dev(ctx.pool(), (size_t) n_out);
+            CUDA_CHECK(cudaMemcpyAsync(cpu_dev.get(), cpu_partial.data(), (size_t) n_out * sizeof(float),
+                                       cudaMemcpyHostToDevice, stream));
+            const int64_t nb2 = (n_out + nthreads - 1) / nthreads;
+            k_moe_add_inplace<<<nb2, nthreads, 0, stream>>>((float *) dst->data, cpu_dev.get(), n_out);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(stream)); // cpu_partial/w_host are stack buffers; hold until copies land
+        }
+    }
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -3153,6 +3398,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
             break;
+        case GGML_OP_MOE_FFN:
+            ggml_cuda_op_moe_ffn(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -3325,6 +3573,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
             }
+        }
+
+        // fork: the fused MoE FFN op does a synchronous H2D expert load on the stream and stashes a
+        // per-step cache pointer in op_params, so it cannot be captured/replayed - disable graphs.
+        if (node->op == GGML_OP_MOE_FFN) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GGML_OP_MOE_FFN\n", __func__);
+#endif
         }
 
         if (!use_cuda_graph) {
@@ -5477,6 +5734,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
             return true;
+        case GGML_OP_MOE_FFN:
+            return true; // fork: fused MoE FFN, CUDA-native decode path
 
         default:
             return false;

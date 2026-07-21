@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -15,6 +16,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "ggml-cpu.h"
 #include "llama-impl.h"
 
 #ifdef _WIN32
@@ -27,6 +29,7 @@
 #  include <windows.h>
 #else
 #  include <sys/mman.h>
+#  include <unistd.h>
 #endif
 
 #ifdef _WIN32
@@ -100,6 +103,27 @@ static void llama_moe_ram_free(void * p, size_t bytes) {
 #else
     (void) munlock(p, bytes);
     free(p);
+#endif
+}
+
+// Available physical RAM in bytes (free, not total), or 0 if it cannot be measured.
+static uint64_t llama_moe_avail_ram(void) {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) {
+        return (uint64_t) ms.ullAvailPhys;
+    }
+    return 0;
+#elif defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
+    const long pages = sysconf(_SC_AVPHYS_PAGES);
+    const long psize = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && psize > 0) {
+        return (uint64_t) pages * (uint64_t) psize;
+    }
+    return 0;
+#else
+    return 0;
 #endif
 }
 
@@ -460,13 +484,21 @@ static ggml_backend_t llama_moe_pick_device_backend(ggml_backend_sched_t sched) 
 // TOTAL expert-cache footprint to (dev_free - reserve) * frac, then divide by layers. Returns a capacity
 // in [n_used, n_expert]; 0 if it cannot measure. Env overrides:
 //   LLAMA_MOE_CACHE_CAP set (>0) -> honored verbatim, this is not called
-//   LLAMA_MOE_VRAM_FRAC=F        -> fraction of the (free - reserve) budget for the cache (default 0.90)
-//   LLAMA_MOE_VRAM_RESERVE_MB=N  -> MiB kept free as a fragmentation margin (default 1024; KV/compute are
+//   LLAMA_MOE_VRAM_FRAC=F        -> fraction of the (free - reserve) budget for the cache (default 0.97)
+//   LLAMA_MOE_VRAM_RESERVE_MB=N  -> MiB kept free as a fragmentation margin (default 512; KV/compute are
 //                                   already allocated + excluded from the measured free, so this is small)
 int llama_moe_auto_capacity(ggml_backend_sched_t sched,
                             ggml_tensor * const * exps_list, int n_proj,
                             int n_expert, int n_used, int n_moe_layers) {
     if (n_moe_layers <= 0 || n_proj <= 0) { return 0; }
+    // Compute ONCE (at the first MoE layer) and reuse for every layer. build_moe_ffn calls this per
+    // layer, but dev_free shrinks as each layer's cache allocates - so recomputing would give later
+    // layers a smaller cap, leaving VRAM unused (measured: per-layer recompute filled only ~17 GB where
+    // a uniform cap fills ~21.5 GB on a 24 GB card). A single model runs one geometry, so caching the
+    // first (max-free) result is correct and reproduces the hand-tuned uniform-cap behaviour.
+    static int cached_cap = 0;
+    if (cached_cap > 0) { return cached_cap; }
+
     ggml_backend_t backend = llama_moe_pick_device_backend(sched);
     if (!backend) { return 0; }
     size_t dev_free = 0, dev_total = 0;
@@ -481,19 +513,20 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
     }
     if (per_expert == 0) { return 0; }
 
-    double frac = 0.92;
+    double frac = 0.97;
     if (const char * fe = getenv("LLAMA_MOE_VRAM_FRAC")) {
         const double f = atof(fe);
-        if (f > 0.05 && f < 0.98) { frac = f; }
+        if (f > 0.05 && f < 0.995) { frac = f; }
     }
     // Headroom kept free out of dev_free. dev_free is measured at the first MoE layer's cache creation,
     // during the first real decode graph, so the non-expert weights, KV cache and compute buffers are
-    // ALREADY allocated and excluded from dev_free - the reserve is only a small fragmentation margin,
-    // NOT a weights/KV/compute budget. (The pinned H2D staging arena is a single global buffer, not
-    // per-layer, and shows up as "Shared GPU memory" on Windows since pinned host RAM is GPU-addressable;
-    // it is host memory, NOT a dedicated-VRAM spill, so it does not enter this budget. A plain mmap'd
-    // file's page-cache working set is NOT cudaHostRegister'd and does NOT count as GPU shared memory.)
-    uint64_t reserve = (uint64_t) 1024 * 1024 * 1024;
+    // ALREADY allocated and excluded from dev_free - so the cache can use almost all of dev_free, and the
+    // reserve is only a small fragmentation margin (NOT a weights/KV/compute budget; double-counting it
+    // is what left ~7 GB of VRAM unused on a 24 GB card - measured: auto picked cap 15 / 16.7 GB where
+    // cap 18 / 23.2 GB fit with no spill). (The pinned H2D staging arena is a single global buffer that
+    // shows up as Windows "Shared GPU memory" - host RAM, NOT a dedicated-VRAM spill, so it is excluded
+    // here. A plain mmap'd file's page-cache working set is not cudaHostRegister'd and does not count.)
+    uint64_t reserve = (uint64_t) 512 * 1024 * 1024;
     if (const char * re = getenv("LLAMA_MOE_VRAM_RESERVE_MB")) {
         const long long r = atoll(re);
         if (r >= 0) { reserve = (uint64_t) r * 1024 * 1024; }
@@ -521,6 +554,7 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
                        "Override with LLAMA_MOE_CACHE_CAP; tune LLAMA_MOE_VRAM_FRAC / LLAMA_MOE_VRAM_RESERVE_MB.\n",
                        cap, cache_gib, n_moe_layers, dev_free/gib, reserve/gib, frac, per_expert/(1024.0*1024.0));
     }
+    cached_cap = (int) cap; // reuse for all remaining layers (see note at function top)
     return (int) cap;
 }
 
@@ -771,6 +805,12 @@ struct llama_moe_layer_cache {
     uint64_t              pin_gen = 0;   // current step's pin generation; bumped by each remap callback
     float                 sync_threshold = 0.5f; // miss fraction above which the remap sync-loads
     int                   sync_budget = 0; // >0: sync-load at most this many top-weight missing experts/step
+    float                 sync_cover = 0.0f; // >0: coverage mode - stop syncing once (cached+synced) gate-
+                                             // weight sum reaches this fraction, capped at sync_budget misses.
+                                             // Needs per-step weight values (set by the cov_cb via step_wexp).
+    std::vector<float>    step_wexp;         // n_expert: this step's normalized gate weight per selected
+                                             // expert (0 for unselected); filled by cov_cb, read in remap_cb.
+    float                 step_cover = 0.0f; // this step's active coverage threshold (0 = off); set by cov_cb.
     bool                  weighted_evict = false; // prefer evicting low-score slots (protect high-weight core)
     std::vector<float>    expert_score;  // n_expert: exp-decayed high-weight (top-2) usage score
 
@@ -801,6 +841,18 @@ struct llama_moe_layer_cache {
 
 static std::mutex g_moe_layer_mutex;
 static std::unordered_map<const ggml_tensor *, llama_moe_layer_cache *> g_moe_layer_caches;
+
+// Set while the one-shot LLAMA_MOE_PREFILL is running (holds g_moe_layer_mutex the whole time). The
+// background loader's fill_ram does its slow disk read OUTSIDE the mutex, so without this flag it could
+// write a RAM slot the prefill is also filling. fill_ram checks this at the top of each tick and yields
+// entirely while it is true - the prefill is a few seconds, one time, so the loader losing those ticks is
+// harmless (the pool is full by the time it resumes).
+static std::atomic<bool> g_moe_prefill_running{false};
+// Non-zero while a loader tick is inside its UNLOCKED disk read (fill_ram reads outside g_moe_layer_mutex).
+// The prefill sets g_moe_prefill_running, then spins until this is 0, so no in-flight loader read overlaps
+// its writes. Handshake: the loader bumps this then re-checks the flag before reading (bail if set); the
+// prefill sets the flag then waits for this to drain. seq_cst on both sides makes the ordering airtight.
+static std::atomic<int> g_moe_loader_reading{0};
 
 // Single GLOBAL pinned host staging arena shared by all layers (LLAMA_MOE_PINNED_STAGE). Expert reads on
 // the no-mmap path land here before the H2D copy so the transfer runs at full PCIe rate. Only ever touched
@@ -952,9 +1004,90 @@ static uint64_t g_diag_pl_ns    = 0; // of which, in parallel_load (disk fread +
 static uint64_t g_diag_sync_cnt = 0; // experts sync-loaded (per layer, summed)
 static uint64_t g_diag_ram_hit  = 0; // of those, how many were served from the RAM pool (no disk)
 static uint64_t g_diag_lockwait_ns = 0; // time the remap callback waited to ACQUIRE g_moe_layer_mutex
+static uint64_t g_diag_publish_ns = 0; // time in the slot_table/stale_table publish sync sets (batching target)
+static std::atomic<uint64_t> g_diag_read_ns{0}; // parallel_load: time in disk fread (no-mmap miss path)
+static std::atomic<uint64_t> g_diag_h2d_ns{0};  // parallel_load: time in H2D (staged sync set + async batch sync)
+
+// fork: read-only gate-weight distribution probe (LLAMA_MOE_WEIGHT_DIAG). Answers "how often is hy3's
+// top-2 gate weight actually low (flat distribution), where forcing a top-2 sync-load buys little?" by
+// binning the normalized top-1 weight per decode token. Purely observational - no effect on compute or
+// residency. Accumulated across all layers, printed periodically.
+static std::atomic<uint64_t> g_wdiag_tokens{0};   // decode token-layers observed
+static std::atomic<uint64_t> g_wdiag_top1_lt20{0}; // of those, top-1 normalized weight < 0.20 (flat-ish)
+static std::atomic<uint64_t> g_wdiag_top1_lt15{0}; // < 0.15 (very flat: top-1 barely above uniform 1/8=0.125)
+static std::atomic<uint64_t> g_wdiag_top1_gt40{0}; // > 0.40 (peaked: top-1 dominates, sync clearly matters)
+static std::atomic<uint64_t> g_wdiag_top2sum_x1000{0}; // running sum of (top1+top2) x1000, for a mean
+
+// coverage-mode diagnostic: how many experts the coverage rule WOULD sync vs the fixed budget=2, and the
+// already-cached weight fraction seen at decision time. Accumulated when LLAMA_MOE_SYNC_COVER is active.
+static std::atomic<uint64_t> g_cov_tokens{0};       // decode token-layers seen by the coverage callback
+static std::atomic<uint64_t> g_cov_synced{0};       // experts the coverage rule chose to sync (sum)
+static std::atomic<uint64_t> g_cov_cached_x1000{0}; // sum of already-cached weight fraction x1000 (for mean)
+static std::atomic<uint64_t> g_cov_zero_sync{0};    // token-layers where coverage needed ZERO sync (all covered)
+// steady-state early-stop diagnostic (LLAMA_MOE_COVDBG): measured in remap_cb over the SAME order_n (top-2)
+// that drives the early-stop, so we can see the actual cov_have vs step_cover the rule compares - the cov_cb
+// numbers above sum over all n_used and cannot show why a top-2 early-stop fired.
+static std::atomic<uint64_t> g_covss_tokens{0};       // token-layers where the early-stop path was active
+static std::atomic<uint64_t> g_covss_have_x1000{0};   // sum of initial cov_have (top-2 cached weight) x1000
+static std::atomic<uint64_t> g_covss_earlystop{0};    // misses skipped by the early-stop rule (sum)
+static std::atomic<uint64_t> g_covss_cover_x1000{0};  // sum of the active step_cover x1000 (for mean)
 
 static std::thread       g_moe_loader_thread;
 static std::atomic<bool> g_moe_loader_run{false};
+
+// Persisted expert-score warm start (LLAMA_MOE_SCORE_FILE). Cold-start residency learning is slow: the
+// loader only learns which experts are hot by observing routing, so it fills the RAM/VRAM pool by expert
+// index until enough tokens accrue expert_score - measured ~1400 tokens to climb from 1% to the ~85%
+// steady-state RAM-hit. Persisting the learned per-layer scores and preloading them on the next run lets
+// the pool fill with the RIGHT experts from tick 0, skipping the warm-up. Keyed by the expert tensor name
+// (e.g. "blk.5.ffn_gate_exps.weight"), which is stable across runs. Purely a residency HINT: wrong/stale
+// scores only change WHICH experts warm first, never correctness (SYNC_BUDGET still guarantees the real
+// top-N each step). File format (binary): repeated [u32 name_len][name bytes][u32 n_expert][f32 x n_expert].
+static std::unordered_map<std::string, std::vector<float>> g_moe_loaded_scores; // name -> scores, read once
+static std::once_flag g_moe_scores_loaded_flag;
+
+static const char * llama_moe_score_file(void) {
+    return getenv("LLAMA_MOE_SCORE_FILE");
+}
+
+// Read the score file into g_moe_loaded_scores once (idempotent). Missing/absent file => empty map (no-op).
+static void llama_moe_scores_load_once(void) {
+    std::call_once(g_moe_scores_loaded_flag, []() {
+        const char * path = llama_moe_score_file();
+        if (!path) { return; }
+        FILE * f = fopen(path, "rb");
+        if (!f) { return; } // first run: no file yet
+        for (;;) {
+            uint32_t nlen = 0;
+            if (fread(&nlen, sizeof(nlen), 1, f) != 1) { break; }
+            if (nlen == 0 || nlen > GGML_MAX_NAME) { break; } // corrupt; stop
+            std::string name((size_t) nlen, '\0');
+            if (fread(&name[0], 1, nlen, f) != nlen) { break; }
+            uint32_t ne = 0;
+            if (fread(&ne, sizeof(ne), 1, f) != 1) { break; }
+            if (ne == 0 || ne > 100000) { break; } // sanity
+            std::vector<float> sc((size_t) ne);
+            if (fread(sc.data(), sizeof(float), ne, f) != ne) { break; }
+            g_moe_loaded_scores[name] = std::move(sc);
+        }
+        fclose(f);
+        if (!g_moe_loaded_scores.empty()) {
+            LLAMA_LOG_WARN("MoE stream: preloaded expert scores for %zu layers from %s (warm-start residency).\n",
+                           g_moe_loaded_scores.size(), path);
+        }
+    });
+}
+
+// If a persisted score vector exists for this layer (by expert tensor name), copy it into `dst`. Returns
+// true if seeded. Called at cache creation so the loader fills the hot set immediately.
+static bool llama_moe_scores_seed(const ggml_tensor * exps, std::vector<float> & dst, int n_expert) {
+    if (!exps || !llama_moe_score_file()) { return false; }
+    llama_moe_scores_load_once();
+    auto it = g_moe_loaded_scores.find(std::string(exps->name));
+    if (it == g_moe_loaded_scores.end() || (int) it->second.size() != n_expert) { return false; }
+    dst = it->second;
+    return true;
+}
 
 // Fill each layer cache's locked RAM residency pool toward its highest-score experts, so VRAM
 // misses read from RAM (~25 GB/s) instead of faulting the model file from disk. Runs as a separate
@@ -968,8 +1101,12 @@ static std::atomic<bool> g_moe_loader_run{false};
 // the mutex to publish ram_slot[e]=v. A concurrent reader only ever dereferences a RAM slot via
 // ram_slot[expert] (see llama_moe_read_expert / llama_moe_layer_src), and no ram_slot maps to `v`
 // during the unlocked write, so it never reads half-written bytes.
-static void llama_moe_loader_fill_ram(std::vector<char> & scratch) {
+static int llama_moe_loader_fill_ram(std::vector<char> & scratch) {
     (void) scratch;
+    // Yield entirely while the one-shot startup prefill holds the pool: its slow reads run under the mutex
+    // but write the same RAM slots fill_ram would, so overlapping the unlocked read below would race.
+    if (g_moe_prefill_running.load(std::memory_order_acquire)) { return 0; }
+    int promoted = 0; // experts promoted this call (drives the loader's adaptive backoff when warm)
     // Experts promoted into the locked RAM pool per loader tick, across ALL caches. The slow disk read
     // runs WITHOUT the mutex (see below), so a large budget does not lengthen any lock-hold; it only
     // fills the pool faster. The old default of 64/tick across ~80 layers was <1 expert/layer/tick, so
@@ -1034,26 +1171,36 @@ static void llama_moe_loader_fill_ram(std::vector<char> & scratch) {
                 c->ram_expert[(size_t) victim] = -1; // slot is "being filled", owned by us, unreadable
             }
 
-            // slow part, NO lock held: read the expert's bytes into the RAM pool slot for every proj
+            // slow part, NO lock held: read the expert's bytes into the RAM pool slot for every proj.
+            // Guard against the one-shot prefill: announce we are about to read, then re-check the prefill
+            // flag. If the prefill has started, bail (leave the slot empty, published below) so its writes
+            // to this slot cannot race ours. Otherwise the prefill's spin on g_moe_loader_reading waits for
+            // this read to finish before it touches any slot.
             bool ok = true;
-            for (size_t pi = 0; pi < c->proj.size(); ++pi) {
-                llama_moe_proj_store & pr = c->proj[pi];
-                if (!pr.ram) { continue; }
-                char * ramdst = (char *) pr.ram + (size_t) victim * pr.stride;
-                if (pr.fp_ld) {
-                    // use the loader's PRIVATE file handle - never the compute-thread pr.fp - so this
-                    // unlocked seek+read cannot race the compute callback's read on a shared position
-                    if (llama_moe_fseek64(pr.fp_ld, (int64_t) (pr.foff0 + (uint64_t) target_e * pr.stride), SEEK_SET) != 0 ||
-                        fread(ramdst, 1, (size_t) pr.stride, pr.fp_ld) != (size_t) pr.stride) {
-                        ok = false; break;
-                    }
-                } else {
-                    memcpy(ramdst, (const char *) pr.src->data + (size_t) target_e * pr.stride, (size_t) pr.stride);
-                    if (c->evict_after_ram) {
-                        llama_moe_evict_pagecache((const char *) pr.src->data + (size_t) target_e * pr.stride, (size_t) pr.stride);
+            g_moe_loader_reading.fetch_add(1, std::memory_order_seq_cst);
+            if (g_moe_prefill_running.load(std::memory_order_seq_cst)) {
+                ok = false; // prefill owns the pool now; abandon this fill cleanly
+            } else {
+                for (size_t pi = 0; pi < c->proj.size(); ++pi) {
+                    llama_moe_proj_store & pr = c->proj[pi];
+                    if (!pr.ram) { continue; }
+                    char * ramdst = (char *) pr.ram + (size_t) victim * pr.stride;
+                    if (pr.fp_ld) {
+                        // use the loader's PRIVATE file handle - never the compute-thread pr.fp - so this
+                        // unlocked seek+read cannot race the compute callback's read on a shared position
+                        if (llama_moe_fseek64(pr.fp_ld, (int64_t) (pr.foff0 + (uint64_t) target_e * pr.stride), SEEK_SET) != 0 ||
+                            fread(ramdst, 1, (size_t) pr.stride, pr.fp_ld) != (size_t) pr.stride) {
+                            ok = false; break;
+                        }
+                    } else {
+                        memcpy(ramdst, (const char *) pr.src->data + (size_t) target_e * pr.stride, (size_t) pr.stride);
+                        if (c->evict_after_ram) {
+                            llama_moe_evict_pagecache((const char *) pr.src->data + (size_t) target_e * pr.stride, (size_t) pr.stride);
+                        }
                     }
                 }
             }
+            g_moe_loader_reading.fetch_sub(1, std::memory_order_seq_cst);
 
             // publish under the lock: the slot's bytes are in place, make it readable as `target_e`
             {
@@ -1067,11 +1214,164 @@ static void llama_moe_loader_fill_ram(std::vector<char> & scratch) {
                 }
             }
             fill_budget--;
+            promoted++;
         }
     }
+    return promoted;
 }
 
-// background loader: keep each layer cache's hot experts resident. On a miss, evict the
+// fork: one-shot multi-threaded RAM-pool prefill (LLAMA_MOE_PREFILL). The background loader's fill_ram is
+// SERIAL (single fseek+fread per slab, one loader thread, 5ms per-tick sleep) so it does NOT saturate the
+// NVMe - the pool takes ~a minute to warm while decode misses to disk, and score-preload alone did not
+// help because the loader still fills at serial-read speed. This fills every cache's RAM pool to capacity
+// UP FRONT with a pool of io threads doing positioned reads (the same 16-thread pattern parallel_load uses
+// to hit ~2 GB/s), no compute/sync interleaved, no lock (runs before decode, no concurrent pool access).
+// Experts chosen by expert_score if seeded (LLAMA_MOE_SCORE_FILE), else by index. Pure I/O; correctness
+// unaffected (just pre-populates the RAM tier the loader would fill anyway). No-op if no RAM pool / no
+// no-mmap file handles (needs pr.fpath to open per-thread handles).
+static void llama_moe_prefill_ram_pools(void) {
+    const int64_t t0 = ggml_time_us();
+    int n_threads = 16;
+    if (const char * e = getenv("LLAMA_MOE_IO_THREADS")) { const int v = atoi(e); if (v > 0) { n_threads = v; } }
+
+    // Fence out the background loader's UNLOCKED reads: set the flag, then wait for any in-flight loader
+    // read to drain. After this, fill_ram bails at the top of every tick (and re-checks after announcing),
+    // so no loader write can land on a slot we are about to fill. Cleared on exit.
+    g_moe_prefill_running.store(true, std::memory_order_seq_cst);
+    while (g_moe_loader_reading.load(std::memory_order_seq_cst) != 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // Hold g_moe_layer_mutex for the whole prefill: it is a one-time startup barrier, so the background
+    // loader and the (blocked) first decode step must wait until the pool is warm. The threaded file reads
+    // below write to distinct pr.ram slots this function has already claimed, so they need no inner lock.
+    std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
+    std::vector<llama_moe_layer_cache *> caches;
+    caches.reserve(g_moe_layer_caches.size());
+    for (auto & kv : g_moe_layer_caches) { caches.push_back(kv.second); }
+
+    uint64_t total_bytes = 0;
+    int filled_caches = 0;
+    for (llama_moe_layer_cache * c : caches) {
+        if (!c || c->ram_capacity <= 0 || c->proj.empty() || !c->proj[0].ram) { continue; }
+        // need per-thread file handles (no-mmap path); skip if not registered
+        if (c->proj[0].fpath.empty()) { continue; }
+        const int rc = c->ram_capacity;
+        const int ne = c->n_expert;
+
+        // choose the rc experts to resident: highest expert_score first, else lowest index. This is the
+        // same target set fill_ram would converge to, computed once here.
+        std::vector<int> pick; pick.reserve((size_t) rc);
+        {
+            std::vector<int> idx(ne);
+            for (int e = 0; e < ne; ++e) { idx[e] = e; }
+            const std::vector<float> & sc = c->expert_score;
+            const bool have_scores = ((int) sc.size() == ne);
+            std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) {
+                const float sa = have_scores ? sc[(size_t) a] : 0.0f;
+                const float sb = have_scores ? sc[(size_t) b] : 0.0f;
+                if (sa != sb) { return sa > sb; } // highest score first
+                return a < b;                      // tie / cold: lowest index
+            });
+            for (int i = 0; i < rc && i < ne; ++i) { pick.push_back(idx[(size_t) i]); }
+        }
+
+        // assign RAM slots 0..rc-1 to the picked experts, publish the maps (no decode running yet)
+        for (int s = 0; s < (int) pick.size(); ++s) {
+            c->ram_expert[(size_t) s] = pick[(size_t) s];
+            c->ram_score[(size_t) s]  = ((int) c->expert_score.size() == ne) ? c->expert_score[(size_t) pick[(size_t) s]] : 0.0f;
+            c->ram_slot[(size_t) pick[(size_t) s]] = s;
+        }
+
+        // multi-threaded positioned reads: each thread opens its OWN handle per projection and reads a
+        // contiguous slice of the picked experts into their RAM slots. No lock, no shared file position.
+        const int np = (int) c->proj.size();
+        auto range = [&](int lo, int hi) {
+            std::vector<FILE *> fp((size_t) np, nullptr);
+            for (int pi = 0; pi < np; ++pi) {
+                if (!c->proj[(size_t) pi].fpath.empty()) { fp[(size_t) pi] = fopen(c->proj[(size_t) pi].fpath.c_str(), "rb"); }
+            }
+            for (int s = lo; s < hi; ++s) {
+                const int e = pick[(size_t) s];
+                for (int pi = 0; pi < np; ++pi) {
+                    llama_moe_proj_store & pr = c->proj[(size_t) pi];
+                    if (!pr.ram || !fp[(size_t) pi]) { continue; }
+                    char * dst = (char *) pr.ram + (size_t) s * pr.stride;
+                    llama_moe_pread(fp[(size_t) pi], pr.foff0 + (uint64_t) e * pr.stride, dst, pr.stride);
+                }
+            }
+            for (FILE * f : fp) { if (f) { fclose(f); } }
+        };
+        const int nl = (int) pick.size();
+        int nt = n_threads; if (nt > nl) { nt = nl; }
+        if (nt <= 1) {
+            range(0, nl);
+        } else {
+            std::vector<std::thread> pool;
+            for (int t = 0; t < nt; ++t) {
+                const int lo = (int) ((long long) t * nl / nt);
+                const int hi = (int) ((long long) (t + 1) * nl / nt);
+                if (lo < hi) { pool.emplace_back(range, lo, hi); }
+            }
+            for (auto & th : pool) { th.join(); }
+        }
+        for (int pi = 0; pi < np; ++pi) { total_bytes += (uint64_t) pick.size() * c->proj[(size_t) pi].stride; }
+        filled_caches++;
+    }
+
+    const double ms = (ggml_time_us() - t0) / 1000.0;
+    const double gb = total_bytes / (1024.0*1024.0*1024.0);
+    LLAMA_LOG_WARN("MoE stream: prefilled RAM pools - %.1f GiB across %d layers in %.1fs (%.2f GiB/s) "
+                   "with %d io threads (warm-start; skips the serial loader ramp).\n",
+                   gb, filled_caches, ms/1000.0, ms > 0 ? gb/(ms/1000.0) : 0.0, n_threads);
+
+    // VRAM slot-cache prefill: the RAM pool is now warm, so fill each layer's VRAM slots (0..capacity-1)
+    // with its top-`capacity` experts BEFORE decode, sourcing bytes from the RAM pool (~25 GB/s) instead of
+    // letting the first tokens warm VRAM one miss at a time. Same score-based pick as the RAM tier; VRAM is a
+    // subset of the RAM set, so this only front-loads H2D copies decode would do anyway - it does not gamble
+    // on future routing (a wrong pick is just evicted by normal LRU, no worse than a cold start). Uses the
+    // stock moe_layer_load_into_slot, which also publishes slot_table/stale_table so decode sees the experts
+    // immediately. Opt-out with LLAMA_MOE_PREFILL_VRAM=0. Held under the same mutex, before any decode step.
+    if (moe_env_on("LLAMA_MOE_PREFILL_VRAM", true)) {
+        const int64_t tv0 = ggml_time_us();
+        uint64_t vram_bytes = 0;
+        int vram_caches = 0;
+        std::vector<char> ldbuf;
+        for (llama_moe_layer_cache * c : caches) {
+            if (!c || c->capacity <= 0 || c->proj.empty() || !c->proj[0].dev) { continue; }
+            const int cap = c->capacity;
+            const int ne  = c->n_expert;
+            // pick the top-cap experts (highest expert_score, else lowest index) - same ranking as RAM
+            std::vector<int> idx(ne);
+            for (int e = 0; e < ne; ++e) { idx[e] = e; }
+            const std::vector<float> & sc = c->expert_score;
+            const bool have_scores = ((int) sc.size() == ne);
+            std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) {
+                const float sa = have_scores ? sc[(size_t) a] : 0.0f;
+                const float sb = have_scores ? sc[(size_t) b] : 0.0f;
+                if (sa != sb) { return sa > sb; }
+                return a < b;
+            });
+            for (int s = 0; s < cap && s < ne; ++s) {
+                const int e = idx[(size_t) s];
+                if (c->expert_slot[(size_t) e] >= 0) { continue; } // already resident (shouldn't happen pre-decode)
+                moe_layer_load_into_slot(c, e, s, ldbuf); // sources from warm RAM pool; publishes slot/stale tables
+                for (auto & pr : c->proj) { vram_bytes += (uint64_t) pr.stride; }
+            }
+            vram_caches++;
+        }
+        const double vms = (ggml_time_us() - tv0) / 1000.0;
+        const double vgb = vram_bytes / (1024.0*1024.0*1024.0);
+        LLAMA_LOG_WARN("MoE stream: prefilled VRAM caches - %.1f GiB across %d layers in %.1fs (%.2f GiB/s) "
+                       "from the warm RAM pool (skips per-token VRAM warm-up).\n",
+                       vgb, vram_caches, vms/1000.0, vms > 0 ? vgb/(vms/1000.0) : 0.0);
+    }
+
+    // pool is warm; let the background loader resume its maintenance ticks (it re-checks the flag, and
+    // still has to take the mutex we hold until this function returns, so it cannot act until we are done)
+    g_moe_prefill_running.store(false, std::memory_order_seq_cst);
+}
+
 // least-recently-used slot and load the expert into it across ALL projections, then
 // publish slot_table and finally resident_flag. resident_flag is written LAST so the
 // compute never treats an expert as resident before its slot and data are in place.
@@ -1080,11 +1380,23 @@ static void llama_moe_loader_main() {
     std::vector<int32_t> sel;
     std::vector<char>    ldbuf; // scratch for reading an expert from file (no-mmap) before H2D
     std::vector<std::vector<char>> ldstage; // per-(miss,proj) staging buffers, pre-read outside the lock
+    // Adaptive backoff (LLAMA_MOE_LOADER_BACKOFF, opt-in): once the pool is warm the loader keeps churning
+    // full-speed (VRAM promote + RAM fill every ~100us). The idea was that its continuous disk/PCIe traffic
+    // competes with the critical-path top-2 sync-load in the decode callback, so when a pass promotes NOTHING
+    // (warm pool) it sleeps progressively longer (cap 20ms) and snaps back the instant a pass finds work. The
+    // quality-bearing top-2 sync is never throttled - only this speculative background warming backs off.
+    // Default OFF: measured ~neutral. It cuts loader disk %-busy 55->42% (external typeperf, stable), but a
+    // colder RAM pool raises the critical-path top-2 sync read ~11% (148->164ms/640-calls) and drops RAM-hit
+    // ~88->70%; the two roughly cancel so tps can't distinguish them. Idleness-based backoff starves exactly
+    // the re-warming that keeps the top-2 in RAM. Kept as opt-in for a future contention-based variant.
+    static const bool loader_backoff = []() { const char * e = getenv("LLAMA_MOE_LOADER_BACKOFF"); return e && atoi(e) != 0; }();
+    int idle_passes = 0;
     while (g_moe_loader_run.load(std::memory_order_relaxed)) {
         if (no_loader) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
+        int pass_promoted = 0; // VRAM slot promotions this pass (+ RAM fills below); 0 => pool warm, back off
         // Snapshot the cache list under a brief registry lock, then process each cache under its OWN
         // acquisition of g_moe_layer_mutex, RELEASING the lock between caches. This bounds how long the
         // decode remap callback (which needs the same mutex per layer) waits on the loader to at most
@@ -1227,6 +1539,7 @@ static void llama_moe_loader_main() {
                         staged_ptr = staged.data();
                     }
                     moe_layer_load_into_slot(c, e, slot, ldbuf, staged_ptr);
+                    pass_promoted++;
                 }
             }
         }
@@ -1235,8 +1548,20 @@ static void llama_moe_loader_main() {
         // RAM (~25 GB/s) instead of faulting the model file from disk. The slow part - the fread of
         // an expert's bytes - is done WITHOUT holding g_moe_layer_mutex (so it never stalls decode's
         // publish or the CPU remap); the mutex is taken only briefly to pick a target and to publish.
-        llama_moe_loader_fill_ram(ldbuf);
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        pass_promoted += llama_moe_loader_fill_ram(ldbuf);
+        // Adaptive backoff: if this pass did real work, stay on the fast cadence (100us). If it promoted
+        // nothing (warm pool), ramp the sleep up so the loader stops competing with decode for disk/PCIe -
+        // but keep waking periodically (cap ~20ms) to catch routing drift. Snaps back to fast the moment a
+        // pass finds work. Disabled with LLAMA_MOE_LOADER_BACKOFF=0 (restores the old always-100us churn).
+        if (loader_backoff && pass_promoted == 0) {
+            if (idle_passes < 200) { idle_passes++; }
+            int sleep_us = 100 * idle_passes;      // linear ramp: 100us -> 20ms over ~200 idle passes
+            if (sleep_us > 20000) { sleep_us = 20000; }
+            std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+        } else {
+            idle_passes = 0;
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
     }
 }
 
@@ -1331,12 +1656,90 @@ ggml_tensor * llama_moe_cache_build_async(ggml_context *       ctx0,
     return p->dev;
 }
 
+// Auto-pick the RAM residency-pool size (experts/layer) from available system RAM, so users need not
+// tune LLAMA_MOE_RAM_CAP by hand. The pool holds high-weight experts in locked host RAM (~25 GB/s) so
+// VRAM-cache misses avoid a disk fault (~2 GB/s); bigger is faster UNTIL it starves the OS + the mmap
+// working set, at which point contention costs more than it saves (measured: filling to within ~6 GB of
+// system RAM regressed decode; ~13 GB headroom was the sweet spot). Budgeting mirrors
+// llama_moe_auto_capacity: this runs at the FIRST MoE layer's cache creation, so the other
+// (n_moe_layers-1) pools are NOT yet allocated - size the TOTAL pool footprint (all layers) from avail
+// RAM up front, then divide by layers. per_expert = sum of projection strides (bytes one expert costs
+// across gate/up/down). Returns experts/layer in [0, n_expert]; 0 if unmeasurable (tier stays off).
+//   LLAMA_MOE_RAM_CAP set (>0)   -> honored verbatim, this is not called
+//   LLAMA_MOE_RAM_FRAC=F         -> fraction of (avail - reserve) the pool may use (default 0.90)
+//   LLAMA_MOE_RAM_RESERVE_MB=N   -> MiB kept free for the OS + growing mmap working set (default 5120 = 5 GiB)
+static int llama_moe_auto_ram_capacity(const std::vector<llama_moe_proj_store> & proj, int n_expert) {
+    if (proj.empty() || n_expert <= 0) { return 0; }
+    // Compute ONCE and reuse for every layer (same reason as llama_moe_auto_capacity): this is called
+    // per layer as caches are created, and avail RAM shrinks as each layer's pool allocates - so
+    // recomputing would shrink the cap for later layers and under-fill RAM. Cache the first (max-avail)
+    // result so all layers get a uniform pool size.
+    static int cached_rc = 0;
+    if (cached_rc > 0) { return cached_rc; }
+
+    const uint64_t avail = llama_moe_avail_ram();
+    if (avail == 0) { return 0; }
+
+    uint64_t per_expert = 0; // bytes one resident expert costs across all projections of a layer
+    for (const auto & pr : proj) { per_expert += (uint64_t) pr.stride; }
+    if (per_expert == 0) { return 0; }
+
+    // Derive the MoE-layer count from the registered expert files (one entry per exps tensor, n_proj per
+    // layer). At the first layer's cache creation only this cache exists, but all expert files are
+    // registered up front at load time, so this is the true layer count - letting us budget for every
+    // layer's pool before the rest are allocated.
+    int n_moe_layers = proj.empty() ? 0 : (int) (g_moe_expert_files.size() / proj.size());
+    if (n_moe_layers < 1) { n_moe_layers = 1; }
+
+    double frac = 0.90;
+    if (const char * fe = getenv("LLAMA_MOE_RAM_FRAC")) {
+        const double f = atof(fe);
+        if (f > 0.05 && f < 0.98) { frac = f; }
+    }
+    // Kept free out of AVAILABLE RAM (not total): the OS, and the mmap working set of the model file that
+    // grows as experts are touched, need room. Measured on a 64 GB box (47 GB avail): a ~45 GB pool ran
+    // best; a ~55 GB pool (leaving ~6 GB free at runtime) regressed from contention. So target ~45 GB from
+    // 47 avail => frac 0.90 with a ~5 GB reserve. Raise the reserve if you see paging / a runtime slowdown.
+    uint64_t reserve = (uint64_t) 5120 * 1024 * 1024; // 5 GiB for OS + growing mmap working set
+    if (const char * re = getenv("LLAMA_MOE_RAM_RESERVE_MB")) {
+        const long long r = atoll(re);
+        if (r >= 0) { reserve = (uint64_t) r * 1024 * 1024; }
+    }
+    const uint64_t usable = avail > reserve ? (uint64_t) (frac * (double) (avail - reserve)) : 0;
+    if (usable == 0) { return 0; }
+
+    const uint64_t denom = (uint64_t) n_moe_layers * per_expert;
+    long long cap = (long long) (usable / denom);
+    if (cap < 0)        { cap = 0; }
+    if (cap > n_expert) { cap = n_expert; }
+    static bool logged = false;
+    if (!logged && cap > 0) {
+        logged = true;
+        const double gib = 1024.0*1024.0*1024.0;
+        const double pool_gib = (double) ((uint64_t) cap * denom) / gib;
+        LLAMA_LOG_WARN("MoE stream: auto RAM_CAP=%lld -> ~%.1f GiB host pool across %d MoE layers "
+                       "(avail %.1f GiB, reserve %.1f GiB for OS/mmap, frac %.2f, %.1f MiB/expert). "
+                       "Override with LLAMA_MOE_RAM_CAP; tune LLAMA_MOE_RAM_FRAC / LLAMA_MOE_RAM_RESERVE_MB.\n",
+                       cap, pool_gib, n_moe_layers, avail/gib, reserve/gib, frac, per_expert/(1024.0*1024.0));
+    }
+    if (cap > 0) { cached_rc = (int) cap; } // reuse for all remaining layers
+    return (int) cap;
+}
+
+// Look up an EXISTING per-layer cache by its first projection tensor (the map key), without creating
+// one. Used by the cross-layer prefetch to reach layer L+1's cache from layer L's graph build. Returns
+// null if that layer's cache has not been created yet (e.g. during the reserve pass).
+llama_moe_layer_cache * llama_moe_layer_cache_lookup(const ggml_tensor * exps0) {
+    std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
+    auto it = g_moe_layer_caches.find(exps0);
+    return it != g_moe_layer_caches.end() ? it->second : nullptr;
+}
+
 llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
                                                   ggml_tensor * const * exps_list,
                                                   int                   n_proj,
                                                   ggml_tensor *         selected_experts,
-                                                  int                   capacity) {
-    if (n_proj <= 0 || !exps_list || !exps_list[0]) {
+                                                  int                   capacity) {    if (n_proj <= 0 || !exps_list || !exps_list[0]) {
         return nullptr;
     }
     // The graph is built once during the sched_reserve/graph_reserve measurement pass, before
@@ -1392,6 +1795,10 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
     c->slot_pin.assign((size_t) capacity, 0);
     c->expert_slot.assign((size_t) n_expert, -1);
     c->expert_score.assign((size_t) n_expert, 0.0f);
+    // warm-start residency: if a persisted score file (LLAMA_MOE_SCORE_FILE) has this layer's learned
+    // scores, seed them so the loader fills the hot experts from tick 0 instead of by-index (skips the
+    // ~1400-token cold learning ramp). Hint only - correctness is unaffected.
+    llama_moe_scores_seed(exps_list[0], c->expert_score, n_expert);
     // seed each routing position u with a distinct real prewarm slot (slot u holds expert u after
     // prewarm below), so stale reuse starts from real experts and the n_used positions never collide.
     c->pos_slot.assign((size_t) n_used, 0);
@@ -1432,7 +1839,7 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
     // `src->data`. This keeps the OS page cache out of the expert path entirely - the only expert
     // bytes in RAM are the ones we deliberately hold in the locked pool. Falls back to mmap if any
     // projection lacks registration.
-    if (getenv("LLAMA_MOE_NOMMAP")) {
+    if (moe_env_on("LLAMA_MOE_NOMMAP", true)) {
         bool all_registered = true;
         for (int i = 0; i < n_proj; ++i) {
             auto fit = g_moe_expert_files.find(exps_list[i]);
@@ -1473,9 +1880,15 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
     }
 
     // high-weight experts that miss the VRAM cache are read from RAM instead of faulting mmap from
-    // disk. LLAMA_MOE_RAM_CAP = experts/layer to hold in RAM (0/unset => tier off). Clamp to n_expert.
-    if (const char * rc_env = getenv("LLAMA_MOE_RAM_CAP")) {
-        int rc = atoi(rc_env);
+    // disk. LLAMA_MOE_RAM_CAP = experts/layer to hold in RAM. Unset/0 => auto-sized from available
+    // system RAM (see llama_moe_auto_ram_capacity); a disk-streamed model always benefits from as large
+    // a RAM tier as fits, so auto is the sensible default rather than "off". Clamp to n_expert.
+    {
+        const char * rc_env = getenv("LLAMA_MOE_RAM_CAP");
+        int rc = rc_env ? atoi(rc_env) : 0;
+        if (!rc_env || rc <= 0) {
+            rc = llama_moe_auto_ram_capacity(c->proj, n_expert); // 0 if unmeasurable => tier stays off
+        }
         if (rc > n_expert) { rc = n_expert; }
         if (rc > 0) {
             bool ok = true;
@@ -1618,6 +2031,68 @@ ggml_tensor * llama_moe_layer_cache_dev(llama_moe_layer_cache * c, const ggml_te
     return nullptr;
 }
 
+bool llama_moe_layer_cache_backend_is_cuda(llama_moe_layer_cache * c) {
+    if (!c || !c->dev_backend) {
+        return false;
+    }
+    const char * name = ggml_backend_name(c->dev_backend);
+    return name && strstr(name, "CUDA") != nullptr;
+}
+
+// fork: read-only probe callback on the normalized gate weights. `a` is [1, n_expert_used, n_tokens],
+// each token's n_expert_used weights sum to 1 and are in descending order (argsort). Bins the top-1 and
+// top-1+top-2 weight to measure how "flat" hy3's routing is. dst is unused (no-op op).
+static void llama_moe_weight_diag_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    (void) dst; (void) nth; (void) userdata;
+    if (ith != 0) { return; }
+    const int64_t n_used   = a->ne[1];
+    const int64_t n_tokens = a->ne[2];
+    if (n_used < 1 || a->type != GGML_TYPE_F32 || !a->data) { return; }
+    const char * base = (const char *) a->data;
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        // read this token's n_used weights; element (0, u, t) at offset u*nb[1] + t*nb[2]. The weights may
+        // carry an arbitrary post-norm scale (hy3 expert_weights_scale=2.826), so normalize by their sum
+        // here to get a scale-invariant fraction (top-1's SHARE of the routed mass, in [0,1]).
+        double sum = 0.0; float w0 = 0.0f, w1 = 0.0f;
+        for (int64_t u = 0; u < n_used; ++u) {
+            const float w = *(const float *) (base + u * a->nb[1] + t * a->nb[2]);
+            sum += w;
+            if (u == 0) { w0 = w; }
+            if (u == 1) { w1 = w; }
+        }
+        if (sum <= 0.0) { continue; }
+        const float f0 = (float) (w0 / sum);          // top-1 share of routed weight
+        const float f01 = (float) ((w0 + w1) / sum);  // top-1+top-2 share
+        g_wdiag_tokens.fetch_add(1, std::memory_order_relaxed);
+        if (f0 < 0.20f) { g_wdiag_top1_lt20.fetch_add(1, std::memory_order_relaxed); }
+        if (f0 < 0.15f) { g_wdiag_top1_lt15.fetch_add(1, std::memory_order_relaxed); }
+        if (f0 > 0.40f) { g_wdiag_top1_gt40.fetch_add(1, std::memory_order_relaxed); }
+        g_wdiag_top2sum_x1000.fetch_add((uint64_t) (f01 * 1000.0f), std::memory_order_relaxed);
+    }
+    // print every ~2560 token-layers (=32 tokens x 80 layers) so it shows without spamming
+    const uint64_t tok = g_wdiag_tokens.load(std::memory_order_relaxed);
+    static std::atomic<uint64_t> last_print{0};
+    uint64_t lp = last_print.load(std::memory_order_relaxed);
+    if (tok - lp >= 2560 && last_print.compare_exchange_strong(lp, tok)) {
+        const uint64_t n = tok ? tok : 1;
+        LLAMA_LOG_WARN("MoE weight-diag: %llu token-layers | top1<0.20: %.0f%%  top1<0.15: %.0f%%  "
+                       "top1>0.40: %.0f%%  mean(top1+top2)=%.2f\n",
+                       (unsigned long long) tok,
+                       100.0 * (double) g_wdiag_top1_lt20.load() / (double) n,
+                       100.0 * (double) g_wdiag_top1_lt15.load() / (double) n,
+                       100.0 * (double) g_wdiag_top1_gt40.load() / (double) n,
+                       (double) g_wdiag_top2sum_x1000.load() / 1000.0 / (double) n);
+    }
+}
+
+void llama_moe_weight_diag_probe(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * weights) {
+    if (!getenv("LLAMA_MOE_WEIGHT_DIAG") || !weights || !gf) { return; }
+    // map_custom1 reads weights and writes a throwaway dst; expand it directly so it runs. Its output is
+    // never consumed, so it cannot affect the model's computation - purely observational.
+    ggml_tensor * probe = ggml_map_custom1(ctx0, weights, llama_moe_weight_diag_cb, 1, nullptr);
+    ggml_build_forward_expand(gf, probe);
+}
+
 void llama_moe_layer_cache_publish(llama_moe_layer_cache * c,
                                    ggml_context *          ctx0,
                                    ggml_cgraph *           gf,
@@ -1635,6 +2110,33 @@ void llama_moe_layer_cache_publish(llama_moe_layer_cache * c,
         dst = ggml_view_2d(ctx0, c->sel_buf, c->sel_buf->ne[0], selected_experts->ne[1], c->sel_buf->nb[1], 0);
     }
     ggml_tensor * cpy = ggml_cpy(ctx0, selected_experts, dst);
+    ggml_build_forward_expand(gf, cpy);
+}
+
+void llama_moe_layer_cache_prefetch(llama_moe_layer_cache * next_c,
+                                    ggml_context *          ctx0,
+                                    ggml_cgraph *           gf,
+                                    ggml_tensor *           pred) {
+    if (!next_c || !next_c->sel_buf || !pred) {
+        return;
+    }
+    // Publish the predicted selection into the NEXT layer's sel_buf so its background loader warms the
+    // candidates during THIS layer's compute. Copy the leading sel_buf->ne[0] rows of `pred` (the
+    // highest-weight predicted experts, since pred is argsort output). pred is [k, n_tokens]; take a
+    // view of its first n_used rows to match sel_buf's width. Column count must fit sel_buf.
+    const int64_t n_used = next_c->sel_buf->ne[0];
+    if (pred->ne[0] < n_used || pred->ne[1] > next_c->sel_buf->ne[1]) {
+        return;
+    }
+    ggml_tensor * src = pred;
+    if (pred->ne[0] != n_used) {
+        src = ggml_view_2d(ctx0, pred, n_used, pred->ne[1], pred->nb[1], 0);
+    }
+    ggml_tensor * dst = next_c->sel_buf;
+    if (pred->ne[1] != next_c->sel_buf->ne[1]) {
+        dst = ggml_view_2d(ctx0, next_c->sel_buf, n_used, pred->ne[1], next_c->sel_buf->nb[1], 0);
+    }
+    ggml_tensor * cpy = ggml_cpy(ctx0, src, dst);
     ggml_build_forward_expand(gf, cpy);
 }
 
@@ -1693,6 +2195,7 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
     if (nl == 0) {
         return;
     }
+    const bool diag = getenv("LLAMA_MOE_DIAG") != nullptr; // split read vs H2D timing (parallel_load audit)
     std::vector<size_t> order(nl);
     for (size_t i = 0; i < nl; ++i) {
         order[i] = i;
@@ -1787,19 +2290,23 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
                     stg = scratch.data();
                 }
                 bool ok;
+                const int64_t t_rd0 = diag ? ggml_time_us() : 0;
                 if (par_read && tfp[pi]) {
                     ok = llama_moe_pread(tfp[pi], pr.foff0 + (uint64_t) e * stride, stg, stride);
                 } else {
                     // single-thread / no private handle: use the shared read path (holds compute fp)
                     ok = llama_moe_read_expert(c, pi, e, stg);
                 }
+                if (diag) { g_diag_read_ns += (uint64_t) (ggml_time_us() - t_rd0); }
                 if (ok) {
                     // NOTE: in async mode a pinned staging slot is reused per (thread,proj) across
                     // experts, so we must issue its H2D before the next expert overwrites it. With the
                     // pinned arena the async copy reads the slot immediately on enqueue on the same
                     // stream, but to be safe against reuse we issue staged H2D synchronously here and
                     // only async-batch the direct-source (RAM/mmap, stable pointer) copies above.
+                    const int64_t t_h0 = diag ? ggml_time_us() : 0;
                     ggml_backend_tensor_set(pr.dev, stg, (size_t) slot * stride, stride);
+                    if (diag) { g_diag_h2d_ns += (uint64_t) (ggml_time_us() - t_h0); }
                 }
             }
         }
@@ -1831,10 +2338,12 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
     // single synchronize (instead of one cudaStreamSynchronize per copy). Sources are stable host
     // pointers (RAM pool / mmap), safe to read after the reads completed above.
     if (async_h2d && !pend.empty()) {
+        const int64_t t_b0 = diag ? ggml_time_us() : 0;
         for (const auto & p : pend) {
             ggml_backend_tensor_set_async(c->dev_backend, p.dev, p.src, p.off, p.bytes);
         }
         ggml_backend_synchronize(c->dev_backend);
+        if (diag) { g_diag_h2d_ns += (uint64_t) (ggml_time_us() - t_b0); }
     }
 }
 
@@ -1844,6 +2353,60 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
 // the downstream mul_mat_id GPU split is enqueued; the synchronous ggml_backend_tensor_set here
 // blocks the host until the H2D copy lands, so every slot this callback resolves is resident in
 // VRAM before the matmul that reads these ids runs. See llama_moe_cache_remap_cb for the same
+static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+
+// fork: coverage-mode remap callback (LLAMA_MOE_SYNC_COVER). `a` = selected_experts [n_used, 1] (argsort,
+// descending gate weight); `b` = normalized weights [1, n_used, 1]. Computes this step's per-expert weight
+// share into c->step_wexp and sets c->step_cover, then delegates to remap_cb, which applies the rule:
+// sync missing experts weight-descending but STOP once (already-cached + synced) weight coverage reaches
+// the threshold, AND never sync more than sync_budget (top-2) misses. So the sync count is
+// min(top-2, experts-needed-to-reach-coverage): the top-2 cap guarantees the proven quality floor, and
+// coverage lets a step whose cached experts already cover enough weight skip even those loads. Directly
+// handles the user's case (cached experts' weight already high -> load fewer/none) without ever exceeding
+// the safe budget.
+static void llama_moe_layer_remap_cov_cb(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b,
+                                         int ith, int nth, void * userdata) {
+    (void) nth;
+    llama_moe_layer_cache * c = (llama_moe_layer_cache *) userdata;
+    if (ith == 0 && c && b && b->type == GGML_TYPE_F32 && b->data && a->ne[1] == 1) {
+        const int64_t n_used = a->ne[0];
+        const int32_t * sel = (const int32_t *) a->data;
+        const char * wbase = (const char *) b->data;
+        double wsum = 0.0;
+        for (int64_t u = 0; u < n_used; ++u) { wsum += *(const float *) (wbase + u * b->nb[1]); }
+        if ((int) c->step_wexp.size() != c->n_expert) { c->step_wexp.assign((size_t) c->n_expert, 0.0f); }
+        else { std::fill(c->step_wexp.begin(), c->step_wexp.end(), 0.0f); }
+        double cached_cover = 0.0;
+        if (wsum > 0.0) {
+            for (int64_t u = 0; u < n_used; ++u) {
+                const int32_t e = sel[u];
+                if (e < 0 || e >= c->n_expert) { continue; }
+                const float w = (float) (*(const float *) (wbase + u * b->nb[1]) / wsum);
+                c->step_wexp[(size_t) e] = w;
+                if (c->expert_slot[(size_t) e] >= 0) { cached_cover += w; }
+            }
+        }
+        c->step_cover = c->sync_cover; // active threshold for remap_cb this step
+        // diagnostic: how many the coverage rule will sync (min(budget, needed-to-reach-cover))
+        g_cov_tokens.fetch_add(1, std::memory_order_relaxed);
+        g_cov_cached_x1000.fetch_add((uint64_t) (cached_cover * 1000.0), std::memory_order_relaxed);
+        if (cached_cover >= c->sync_cover) { g_cov_zero_sync.fetch_add(1, std::memory_order_relaxed); }
+        const uint64_t tok = g_cov_tokens.load(std::memory_order_relaxed);
+        static std::atomic<uint64_t> last{0};
+        uint64_t lp = last.load(std::memory_order_relaxed);
+        if (tok - lp >= 2560 && last.compare_exchange_strong(lp, tok)) {
+            const uint64_t nn = tok ? tok : 1;
+            LLAMA_LOG_WARN("MoE cover-diag: %llu token-layers | cached-cover mean=%.0f%% | "
+                           "already-covered(zero-sync) %.0f%% of tokens | synced mean=%.2f/token\n",
+                           (unsigned long long) tok,
+                           100.0 * (double) g_cov_cached_x1000.load() / 1000.0 / (double) nn,
+                           100.0 * (double) g_cov_zero_sync.load() / (double) nn,
+                           (double) g_cov_synced.load() / (double) nn);
+        }
+    }
+    llama_moe_layer_remap_cb(dst, a, ith, nth, userdata);
+}
+
 // pattern on the per-tensor cache.
 //
 // Concurrency vs the background loader (shares g_moe_layer_mutex): this callback does NOT advance
@@ -1861,6 +2424,17 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     const int64_t n_used   = a->ne[0];
     const int64_t n_tokens = a->ne[1];
     const int64_t n        = n_used * n_tokens;
+
+    // One-shot RAM-pool prefill (LLAMA_MOE_PREFILL): fire on the VERY FIRST remap callback, which is the
+    // first prompt-eval layer (n_tokens>1) - by then every layer cache and its RAM pool already exist (the
+    // whole graph is built, so all 80 caches registered, before any compute runs). Filling here charges the
+    // ~4s one-time read to the prompt-eval/startup window instead of the first decode token, so the reported
+    // decode tok/s reflects the warm steady state a user actually feels, not the startup cost. Runs once,
+    // before this callback takes the mutex. Skips the ~minute-long serial background-loader warm-up ramp.
+    if (moe_env_on("LLAMA_MOE_PREFILL", true)) {
+        static std::once_flag prefill_flag;
+        std::call_once(prefill_flag, []() { llama_moe_prefill_ram_pools(); });
+    }
 
     std::vector<int32_t> flat;
     llama_moe_flatten_ids(a, flat);
@@ -1980,6 +2554,34 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     }
     if (n_tokens == 1) { c->pos_init = true; }
 
+    // Coverage early-stop (LLAMA_MOE_SYNC_COVER, set via cov_cb into step_cover/step_wexp): sync missing
+    // experts weight-descending but STOP once (already-cached + synced) gate-weight coverage reaches the
+    // threshold. Still capped by order_n (=sync_budget, top-2), so the sync count is min(top-2, needed-for-
+    // coverage): the cap guarantees the proven quality floor, coverage lets a step whose cached experts
+    // already cover enough weight skip loads. cov_active gates it; when off, behaviour is exactly as before.
+    // gate coverage off on first_decode (that step intentionally loads all 8 for a correct baseline) and
+    // only sum coverage over the SAME experts the sync loop will inspect (order_n, = top-2 budget in steady
+    // state). Summing the full first-decode order (8) wrongly reached the threshold and skipped real loads.
+    const bool cov_active = (c->step_cover > 0.0f) && ((int) c->step_wexp.size() == c->n_expert)
+                            && (n_tokens == 1) && !first_decode;
+    double cov_have = 0.0; // weight already covered by cached experts among the inspected order
+    if (cov_active) {
+        for (int r = 0; r < order_n; ++r) {
+            const int32_t e = order[(size_t) r];
+            if (e >= 0 && e < c->n_expert && c->expert_slot[(size_t) e] >= 0) {
+                cov_have += c->step_wexp[(size_t) e];
+            }
+        }
+    }
+    // COVDBG: capture the initial top-2 cached coverage vs the active threshold, before any sync this step.
+    const bool covdbg = cov_active && getenv("LLAMA_MOE_COVDBG");
+    int covdbg_earlystop = 0;
+    if (covdbg) {
+        g_covss_tokens.fetch_add(1, std::memory_order_relaxed);
+        g_covss_have_x1000.fetch_add((uint64_t) (cov_have * 1000.0), std::memory_order_relaxed);
+        g_covss_cover_x1000.fetch_add((uint64_t) (c->step_cover * 1000.0), std::memory_order_relaxed);
+    }
+
     // Resolve residency. Hits pin their slot; misses among the inspected positions are loaded into an
     // unpinned victim slot (bytes loaded in parallel below), then pinned too. Any expert not inspected
     // or not loaded maps to a zero sentinel slot when writing dst.
@@ -1997,6 +2599,14 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         // gated by the threshold decision (do_sync).
         if (c->sync_budget <= 0 && !do_sync) {
             continue; // below threshold: leave dropped, loader will warm it
+        }
+        // coverage early-stop: if the already-cached experts (plus misses synced so far this step) already
+        // cover >= step_cover of the routed weight, skip syncing this (lower-weight) miss - leave it stale.
+        // This is what lets a well-covered step load fewer than the budget. The budget cap (order_n) still
+        // bounds the max, so we never sync MORE than the proven-safe top-2.
+        if (cov_active && cov_have >= (double) c->step_cover) {
+            if (covdbg) { covdbg_earlystop++; }
+            continue;
         }
         // pick an eviction victim among slots not pinned this step: empty first; then, in weighted
         // mode, the LOWEST-score slot (protect the high-weight core), else the oldest (age-LRU).
@@ -2033,6 +2643,25 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         c->slot_pin[(size_t) victim]    = gen;
         load_e.push_back(e);
         load_slot.push_back(victim);
+        if (cov_active) {
+            cov_have += c->step_wexp[(size_t) e]; // this synced expert now contributes to coverage
+            g_cov_synced.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (covdbg) {
+        g_covss_earlystop.fetch_add((uint64_t) covdbg_earlystop, std::memory_order_relaxed);
+        const uint64_t tk = g_covss_tokens.load(std::memory_order_relaxed);
+        static std::atomic<uint64_t> last{0};
+        uint64_t lp = last.load(std::memory_order_relaxed);
+        if (tk - lp >= 2560 && last.compare_exchange_strong(lp, tk)) {
+            const double nn = tk ? (double) tk : 1.0;
+            LLAMA_LOG_WARN("MoE COVDBG: %llu tok-layers | cover thr mean=%.3f | initial cov_have (top-%d cached) "
+                           "mean=%.3f | early-stopped misses mean=%.3f/tok\n",
+                           (unsigned long long) tk,
+                           (double) g_covss_cover_x1000.load() / 1000.0 / nn, order_n,
+                           (double) g_covss_have_x1000.load() / 1000.0 / nn,
+                           (double) g_covss_earlystop.load() / nn);
+        }
     }
 
     // load the missed experts' bytes into their claimed slots (parallel disk reads)
@@ -2049,15 +2678,18 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         }
     }
     llama_moe_layer_parallel_load(c, load_e, load_slot);
+    c->step_cover = 0.0f; // consumed for this step; cov_cb re-sets it next step if coverage mode is on
     g_diag_pl_ns    += (uint64_t) (ggml_time_us() - diag_pl0);
     g_diag_sync_cnt += (uint64_t) load_e.size();
     // publish the freshly loaded slots into the device slot_table only after their data is in
     // place (keeps slot_table consistent for the background loader's bookkeeping)
+    const int64_t diag_pub0 = ggml_time_us();
     for (size_t i = 0; i < load_e.size(); ++i) {
         ggml_backend_tensor_set(c->slot_table, &load_slot[i], (size_t) load_e[i] * sizeof(int32_t), sizeof(int32_t));
         moe_stale_on_load(c, load_e[i], load_slot[i]); // mirror into stale_table for the pure-GPU decode path
         c->last_settled_slot = load_slot[i];
     }
+    if (getenv("LLAMA_MOE_DIAG")) { g_diag_publish_ns += (uint64_t) (ggml_time_us() - diag_pub0); }
 
     // Write the resolved slot per routing position. A resident expert -> its real slot; a dropped
     // Write the resolved slot per routing position. Resident expert -> its real slot. A MISSING
@@ -2132,23 +2764,188 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
             const double cb_ms = g_diag_cb_ns / 1000.0;
             const double pl_ms = g_diag_pl_ns / 1000.0;
             const double lw_ms = g_diag_lockwait_ns / 1000.0;
+            const double pub_ms = g_diag_publish_ns / 1000.0;
+            const double rd_ms  = g_diag_read_ns.load() / 1000.0; // parallel_load: disk fread
+            const double h2d_ms = g_diag_h2d_ns.load() / 1000.0;  // parallel_load: H2D (staged sync + batch sync)
             // per-step (640 calls / 80 layers = 8 steps): callback time and how much is disk/H2D load
             const uint64_t sc = g_diag_sync_cnt ? g_diag_sync_cnt : 1;
-            LLAMA_LOG_WARN("MoE timing/640-calls: callback %.0fms, parallel_load(disk+H2D) %.0fms (%.0f%%), "
-                           "other(CPU remap) %.0fms; LOCK-WAIT %.0fms; sync-loaded %llu (RAM-hit %.0f%%, DISK %llu)\n",
-                           cb_ms, pl_ms, cb_ms > 0 ? 100.0 * pl_ms / cb_ms : 0.0, cb_ms - pl_ms, lw_ms,
+            LLAMA_LOG_WARN("MoE timing/640-calls: callback %.0fms, parallel_load %.0fms (read %.0f + H2D %.0f + other %.0f), "
+                           "publish %.0fms, remap %.0fms; LOCK-WAIT %.0fms; sync-loaded %llu (RAM-hit %.0f%%, DISK %llu)\n",
+                           cb_ms, pl_ms, rd_ms, h2d_ms, pl_ms - rd_ms - h2d_ms, pub_ms, cb_ms - pl_ms - pub_ms, lw_ms,
                            (unsigned long long) g_diag_sync_cnt,
                            100.0 * (double) g_diag_ram_hit / (double) sc,
                            (unsigned long long) (g_diag_sync_cnt - g_diag_ram_hit));
-            g_diag_cb_ns = g_diag_pl_ns = g_diag_sync_cnt = g_diag_ram_hit = g_diag_lockwait_ns = 0;
+            g_diag_cb_ns = g_diag_pl_ns = g_diag_sync_cnt = g_diag_ram_hit = g_diag_lockwait_ns = g_diag_publish_ns = 0;
+            g_diag_read_ns = 0; g_diag_h2d_ns = 0;
         }
     }
+}
+
+// fork: host callback for the fused CUDA GGML_OP_MOE_FFN op. The CUDA op has already copied the routing
+// ids to sel_host; this plans residency + sync-loads the missing top-N experts into the device cache and
+// writes the resolved slot per position into ids_host. It reuses llama_moe_layer_remap_cb verbatim (the
+// proven residency/eviction/load logic) by wrapping the host arrays in contiguous stand-in tensors - so
+// there is a single source of truth for "which slot does each routing position map to". remap_cb takes
+// g_moe_layer_mutex itself, so we must not hold it here. Runs on the host inside the CUDA op, before the
+// expert matmuls, so the loaded slabs are in VRAM by the time mul_mat_id reads them (same stream).
+static void llama_moe_ffn_sync(void * cache, const int32_t * sel_host, int32_t * ids_host,
+                               int n_used, int n_tokens) {
+    llama_moe_layer_cache * c = (llama_moe_layer_cache *) cache;
+    if (!c) { return; }
+
+    ggml_tensor a;   // stand-in for `selected_experts` (remap_cb reads a->data via nb strides)
+    memset(&a, 0, sizeof(a));
+    a.type = GGML_TYPE_I32;
+    a.ne[0] = n_used; a.ne[1] = n_tokens; a.ne[2] = 1; a.ne[3] = 1;
+    a.nb[0] = sizeof(int32_t);
+    a.nb[1] = a.ne[0]*a.nb[0];
+    a.nb[2] = a.ne[1]*a.nb[1];
+    a.nb[3] = a.ne[2]*a.nb[2];
+    a.data  = (void *) sel_host;
+
+    ggml_tensor d = a; // stand-in for the map_custom dst (remap_cb writes slot ids into d->data)
+    d.data = ids_host;
+
+    llama_moe_layer_remap_cb(&d, &a, /*ith=*/0, /*nth=*/1, c);
+}
+
+ggml_moe_ffn_sync_fn llama_moe_layer_cache_sync_fn(void) {
+    return llama_moe_ffn_sync;
+}
+
+// fork: CPU expert lane (Pulsar-style). For each routed position whose expert is resident in the host
+// RAM pool, compute the FULL FFN on the CPU with ggml's AVX2 quantized vec_dot - no H2D upload, no VRAM
+// slot - and accumulate its weighted contribution into partial_host. Zeroes the router weight of every
+// handled position so the GPU weighted-sum excludes it (the caller uploads the modified weights and adds
+// partial_host). Byte-identical math to the GPU path (same quantized weights, q8_K-quantized activations,
+// silu(gate)*up). Threaded across (position) jobs. Returns the number of positions handled.
+//
+// Layout (verified): gate/up expert slab = n_ff rows of n_embd quantized elems; down slab = n_embd rows
+// of n_ff quantized elems. One row = ggml_row_size(type, k). vec_dot(k, &s, 0, wrow, 0, actq, 0, 1).
+static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weights_host,
+                              const int32_t * sel_host, int32_t * /*ids_host*/, float * partial_host,
+                              int n_used, int n_tokens, int n_embd, int n_ff, int /*gpu_skip_slot*/) {
+    llama_moe_layer_cache * c = (llama_moe_layer_cache *) cache;
+    if (!c || c->proj.size() < 3) { return 0; }
+
+    // Projection order is fixed by build_moe_ffn's registration (llama-graph.cpp: projs[] =
+    // {gate_exps, up_exps, down_exps} when gate_up_exps is null, which the fused-op guard requires), so
+    // proj[0]=gate, proj[1]=up, proj[2]=down. gate/up share n_embd input dim; down takes the n_ff mid.
+    const llama_moe_proj_store & gate_pr = c->proj[0];
+    const llama_moe_proj_store & up_pr   = c->proj[1];
+    const llama_moe_proj_store & down_pr = c->proj[2];
+
+    const ggml_type wtype = gate_pr.src ? gate_pr.src->type : GGML_TYPE_COUNT;
+    if (wtype == GGML_TYPE_COUNT) { return 0; }
+    const ggml_type dtype = down_pr.src ? down_pr.src->type : GGML_TYPE_COUNT;
+    const auto * tt_gu = ggml_get_type_traits_cpu(wtype);   // gate/up weight traits
+    const auto * tt_dn = ggml_get_type_traits_cpu(dtype);   // down weight traits
+    if (!tt_gu || !tt_gu->vec_dot || !tt_gu->from_float) { return 0; }
+    if (!tt_dn || !tt_dn->vec_dot || !tt_dn->from_float) { return 0; }
+    const ggml_type gu_vdt = tt_gu->vec_dot_type; // activation quant type for gate/up dots
+    const ggml_type dn_vdt = tt_dn->vec_dot_type; // activation quant type for down dots
+
+    const size_t gu_rowbytes = ggml_row_size(wtype, n_embd); // one gate/up weight row (n_embd elems)
+    const size_t dn_rowbytes = ggml_row_size(dtype, n_ff);   // one down weight row (n_ff elems)
+
+    // Build the CPU job list under the lock: each job is a (token, used-position) whose expert is
+    // RAM-resident in ALL three projections. Zero its router weight so the GPU sum drops it. We snapshot
+    // the RAM pointers here; the slots are pinned by the residency machinery until this step completes.
+    struct Job { int t; int u; int e; float w; const char * gate; const char * up; const char * down; };
+    std::vector<Job> jobs;
+    {
+        std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
+        if (gate_pr.ram == nullptr) { return 0; } // RAM tier off => nothing to do on the CPU
+        for (int t = 0; t < n_tokens; ++t) {
+            for (int u = 0; u < n_used; ++u) {
+                const int32_t e = sel_host[(size_t) (t * n_used + u)];
+                if (e < 0 || e >= c->n_expert) { continue; }
+                const int32_t rs = c->ram_slot[(size_t) e];
+                if (rs < 0) { continue; } // not RAM-resident => leave it to the GPU
+                Job j;
+                j.t = t; j.u = u; j.e = e;
+                j.w = weights_host[(size_t) (t * n_used + u)];
+                j.gate = (const char *) gate_pr.ram + (size_t) rs * gate_pr.stride;
+                j.up   = (const char *) up_pr.ram   + (size_t) rs * up_pr.stride;
+                j.down = (const char *) down_pr.ram + (size_t) rs * down_pr.stride;
+                jobs.push_back(j);
+                weights_host[(size_t) (t * n_used + u)] = 0.0f; // GPU sum excludes this position
+            }
+        }
+    }
+    if (jobs.empty()) { return 0; }
+
+    // per-token output accumulator is shared, so guard the final add; the heavy dots are lock-free.
+    std::mutex out_mtx;
+    const size_t act_gu_bytes = ggml_row_size(gu_vdt, n_embd);
+    const size_t act_dn_bytes = ggml_row_size(dn_vdt, n_ff);
+
+    int nthreads = 1;
+    if (const char * e = getenv("LLAMA_MOE_IO_THREADS")) { nthreads = atoi(e); }
+    if (nthreads < 1) { nthreads = 1; }
+    if (nthreads > (int) jobs.size()) { nthreads = (int) jobs.size(); }
+
+    auto worker = [&](int tid) {
+        // per-thread scratch: quantized input row (shared across a token's experts), gate/up/mid buffers
+        std::vector<char>  xq(act_gu_bytes);   // q8_K of the token's n_embd input
+        std::vector<char>  midq(act_dn_bytes); // q8_K of the n_ff intermediate
+        std::vector<float> mid((size_t) n_ff);
+        std::vector<float> out((size_t) n_embd);
+        int last_t = -1;
+        for (size_t ji = (size_t) tid; ji < jobs.size(); ji += (size_t) nthreads) {
+            const Job & j = jobs[ji];
+            // quantize this token's input activations to the gate/up dot type (reuse across experts of
+            // the same token handled by this thread)
+            if (j.t != last_t) {
+                tt_gu->from_float(cur_host + (size_t) j.t * n_embd, xq.data(), n_embd);
+                last_t = j.t;
+            }
+            // gate/up: n_ff rows each -> silu(gate)*up
+            for (int f = 0; f < n_ff; ++f) {
+                float g = 0.0f, u = 0.0f;
+                tt_gu->vec_dot(n_embd, &g, 0, j.gate + (size_t) f * gu_rowbytes, 0, xq.data(), 0, 1);
+                tt_gu->vec_dot(n_embd, &u, 0, j.up   + (size_t) f * gu_rowbytes, 0, xq.data(), 0, 1);
+                const float s = g / (1.0f + expf(-g)); // silu(gate)
+                mid[(size_t) f] = s * u;
+            }
+            // quantize the intermediate to the down dot type
+            tt_dn->from_float(mid.data(), midq.data(), n_ff);
+            // down: n_embd rows -> out
+            for (int i = 0; i < n_embd; ++i) {
+                float o = 0.0f;
+                tt_dn->vec_dot(n_ff, &o, 0, j.down + (size_t) i * dn_rowbytes, 0, midq.data(), 0, 1);
+                out[(size_t) i] = o * j.w;
+            }
+            // accumulate into the shared per-token partial
+            {
+                std::lock_guard<std::mutex> lk(out_mtx);
+                float * dst = partial_host + (size_t) j.t * n_embd;
+                for (int i = 0; i < n_embd; ++i) { dst[i] += out[(size_t) i]; }
+            }
+        }
+    };
+
+    if (nthreads == 1) {
+        worker(0);
+    } else {
+        std::vector<std::thread> pool;
+        for (int t = 1; t < nthreads; ++t) { pool.emplace_back(worker, t); }
+        worker(0);
+        for (auto & th : pool) { th.join(); }
+    }
+    return (int) jobs.size();
+}
+
+ggml_moe_ffn_cpu_fn llama_moe_layer_cache_cpu_fn(void) {
+    return llama_moe_cpu_lane;
 }
 
 ggml_tensor * llama_moe_layer_cache_remap(llama_moe_layer_cache * c,
                                           ggml_context *          ctx0,
                                           ggml_tensor *           selected_experts,
-                                          float                   threshold) {
+                                          ggml_tensor *           weights,
+                                          float                   threshold,
+                                          int                     sync_budget) {
     if (!c) {
         return nullptr;
     }
@@ -2163,17 +2960,37 @@ ggml_tensor * llama_moe_layer_cache_remap(llama_moe_layer_cache * c,
     // weighted_evict is set at cache creation (default on) so the background loader uses it too;
     // do not clobber it here.
     // Per-step sync budget applies to DECODE only (n_tokens==1). Prefill must load the whole prompt
-    // working set (bounded by capacity via the threshold), so budget must not throttle it.
+    // working set (bounded by capacity via the threshold), so budget must not throttle it. The caller
+    // (build_moe_ffn) already resolved the effective budget once (env value, else 2 on the async path,
+    // else 0) so both the decode-path selection and this cache agree - do not re-read the env here. The
+    // HYBRID_BUDGET probe still applies only when no budget was passed (the static per-layer hybrid runs
+    // with SYNC_BUDGET unset so it does not force ALL layers onto the CPU path).
     c->sync_budget = 0;
     if (selected_experts->ne[1] <= 1) {
-        if (const char * b_env = getenv("LLAMA_MOE_SYNC_BUDGET")) {
-            c->sync_budget = atoi(b_env);
-            if (c->sync_budget < 0) { c->sync_budget = 0; }
+        if (sync_budget > 0) {
+            c->sync_budget = sync_budget;
         } else if (const char * hb = getenv("LLAMA_MOE_HYBRID_BUDGET")) {
-            // static per-layer hybrid: the CPU-path layers use this budget without the global
-            // SYNC_BUDGET (which would force ALL layers onto the CPU path). Decode only.
             c->sync_budget = atoi(hb);
             if (c->sync_budget < 0) { c->sync_budget = 0; }
+        }
+    }
+    // Coverage mode (LLAMA_MOE_SYNC_COVER=F, decode only): size the sync set by weight coverage instead of
+    // a fixed budget - sync missing top-K experts weight-descending but stop once (cached+synced) gate weight
+    // reaches F, capped at sync_budget (top-2). The earlier garbage bug (COV=0.9 dropping real top-2 loads)
+    // was cov_have summing over the full first-decode order of 8 experts (weights sum to 1.0), which cleared
+    // any threshold <1 and fired spurious early-stops; fixed by gating coverage off on first_decode and only
+    // summing over order_n (see the early-stop block in remap_cb). Verified with LLAMA_MOE_COVDBG: at 0.9 the
+    // early-stop fires 0.000/tok (== baseline, coherent); at 0.15 it fires ~0.45/tok and stays coherent.
+    // Still gated behind LLAMA_MOE_SYNC_COVER_ENABLE=1 so it stays opt-in.
+    c->sync_cover = 0.0f;
+    if (getenv("LLAMA_MOE_SYNC_COVER_ENABLE") && weights &&
+        selected_experts->ne[1] == 1 && weights->ne[1] == selected_experts->ne[0]) {
+        if (const char * cv = getenv("LLAMA_MOE_SYNC_COVER")) {
+            const float f = (float) atof(cv);
+            if (f > 0.0f) {
+                c->sync_cover = f > 1.0f ? 1.0f : f;
+                return ggml_map_custom2(ctx0, selected_experts, weights, llama_moe_layer_remap_cov_cb, 1, c);
+            }
         }
     }
     return ggml_map_custom1(ctx0, selected_experts, llama_moe_layer_remap_cb, 1, c);
@@ -2326,6 +3143,36 @@ void llama_moe_cache_shutdown(void) {
     }
     // free the locked RAM residency pools and no-mmap file handles (loader stopped, no concurrent access)
     std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
+
+    // Persist the learned per-layer expert scores (LLAMA_MOE_SCORE_FILE) so the next run warm-starts
+    // residency instead of re-learning the hot set over ~1400 tokens. Keyed by expert tensor name (stable
+    // across runs). Written before the caches are torn down below.
+    if (const char * spath = llama_moe_score_file()) {
+        FILE * f = fopen(spath, "wb");
+        if (f) {
+            size_t written = 0;
+            for (auto & kv : g_moe_layer_caches) {
+                llama_moe_layer_cache * c = kv.second;
+                if (!c || c->proj.empty() || !c->proj[0].src) { continue; }
+                if ((int) c->expert_score.size() != c->n_expert || c->n_expert <= 0) { continue; }
+                const char * nm = c->proj[0].src->name;
+                const uint32_t nlen = (uint32_t) strnlen(nm, GGML_MAX_NAME);
+                if (nlen == 0) { continue; }
+                const uint32_t ne = (uint32_t) c->n_expert;
+                fwrite(&nlen, sizeof(nlen), 1, f);
+                fwrite(nm, 1, nlen, f);
+                fwrite(&ne, sizeof(ne), 1, f);
+                fwrite(c->expert_score.data(), sizeof(float), ne, f);
+                written++;
+            }
+            fclose(f);
+            LLAMA_LOG_WARN("MoE stream: saved expert scores for %zu layers to %s (next run warm-starts).\n",
+                           written, spath);
+        } else {
+            LLAMA_LOG_WARN("MoE stream: could not open %s to save expert scores.\n", spath);
+        }
+    }
+
     for (auto & kv : g_moe_layer_caches) {
         llama_moe_layer_cache * c = kv.second;
         if (!c) {
