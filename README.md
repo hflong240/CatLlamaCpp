@@ -95,16 +95,21 @@ llama-completion -m hy3-q4.gguf -ngl 99 --moe-stream-async -fit off -no-cnv -p "
 ```
 
 `--moe-stream-async` enables the recommended async-streaming configuration by default: the per-layer
-streaming cache + background loader, off-page-cache expert reads, a top-2 synchronous expert budget, and a
-one-shot startup RAM-pool prefill. `CACHE_CAP` fills VRAM and `RAM_CAP` fills host RAM automatically (both
-printed at startup as `auto CACHE_CAP=N` / `auto RAM_CAP=N`). The top-2 `SYNC_BUDGET` is what keeps output
-coherent on hard prompts: it guarantees each layer's two highest-weight experts are resident before the
-matmul, while the rest reuse the previous (still-valid) expert.
+streaming cache + background loader, off-page-cache expert reads, a top-2 synchronous expert budget, a
+coverage early-stop that trims that budget when the resident experts already cover most of the routed
+weight, and a one-shot startup RAM-pool prefill. `CACHE_CAP` fills VRAM and `RAM_CAP` fills host RAM
+automatically (both printed at startup as `auto CACHE_CAP=N` / `auto RAM_CAP=N`). The top-2 `SYNC_BUDGET`
+is what keeps output coherent on hard prompts: it guarantees each layer's two highest-weight experts are
+resident before the matmul, while the rest reuse the previous (still-valid) expert. `SYNC_COVER=0.2` then
+skips the second of those two loads on steps whose cached experts already cover enough weight, for roughly
++30% decode on average at coherent quality. (The async loader is non-deterministic, so a run may
+occasionally degenerate into a repeat loop on reasoning-heavy prompts; re-running or `LLAMA_MOE_SYNC_COVER=0`
+clears it.)
 
-To opt out of any single piece, set that switch to `0` (e.g. `LLAMA_MOE_NOMMAP=0`, or
-`LLAMA_MOE_SYNC_BUDGET=0` to let decode run pure-GPU and much faster - though the stale reuse then
-**degrades quality on hard prompts**). An explicit value always wins over the default. To try the fused
-CUDA op, add `LLAMA_MOE_FUSED=1` (off by default - see below).
+To opt out of any single piece, set that switch to `0` (e.g. `LLAMA_MOE_NOMMAP=0`, `LLAMA_MOE_SYNC_COVER=0`
+to restore the pure fixed top-2 budget, or `LLAMA_MOE_SYNC_BUDGET=0` to let decode run pure-GPU and much
+faster - though the stale reuse then **degrades quality on hard prompts**). An explicit value always wins
+over the default. To try the fused CUDA op, add `LLAMA_MOE_FUSED=1` (off by default - see below).
 
 Measured on an RTX 4090D (24 GB) + 64 GB RAM, coherent and non-degenerate through long generations:
 
@@ -115,8 +120,11 @@ Measured on an RTX 4090D (24 GB) + 64 GB RAM, coherent and non-degenerate throug
 
 Q4 is slower than IQ2 because each expert slab is ~1.8x the bytes, so fewer experts fit resident (both
 tiers hold fewer) and the working set overflows VRAM+RAM further - decode is bounded by NVMe read
-bandwidth. Both figures are the correct-quality (`SYNC_BUDGET=2`) path; the pure-GPU stale path is much
-faster but degrades on hard prompts.
+bandwidth. The table figures are the correct-quality path; the pure-GPU stale path is much faster but
+degrades on hard prompts. The shipped default adds the coverage early-stop (`SYNC_COVER=0.2`); in paired
+A/B tests (same prompt and seed, coverage off vs on) it gave a further **~+30% decode on IQ2 and ~+45% on
+Q4** at coherent quality - Q4 gains more because each skipped expert sync is a saved NVMe read, its
+dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 
 > [!NOTE]
 > Streaming engages on the real inference graph. This fork's `-fit` device-fitting runs a separate
@@ -141,6 +149,7 @@ faster but degrades on hard prompts.
 | `LLAMA_MOE_ASYNC` | on with `--moe-stream-async` | The per-layer streaming cache + background loader - required to run a model that exceeds VRAM *and* RAM. On by default with `--moe-stream-async`; set `LLAMA_MOE_ASYNC=0` to fall back to a plain resident cache. |
 | `LLAMA_MOE_CACHE_CAP=N` | auto | Experts-per-layer kept resident in the VRAM cache. **Unset = auto:** sized from free VRAM so the cache fills the device without spilling to system memory (adapts to `-c` context size and card). Set `N` to override; trades VRAM for quality. |
 | `LLAMA_MOE_SYNC_BUDGET=N` | `2` with `--moe-stream-async` | On decode, synchronously load each layer's `N` highest-weight missing experts (the true top-N) before its matmul, reusing the previous (real, stale) expert for the rest. This is what makes decode **correct on hard prompts**; `N=2` is the quality knee for Hunyuan-v3. Set `0` to disable (decode runs pure-GPU and much faster, but stale reuse degrades quality on hard prompts). |
+| `LLAMA_MOE_SYNC_COVER=F` | `0.2` with `--moe-stream-async` | Coverage early-stop layered on top of `SYNC_BUDGET`: skip a top-N miss's synchronous load once the step's already-resident experts cover fraction `F` of the routed gate weight (the low-weight tail then reuses its stale expert). Since Hunyuan-v3's top-2 gate weight sums to only ~0.34, `F=0.2` lets a well-covered step load one expert instead of two - **~+30% decode on IQ2, ~+45% on Q4 (paired A/B, same prompt/seed), coherent output**. A sweep found `0.15-0.19` is a seed-fragile cliff (repeat loops), so `0.2` is the safe knee. Tuned on Hunyuan-v3; other MoE architectures may want a different `F`. Set `0` to disable (pure fixed `SYNC_BUDGET`). Decode only. |
 | `LLAMA_MOE_RAM_CAP=N` | auto | Experts-per-layer held in a locked host-RAM pool (three-tier: VRAM cache -> RAM pool -> disk). A VRAM miss reads from RAM (~25 GB/s) instead of faulting the model file from disk. **Unset = auto:** sized from available system RAM to fill the host, leaving headroom for the OS + mmap working set. Set `0` to disable the tier, or `N` to override. |
 | `LLAMA_MOE_NOMMAP` | on with `--moe-stream-async` | Read experts from the model file by offset (own file handles) instead of the mmap pointer, bypassing the OS page cache so host RAM stays under the locked pool's control rather than an unbounded page cache that thrashes when the model is larger than RAM. Set `LLAMA_MOE_NOMMAP=0` to use the mmap path. |
 | `LLAMA_MOE_FUSED=1` | off | Use the fused CUDA MoE-FFN op on the async decode path: one CUDA-native op does the expert sync-load + gate/up + SwiGLU + down + weighted sum, instead of a per-layer CPU remap op that forces a scheduler split (160 splits/token -> 4). Quality-identical, but measured decode is **~20% slower** on this disk/H2D-bound path (the fused op serializes the load with compute, losing the split's load//compute overlap), so it is **off by default**. Decode only; prefill, non-hy3 layers, and non-CUDA backends fall back automatically. |

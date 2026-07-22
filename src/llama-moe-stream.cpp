@@ -2387,21 +2387,24 @@ static void llama_moe_layer_remap_cov_cb(ggml_tensor * dst, const ggml_tensor * 
             }
         }
         c->step_cover = c->sync_cover; // active threshold for remap_cb this step
-        // diagnostic: how many the coverage rule will sync (min(budget, needed-to-reach-cover))
-        g_cov_tokens.fetch_add(1, std::memory_order_relaxed);
-        g_cov_cached_x1000.fetch_add((uint64_t) (cached_cover * 1000.0), std::memory_order_relaxed);
-        if (cached_cover >= c->sync_cover) { g_cov_zero_sync.fetch_add(1, std::memory_order_relaxed); }
-        const uint64_t tok = g_cov_tokens.load(std::memory_order_relaxed);
-        static std::atomic<uint64_t> last{0};
-        uint64_t lp = last.load(std::memory_order_relaxed);
-        if (tok - lp >= 2560 && last.compare_exchange_strong(lp, tok)) {
-            const uint64_t nn = tok ? tok : 1;
-            LLAMA_LOG_WARN("MoE cover-diag: %llu token-layers | cached-cover mean=%.0f%% | "
-                           "already-covered(zero-sync) %.0f%% of tokens | synced mean=%.2f/token\n",
-                           (unsigned long long) tok,
-                           100.0 * (double) g_cov_cached_x1000.load() / 1000.0 / (double) nn,
-                           100.0 * (double) g_cov_zero_sync.load() / (double) nn,
-                           (double) g_cov_synced.load() / (double) nn);
+        // diagnostic (LLAMA_MOE_COVDBG only - coverage is default-on now, so this must not spam the
+        // default path): how many the coverage rule will sync (min(budget, needed-to-reach-cover))
+        if (getenv("LLAMA_MOE_COVDBG")) {
+            g_cov_tokens.fetch_add(1, std::memory_order_relaxed);
+            g_cov_cached_x1000.fetch_add((uint64_t) (cached_cover * 1000.0), std::memory_order_relaxed);
+            if (cached_cover >= c->sync_cover) { g_cov_zero_sync.fetch_add(1, std::memory_order_relaxed); }
+            const uint64_t tok = g_cov_tokens.load(std::memory_order_relaxed);
+            static std::atomic<uint64_t> last{0};
+            uint64_t lp = last.load(std::memory_order_relaxed);
+            if (tok - lp >= 2560 && last.compare_exchange_strong(lp, tok)) {
+                const uint64_t nn = tok ? tok : 1;
+                LLAMA_LOG_WARN("MoE cover-diag: %llu token-layers | cached-cover mean=%.0f%% | "
+                               "already-covered(zero-sync) %.0f%% of tokens | synced mean=%.2f/token\n",
+                               (unsigned long long) tok,
+                               100.0 * (double) g_cov_cached_x1000.load() / 1000.0 / (double) nn,
+                               100.0 * (double) g_cov_zero_sync.load() / (double) nn,
+                               (double) g_cov_synced.load() / (double) nn);
+            }
         }
     }
     llama_moe_layer_remap_cb(dst, a, ith, nth, userdata);
@@ -2976,15 +2979,17 @@ ggml_tensor * llama_moe_layer_cache_remap(llama_moe_layer_cache * c,
     }
     // Coverage mode (LLAMA_MOE_SYNC_COVER=F, decode only): size the sync set by weight coverage instead of
     // a fixed budget - sync missing top-K experts weight-descending but stop once (cached+synced) gate weight
-    // reaches F, capped at sync_budget (top-2). The earlier garbage bug (COV=0.9 dropping real top-2 loads)
-    // was cov_have summing over the full first-decode order of 8 experts (weights sum to 1.0), which cleared
-    // any threshold <1 and fired spurious early-stops; fixed by gating coverage off on first_decode and only
-    // summing over order_n (see the early-stop block in remap_cb). Verified with LLAMA_MOE_COVDBG: at 0.9 the
-    // early-stop fires 0.000/tok (== baseline, coherent); at 0.15 it fires ~0.45/tok and stays coherent.
-    // Still gated behind LLAMA_MOE_SYNC_COVER_ENABLE=1 so it stays opt-in.
+    // reaches F, capped at sync_budget (top-2). On the async path this is ON by default at F=0.2 (set via
+    // common.cpp set_if_unset when --moe-stream-async is passed); a cross-domain sweep found 0.2 gives ~+30%
+    // decode on average (measured +2%..+51%) at coherent quality, while 0.15-0.19 is a seed-fragile cliff
+    // (repeat loops), so 0.2 is the safe knee. Tuned on hy3 (top-2 weight ~0.34); other MoEs may want a
+    // different F. LLAMA_MOE_SYNC_COVER=0 opts out (atof 0 -> f<=0 -> plain map_custom1 == fixed budget=2).
+    // The earlier garbage bug (COV=0.9 dropping real top-2 loads) was cov_have summing over the full
+    // first-decode order of 8 experts (weights sum to 1.0), which cleared any threshold <1 and fired spurious
+    // early-stops; fixed by gating coverage off on first_decode and only summing over order_n (see the
+    // early-stop block in remap_cb). Verify with LLAMA_MOE_COVDBG (early-stopped misses/tok vs threshold).
     c->sync_cover = 0.0f;
-    if (getenv("LLAMA_MOE_SYNC_COVER_ENABLE") && weights &&
-        selected_experts->ne[1] == 1 && weights->ne[1] == selected_experts->ne[0]) {
+    if (weights && selected_experts->ne[1] == 1 && weights->ne[1] == selected_experts->ne[0]) {
         if (const char * cv = getenv("LLAMA_MOE_SYNC_COVER")) {
             const float f = (float) atof(cv);
             if (f > 0.0f) {

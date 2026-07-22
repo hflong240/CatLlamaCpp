@@ -1617,6 +1617,15 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         // is ~20% SLOWER with it on because the single fused op serializes the expert load with compute,
         // losing the implicit load//compute overlap the per-layer split provided on this disk/H2D-bound
         // path. It stays opt-in via LLAMA_MOE_FUSED=1.
+        // SYNC_COVER (coverage early-stop) CAN be safely defaulted here, unlike SYNC_BUDGET: nothing does a
+        // presence-check on it - the graph reads it as a float and 0/absent both fall to the fixed-budget
+        // baseline - so set_if_unset with a real value cannot flip behaviour a user asked to keep off. It
+        // stacks below the SYNC_BUDGET=2 anchor (trims that 2 toward 1 on well-covered steps), so the shipped
+        // async default sits one expert below the fixed-top-2 config the quality sweeps used as baseline. 0.2
+        // is the swept quality-safe knee for Hunyuan-v3 (its top-2 gate weight sums to only ~0.34; 0.15-0.19
+        // is a seed-fragile cliff); a cross-domain sweep measured ~+30% decode on average at coherent quality.
+        // It is tuned on hy3 - other MoE architectures with more peaked routing may want a different F or
+        // LLAMA_MOE_SYNC_COVER=0 to opt out.
         auto set_if_unset = [](const char * k, const char * v) {
             if (getenv(k) == nullptr) {
 #ifdef _WIN32
@@ -1629,6 +1638,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         set_if_unset("LLAMA_MOE_ASYNC",   "1");
         set_if_unset("LLAMA_MOE_NOMMAP",  "1");
         set_if_unset("LLAMA_MOE_PREFILL", "1");
+        set_if_unset("LLAMA_MOE_SYNC_COVER", "0.2");
     }
 
     cparams.type_k = params.cache_type_k;
