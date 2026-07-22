@@ -95,7 +95,8 @@ Layered, from lowest to highest:
     tokenizer, chat templates.
 - **`common/`** - shared helpers linked by tools: `arg.cpp` (CLI arg parsing - where flags like `-fit`,
   `--moe-stream*` are defined), `common.cpp`, and `fit.{h,cpp}` (**fork** `-fit` device-memory fitting that
-  spills whole layers to system RAM; independent of and combinable with expert streaming).
+  spills whole layers to system RAM; conflicts with expert streaming - both manage expert placement, so use
+  `-fit off` when streaming).
 - **`tools/`** - end-user programs, each its own `main.cpp`: `server` (OpenAI-compatible HTTP server, the
   largest sub-project), `cli` and `completion` (interactive/one-shot inference), `llama-bench`,
   `perplexity`, `quantize`, `imatrix`, `mtmd` (multimodal), `fit-params` (**fork** `-fit` helper), plus

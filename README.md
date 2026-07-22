@@ -45,8 +45,10 @@ slot table is remapped on the GPU via `get_rows`. Prefill reads are parallelized
 disk-read thread pool. The design is inspired by SSD expert-streaming engines (three-tier expert cache,
 routing-driven residency) adapted to ggml's single-3D-expert-tensor layout.
 
-This coexists with the fork's existing `-fit` device-memory fitting (which spills whole layers to system
-RAM); the two spill mechanisms are independent and can be combined.
+This is separate from the fork's `-fit` device-memory fitting (which spills whole layers to system RAM).
+Both decide where the expert weights live, but by opposite strategies - `-fit` pre-plans a static layer
+split up front, while streaming pins all experts to CPU and fills VRAM dynamically at runtime - so they
+should not run together. Use `-fit off` with streaming (see the note under Usage).
 
 ### What's new
 
@@ -126,9 +128,14 @@ A/B tests (same prompt and seed, coverage off vs on) it gave a further **~+30% d
 Q4** at coherent quality - Q4 gains more because each skipped expert sync is a saved NVMe read, its
 dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 
-> [!NOTE]
-> Streaming engages on the real inference graph. This fork's `-fit` device-fitting runs a separate
-> measurement pass first; pass `-fit off` if you want to rule it out when benchmarking streaming.
+> [!IMPORTANT]
+> **Use `-fit off` with streaming.** `-fit` and expert streaming both manage where the weights live, and
+> they work against each other. `-fit` runs measurement passes that load the model with no weights resident;
+> the VRAM cache auto-sizer (`auto CACHE_CAP`) can measure free VRAM during such a pass and freeze an
+> oversized cap that later spills to system memory at runtime (a large decode slowdown). And when `-fit`
+> tries to spill layers, it aborts on the expert CPU-override streaming has already set (a harmless warning;
+> fit just does nothing). Streaming's own auto `CACHE_CAP` / `RAM_CAP` already fill the device and host, so
+> `-fit` is redundant here - pass `-fit off`.
 
 > [!IMPORTANT]
 > **`llama-server`: run with `-np 1`.** The persistent VRAM cache and async fast paths only engage on
