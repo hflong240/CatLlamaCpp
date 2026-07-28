@@ -147,6 +147,27 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 > batched and lose the fast path. Server use of these features is otherwise validated only for single-stream
 > decode (`llama-cli`/`llama-completion`) - treat it as experimental.
 
+> [!IMPORTANT]
+> **`SYNC_BUDGET` governs decode only - prompt processing (prefill) uses a different, lossy path.**
+> The top-N `SYNC_BUDGET`/`SYNC_COVER` selection engages only on single-token steps (`n_tokens <= 1`).
+> A multi-token prefill batch (`n_tokens > 1`) instead loads each layer's working set bounded by
+> `CACHE_CAP` and **drops the rest to a zeroed expert** (no stale reuse across a batch). When a model is
+> far larger than VRAM so `CACHE_CAP` is a small fraction of the experts a batch touches, a prompt can be
+> processed with most of each token's experts zeroed - the output stays fluent but can misread the prompt
+> (e.g. ignoring injected instructions or tool definitions), and raising `SYNC_BUDGET` does **not** help
+> because it never applies to prefill. Measured on Hunyuan-v3 IQ2 (192 experts, ~40 resident, 24 GB card):
+> prompt perplexity 6.66 with the default `-ub`/large batch vs 3.07 lossless - a 2.17x gap.
+>
+> **Workaround: `-ub 1`.** With a micro-batch of one, every prefill token takes the same `n_tokens <= 1`
+> path as decode, so `SYNC_BUDGET`/`SYNC_COVER` apply to prefill too and misses reuse a real (stale)
+> expert instead of zero - prompt quality returns to the decode-path level (measured PPL back in the
+> lossless band). The cost is speed: `-ub 1` serializes prefill token-by-token (measured ~7 tok/s prompt
+> processing on the hy3-IQ2 case above, vs faster-but-lossy large batches), so it suits agent/tool use
+> where following the prompt matters more than prompt-eval latency. This gap is specific to models whose
+> per-batch expert working set exceeds the resident cache; a MoE that fits (or nearly fits) in VRAM does
+> not zero experts and large `-ub` stays correct and faster. The byte-identical `--moe-stream` (compaction)
+> mode is lossless at any `-ub`.
+
 ### Tuning (environment variables)
 
 **Core** (the knobs you actually reach for):
