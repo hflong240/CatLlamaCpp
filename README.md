@@ -225,6 +225,129 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 > layers), so `CACHE_CAP=16` (~21.5 GB) fills a 24 GB card; IQ2's ~6.4 MiB slab lets ~36 experts/layer fit.
 
 
+### Baking the system-prompt KV cache (skip cold-start prefill)
+
+With expert streaming, the correct-quality path runs at `-ub 1` (see the caveats below), so the very first
+prompt evaluation of a session is slow: a long, fixed system prompt (agentic tool definitions, injected
+rules) is prefilled one token at a time. Measured on an RTX 4090D (IQ2, `-ub 1`), an ~900-token system
+prompt takes **~169 s** to prefill from cold. That prefill is pure compute over a *fixed* prefix, so it can
+be done once, saved, and restored on every later session for **~0 ms**.
+
+This reuses the stock session/prompt-cache mechanism; no fork-specific flag is needed. The saved file holds
+only the tokens and the raw K/V cache bytes - no expert weights and nothing streaming-specific - so it is
+independent of where experts live (VRAM/RAM/disk). It must be baked at `-ub 1`: a larger ubatch prefills
+with most experts dropped (see caveats) and would persist a low-quality KV.
+
+`llama-completion` (bake once, then load read-only):
+
+```sh
+# Format the system turn exactly as the model's chat template does (Hunyuan-v3 shown), so the baked
+# tokens match the runtime tokens byte-for-byte; -no-cnv avoids conversation mode pausing for input.
+SYS="$(cat system.txt)"
+FULL="<|startoftext|>${SYS}<|extra_4|>"
+
+# Bake: prefill the fixed prefix at -ub 1 and write the KV to disk (one-time, slow).
+llama-completion -m model.gguf --moe-stream-async -fit off -c 4096 -ub 1 -no-cnv \
+  -p "$FULL" -n 1 --prompt-cache sys.kv --prompt-cache-all
+
+# Reuse: load the baked KV; the shared prefix is skipped (prompt eval ~0 ms), only new tokens are evaluated.
+llama-completion -m model.gguf --moe-stream-async -fit off -c 4096 -ub 1 -no-cnv \
+  -p "${FULL}<|startoftext|>your question here<|extra_0|>" --prompt-cache sys.kv --prompt-cache-ro
+```
+
+`llama-server` (per-slot KV save/restore over the HTTP API):
+
+```sh
+# Start with a directory for slot state.
+llama-server -m model.gguf --moe-stream-async -fit off -c 4096 -ub 1 -np 1 --slot-save-path ./kvcache
+
+# After the first request has prefilled the system prompt into slot 0, persist that slot once:
+curl -X POST 'localhost:8080/slots/0?action=save'    -d '{"filename":"sys.kv"}'
+
+# On every later server start, restore the slot to skip the system-prompt prefill; subsequent requests
+# reuse the system prefix automatically via the server's longest-common-prefix KV reuse.
+curl -X POST 'localhost:8080/slots/0?action=restore' -d '{"filename":"sys.kv"}'
+```
+
+Caveats specific to baking:
+- Baking skips the *prefill compute* but not the one-time host-RAM expert-pool warm (`LLAMA_MOE_PREFILL`,
+  ~7 s), which runs during model load on both the bake and the load path.
+- The saved file is rejected on a mismatch of llama.cpp session version, model architecture, KV cache type
+  (`--cache-type-k`/`-v`), or context geometry, so re-bake after rebuilding the fork or changing those.
+  A different *expert* quantization is not rejected (the KV is independent of it).
+
+### Compacting the KV cache mid-session (evict token ranges)
+
+A long agentic session grows its context to tens of thousands of tokens. The usual fix - summarize the
+history into a shorter text and send it as a new prompt - forces a full re-prefill of that summary, which
+under expert streaming runs at single-digit tokens/s (tens of minutes for a 20k-token summary). This fork
+adds a server endpoint that instead **deletes chosen token-position ranges directly from a slot's KV cache**,
+with **zero re-prefill**: the surviving tokens keep their computed K/V, only their positions are compacted
+(the engine re-applies RoPE to the shifted keys automatically). No expert weights are touched.
+
+This is not the built-in context-shift (which only drops the *oldest* tokens, FIFO). Here you choose exactly
+which ranges to drop, so you can keep the task goal at the start, keep the recent turns at the end, and evict
+finished middle work (a file you already read, a stale tool output). Deciding *which* ranges to drop is the
+caller's job (e.g. score each past turn with a small model); the server only executes the deletion.
+
+Endpoint (needs `-np 1`; no `--slot-save-path` required, it is a pure in-memory op):
+
+```
+POST /slots/{id}?action=evict
+body: {"ranges": [[p0,p1], ...]}   # half-open [p0,p1) KV token-position ranges to delete
+resp: {"id_slot": 0, "n_evicted": N}
+```
+
+Ranges must be within `[0, n_tokens]`, non-overlapping, and each `0 <= p0 < p1`. After the call the slot's
+token list and KV are both compacted, so the next request re-uses the surviving prefix with no re-prefill.
+
+Important - what to send on the *next* request: the server matches a new prompt against the slot's kept
+tokens by longest common prefix. So the new prompt's leading text must equal the **surviving** token
+sequence (the concatenation of the kept ranges, in order), followed by your new turn. Only the appended
+new turn is prefilled; the kept span is reused. If the new prompt diverges earlier than the kept length,
+everything after the divergence is re-prefilled - so build the next prompt from the same pieces you kept.
+
+End-to-end example (start the server, fill a slot, evict the middle, continue):
+
+```sh
+# 1) Start the server. --chat-template chatml sidesteps a PEG-parser error on Hunyuan-v3's built-in template;
+#    --slots exposes /slots so you can read a slot's current token count.
+llama-server -m model.gguf --moe-stream-async -fit off -c 8192 -np 1 --slots --chat-template chatml &
+
+# 2) Send a prompt that fills the slot's KV (cache_prompt keeps it resident for reuse).
+curl -s localhost:8080/completion -d '{"prompt":"<goal at start> ... <lots of middle work> ...","n_predict":1,"cache_prompt":true}'
+
+# 3) See how many tokens the slot holds now.
+curl -s localhost:8080/slots | python -c 'import json,sys; print(json.load(sys.stdin)[0]["n_prompt_tokens"])'
+#   -> e.g. 1917
+
+# 4) Drop the middle range (keep the head goal + the tail). Positions are token indices from step 3.
+curl -s -X POST 'localhost:8080/slots/0?action=evict' -d '{"ranges":[[50,1900]]}'
+#   -> {"id_slot":0,"n_evicted":1850}     (slot now holds 67 tokens)
+
+# 5) Continue. Re-send the surviving prefix + your new turn with cache_prompt:true; the kept KV is reused
+#    (response "timings.prompt_n" counts only the NEW tokens, proving the evicted span was not re-prefilled).
+curl -s localhost:8080/completion -d '{"prompt":"<goal at start> ... <new turn>","n_predict":128,"cache_prompt":true}'
+```
+
+Determining the token ranges to pass:
+- Track them in your application: as you append each turn, record the `[start,end)` token span it occupies.
+  Positions are 0-based, in the order tokens entered the slot, contiguous.
+- Or compute a span's length with the `/tokenize` endpoint (POST `{"content":"..."}` returns the token
+  array; its length is the token count), and read the slot's current total from `/slots`.
+- Use the **model's own tokenizer** for positions. A separate small scoring model can decide *which turns*
+  are unimportant, but the byte offsets it sees do not map to the big model's token positions.
+
+Caveats:
+- **Text-only.** A multimodal (mtmd) slot is rejected (returns an error, does not crash): image chunks span
+  multiple tokens and the token-list rebuild assumes 1 token == 1 position.
+- The slot's KV **checkpoints** (position-keyed snapshots used for fast context restore) are dropped by an
+  evict, since they would no longer match the compacted cache. Speculative-decoding checkpoints too.
+- Evict runs only when the slot is idle; a request in flight defers it (it does not interrupt a decode).
+- Quality of the result depends on *what* you evict - keeping the wrong ranges loses information the model
+  needed. The mechanism itself preserves the retained tokens' K/V exactly (verified: dropping ~880 filler
+  tokens between a head instruction and the tail, the model still recalled the head's pass key).
+
 ### Performance and caveats
 
 - **A MoE that fits in VRAM** (used to validate correctness): `--moe-stream` and `--moe-stream-async` are

@@ -2337,6 +2337,99 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_EVICT:
+                {
+                    // Drop arbitrary KV token-position ranges from a slot without re-prefill (KV compaction).
+                    // seq_rm removes the ranges, seq_add compacts the survivors (auto re-RoPEs shifted K), and
+                    // the slot's token list is rebuilt to match so later prefix-reuse stays consistent.
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // mutating KV positions mid-decode would corrupt the in-flight batch; defer
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int n = (int) slot->prompt.tokens.size();
+
+                    // sort ranges by p0 and validate: in-bounds (p1 <= n) and non-overlapping
+                    auto ranges = task.slot_action.evict_ranges;
+                    std::sort(ranges.begin(), ranges.end());
+                    bool ok = true;
+                    for (size_t i = 0; i < ranges.size(); ++i) {
+                        if (ranges[i].second > n) { ok = false; break; }
+                        if (i > 0 && ranges[i].first < ranges[i - 1].second) { ok = false; break; } // overlap
+                    }
+                    if (!ok) {
+                        send_error(task, "evict ranges must be non-overlapping and within [0, n_tokens]", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    auto in_drop = [&](int pos) {
+                        for (const auto & r : ranges) { if (pos >= r.first && pos < r.second) { return true; } }
+                        return false;
+                    };
+
+                    // remove each range from the KV (order-independent: survivors' positions are unchanged)
+                    for (const auto & r : ranges) {
+                        common_context_seq_rm(ctx_tgt, slot->id, r.first, r.second);
+                        if (ctx_dft) {
+                            common_context_seq_rm(ctx_dft.get(), slot->id, r.first, r.second);
+                        }
+                    }
+                    // compact: shift each surviving segment down by the number of tokens removed before it
+                    {
+                        int acc = 0;      // total removed so far
+                        int seg_a = -1;   // start of the current kept segment
+                        for (int p = 0; p <= n; ++p) {
+                            const bool drop = (p < n) && in_drop(p);
+                            if (!drop && seg_a < 0) {
+                                seg_a = p; // segment opens
+                            } else if (drop && seg_a >= 0) {
+                                if (acc > 0) {
+                                    common_context_seq_add(ctx_tgt, slot->id, seg_a, p, -acc);
+                                    if (ctx_dft) { common_context_seq_add(ctx_dft.get(), slot->id, seg_a, p, -acc); }
+                                }
+                                seg_a = -1;
+                            }
+                            if (drop) { acc++; }
+                        }
+                        if (seg_a >= 0 && acc > 0) { // trailing kept segment [seg_a, n)
+                            common_context_seq_add(ctx_tgt, slot->id, seg_a, n, -acc);
+                            if (ctx_dft) { common_context_seq_add(ctx_dft.get(), slot->id, seg_a, n, -acc); }
+                        }
+                    }
+
+                    // rebuild the slot's token list to the surviving sequence (index == KV pos for non-mtmd)
+                    const llama_tokens old_tokens = slot->prompt.tokens.get_tokens(); // copy
+                    llama_tokens kept;
+                    kept.reserve(old_tokens.size());
+                    for (int p = 0; p < (int) old_tokens.size(); ++p) {
+                        if (!in_drop(p)) { kept.push_back(old_tokens[p]); }
+                    }
+                    const size_t n_evicted = old_tokens.size() - kept.size();
+                    slot->prompt.tokens.clear();
+                    slot->prompt.tokens.insert(kept);
+
+                    // position-keyed KV checkpoints are now stale; drop them (restoring one would corrupt the compacted KV)
+                    slot->prompt.checkpoints.clear();
+                    slot->spec_ckpt.clear();
+                    if (n_evicted > 0) { slot->truncated = true; }
+
+                    auto res = std::make_unique<server_task_result_slot_evict>();
+                    res->id        = task.id;
+                    res->id_slot   = id_slot;
+                    res->n_evicted = n_evicted;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -4129,12 +4222,15 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
+
+        std::string id_slot_str = req.get_param("id_slot");
+        std::string action      = req.get_param("action");
+
+        // evict is a pure in-memory KV op and needs no save-path; every other action writes/reads a file.
+        if (action != "evict" && params.slot_save_path.empty()) {
             res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
-
-        std::string id_slot_str = req.get_param("id_slot");
 
         int id_slot;
         try {
@@ -4144,8 +4240,6 @@ void server_routes::init_routes() {
             return res;
         }
 
-        std::string action = req.get_param("action");
-
         if (action == "save") {
             return handle_slots_save(req, id_slot);
         }
@@ -4154,6 +4248,9 @@ void server_routes::init_routes() {
         }
         if (action == "erase") {
             return handle_slots_erase(req, id_slot);
+        }
+        if (action == "evict") {
+            return handle_slots_evict(req, id_slot);
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
@@ -4834,6 +4931,61 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_evict(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    // body: { "ranges": [[p0,p1], ...] } - half-open KV token-position ranges to drop (no re-prefill).
+    std::vector<std::pair<llama_pos, llama_pos>> ranges;
+    try {
+        const json body = json::parse(req.body);
+        if (!body.contains("ranges") || !body.at("ranges").is_array()) {
+            res->error(format_error_response("Body must contain a \"ranges\" array of [p0,p1] pairs", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        for (const auto & r : body.at("ranges")) {
+            if (!r.is_array() || r.size() != 2 || !r[0].is_number_integer() || !r[1].is_number_integer()) {
+                res->error(format_error_response("Each range must be a [p0,p1] pair of integers", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const llama_pos p0 = r[0].get<llama_pos>();
+            const llama_pos p1 = r[1].get<llama_pos>();
+            if (p0 < 0 || p1 <= p0) {
+                res->error(format_error_response("Each range must satisfy 0 <= p0 < p1", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            ranges.emplace_back(p0, p1);
+        }
+    } catch (const std::exception & e) {
+        res->error(format_error_response(std::string("Invalid JSON body: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_EVICT);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot      = id_slot;
+        task.slot_action.evict_ranges = std::move(ranges);
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_evict*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }

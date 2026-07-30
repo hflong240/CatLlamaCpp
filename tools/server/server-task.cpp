@@ -1947,6 +1947,13 @@ json server_task_result_slot_erase::to_json() {
     };
 }
 
+json server_task_result_slot_evict::to_json() {
+    return json {
+        { "id_slot",   id_slot },
+        { "n_evicted", n_evicted },
+    };
+}
+
 //
 // server_task_result_get_lora
 //
