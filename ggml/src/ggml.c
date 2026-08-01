@@ -1484,6 +1484,22 @@ bool ggml_is_contiguous_2(const struct ggml_tensor * tensor) {
     return ggml_is_contiguous_n(tensor, 2);
 }
 
+bool ggml_is_contiguous_to_3(const struct ggml_tensor * tensor) {
+    // contiguous for dims < 3 (dim 3 may be strided); matches upstream ggml_is_contiguous_m_n(tensor, 0, 3)
+    size_t next_nb = ggml_type_size(tensor->type);
+    if (tensor->ne[0] != ggml_blck_size(tensor->type) && tensor->nb[0] != next_nb) {
+        return false;
+    }
+    next_nb *= tensor->ne[0]/ggml_blck_size(tensor->type);
+    for (int i = 1; i < 3; i++) {
+        if (tensor->ne[i] != 1 && tensor->nb[i] != next_nb) {
+            return false;
+        }
+        next_nb *= tensor->ne[i];
+    }
+    return true;
+}
+
 bool ggml_is_contiguously_allocated(const struct ggml_tensor * tensor) {
     return ggml_nbytes(tensor) == ggml_nelements(tensor) * ggml_type_size(tensor->type)/ggml_blck_size(tensor->type);
 }
