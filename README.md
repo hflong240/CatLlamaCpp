@@ -190,8 +190,8 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 |----------|---------|--------|
 | `LLAMA_MOE_VRAM_FRAC=F` | `0.97` | Fraction of free VRAM (minus the reserve) the auto VRAM cache may use. Lower it if you see a system-memory spill. Ignored when `LLAMA_MOE_CACHE_CAP` is set. |
 | `LLAMA_MOE_VRAM_RESERVE_MB=N` | `512` | VRAM (MiB) the auto cache keeps free as a fragmentation margin. KV/compute are already excluded from the measured free, so this is small; raise only if a spill persists. |
-| `LLAMA_MOE_RAM_FRAC=F` | `0.90` | Fraction of (available RAM - reserve) the auto RAM pool may use. Ignored when `LLAMA_MOE_RAM_CAP` is set. |
-| `LLAMA_MOE_RAM_RESERVE_MB=N` | `5120` | System RAM (MiB) the auto pool keeps free for the OS + the growing mmap working set. Raise it if you see paging or a runtime slowdown as the pool fills. |
+| `LLAMA_MOE_RAM_FRAC=F` | `0.97` | Hard ceiling on the auto RAM pool as a fraction of available RAM. Only binds when `LLAMA_MOE_RAM_RESERVE_MB` is set too low to be safe on its own. Ignored when `LLAMA_MOE_RAM_CAP` is set. |
+| `LLAMA_MOE_RAM_RESERVE_MB=N` | `5120` | System RAM (MiB) the auto pool leaves free, for the OS + the growing mmap working set. **Exact:** set `N` and that much available RAM stays free. Raise it if other software gets squeezed, or if you see paging / a runtime slowdown. |
 
 **Loader / performance** (sensible defaults; rarely changed):
 
@@ -223,6 +223,18 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 > spill, lower `LLAMA_MOE_VRAM_FRAC`; if the RAM pool starves the OS, raise `LLAMA_MOE_RAM_RESERVE_MB`. For
 > reference, Hunyuan-v3 Q4 has an ~11.7 MiB per-expert slab (~0.9 GiB per cap unit across its 80 MoE
 > layers), so `CACHE_CAP=16` (~21.5 GB) fills a 24 GB card; IQ2's ~6.4 MiB slab lets ~36 experts/layer fit.
+
+> [!NOTE]
+> The RAM reserve is sampled **once**, before the context, the KV cache and `llama-server`'s context
+> checkpoints exist - whatever is allocated later eats into the headroom it left. Checkpoints are the big
+> one: for an architecture whose KV cannot be rolled back partially (`deepseek4`), `llama-server` keeps up
+> to `--ctx-checkpoints` (default 32) per-slot KV snapshots on the **host heap**. `--cache-ram` does not
+> bound them: it budgets the *archived* prompts in the prompt cache, while the live slot's ring sits outside
+> that budget - with `--cache-ram 0` there is no archive at all, yet the ring still fills. `hy_v3` allocates
+> none, since its KV supports partial removal. Each snapshot logs its own size (`created context checkpoint
+> N of M ... size = X MiB`), so read that rather than guessing: when host RAM is tight, lower
+> `--ctx-checkpoints` instead of raising the reserve. Setting it to `0` trades that RAM for a full re-prefill
+> whenever the prompt diverges from what is cached.
 
 
 ### Baking the system-prompt KV cache (skip cold-start prefill)

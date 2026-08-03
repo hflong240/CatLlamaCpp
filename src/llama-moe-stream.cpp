@@ -1659,15 +1659,15 @@ ggml_tensor * llama_moe_cache_build_async(ggml_context *       ctx0,
 // Auto-pick the RAM residency-pool size (experts/layer) from available system RAM, so users need not
 // tune LLAMA_MOE_RAM_CAP by hand. The pool holds high-weight experts in locked host RAM (~25 GB/s) so
 // VRAM-cache misses avoid a disk fault (~2 GB/s); bigger is faster UNTIL it starves the OS + the mmap
-// working set, at which point contention costs more than it saves (measured: filling to within ~6 GB of
-// system RAM regressed decode; ~13 GB headroom was the sweet spot). Budgeting mirrors
+// working set, at which point contention costs more than it saves. Budgeting mirrors
 // llama_moe_auto_capacity: this runs at the FIRST MoE layer's cache creation, so the other
 // (n_moe_layers-1) pools are NOT yet allocated - size the TOTAL pool footprint (all layers) from avail
 // RAM up front, then divide by layers. per_expert = sum of projection strides (bytes one expert costs
 // across gate/up/down). Returns experts/layer in [0, n_expert]; 0 if unmeasurable (tier stays off).
 //   LLAMA_MOE_RAM_CAP set (>0)   -> honored verbatim, this is not called
-//   LLAMA_MOE_RAM_FRAC=F         -> fraction of (avail - reserve) the pool may use (default 0.90)
-//   LLAMA_MOE_RAM_RESERVE_MB=N   -> MiB kept free for the OS + growing mmap working set (default 5120 = 5 GiB)
+//   LLAMA_MOE_RAM_FRAC=F         -> hard ceiling as a fraction of avail; only binds when the reserve is
+//                                   set too low to be safe on its own (default 0.97)
+//   LLAMA_MOE_RAM_RESERVE_MB=N   -> MiB of available RAM left free; exact (default 5120 = 5 GiB)
 static int llama_moe_auto_ram_capacity(const std::vector<llama_moe_proj_store> & proj, int n_expert) {
     if (proj.empty() || n_expert <= 0) { return 0; }
     // Compute ONCE and reuse for every layer (same reason as llama_moe_auto_capacity): this is called
@@ -1691,21 +1691,21 @@ static int llama_moe_auto_ram_capacity(const std::vector<llama_moe_proj_store> &
     int n_moe_layers = proj.empty() ? 0 : (int) (g_moe_expert_files.size() / proj.size());
     if (n_moe_layers < 1) { n_moe_layers = 1; }
 
-    double frac = 0.90;
+    double frac = 0.97;
     if (const char * fe = getenv("LLAMA_MOE_RAM_FRAC")) {
         const double f = atof(fe);
         if (f > 0.05 && f < 0.98) { frac = f; }
     }
-    // Kept free out of AVAILABLE RAM (not total): the OS, and the mmap working set of the model file that
-    // grows as experts are touched, need room. Measured on a 64 GB box (47 GB avail): a ~45 GB pool ran
-    // best; a ~55 GB pool (leaving ~6 GB free at runtime) regressed from contention. So target ~45 GB from
-    // 47 avail => frac 0.90 with a ~5 GB reserve. Raise the reserve if you see paging / a runtime slowdown.
-    uint64_t reserve = (uint64_t) 5120 * 1024 * 1024; // 5 GiB for OS + growing mmap working set
+    // The reserve is EXACT: the pool leaves this much AVAILABLE RAM (not total) free, so the OS and the
+    // mmap working set of the model file - which grows as experts are touched - keep room. frac is only a
+    // backstop for a reserve set too low to be safe on its own.
+    uint64_t reserve = (uint64_t) 5120 * 1024 * 1024;
     if (const char * re = getenv("LLAMA_MOE_RAM_RESERVE_MB")) {
         const long long r = atoll(re);
         if (r >= 0) { reserve = (uint64_t) r * 1024 * 1024; }
     }
-    const uint64_t usable = avail > reserve ? (uint64_t) (frac * (double) (avail - reserve)) : 0;
+    const uint64_t by_reserve = avail > reserve ? avail - reserve : 0;
+    const uint64_t usable     = std::min(by_reserve, (uint64_t) (frac * (double) avail));
     if (usable == 0) { return 0; }
 
     const uint64_t denom = (uint64_t) n_moe_layers * per_expert;
