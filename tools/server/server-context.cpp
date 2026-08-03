@@ -2345,6 +2345,13 @@ private:
                     if (!check_no_mtmd(task.id)) {
                         break;
                     }
+                    // common_context_seq_rm aborts the process when the memory module refuses a
+                    // partial removal, so contexts without range removal + shifting are rejected here
+                    if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                        !llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
+                        send_error(task, "This feature is not supported by this context", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
