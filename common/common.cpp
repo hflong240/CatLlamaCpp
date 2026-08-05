@@ -1639,6 +1639,18 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         set_if_unset("LLAMA_MOE_NOMMAP",  "1");
         set_if_unset("LLAMA_MOE_PREFILL", "1");
         set_if_unset("LLAMA_MOE_SYNC_COVER", "0.2");
+        // PREFILL_SWEEP: prefill evaluates the MoE FFN once per static expert-index group instead of
+        // rationing the step against the VRAM capacity, so no expert is ever dropped. It is the only prefill
+        // path here that is LOSSLESS on a model whose expert set exceeds the cache (measured on dsv4: 6/6
+        // routing positions real, against ~4.2/6 for the -ub 1 path it replaces), and it is much faster than
+        // the lossless alternative of processing one token at a time. Decode is unaffected by construction -
+        // the sweep is gated on n_tokens > 1 - and a same-build A/B against -ub 1 measured decode at parity.
+        // Opt out with LLAMA_MOE_PREFILL_SWEEP=0.
+        //
+        // Note it makes llama_moe_sentinel_count return n_used instead of 1, which costs (n_used-1) expert
+        // slabs of VRAM per layer and therefore a slightly smaller auto capacity. Measured cost of that on
+        // decode was within run-to-run noise; the prefill win is not.
+        set_if_unset("LLAMA_MOE_PREFILL_SWEEP", "1");
     }
 
     cparams.type_k = params.cache_type_k;

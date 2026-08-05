@@ -1555,12 +1555,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     static int64_t sd_cpu_copy_ns = 0, sd_gpu_copy_ns = 0, sd_cpu_comp_ns = 0, sd_gpu_comp_ns = 0;
     static int64_t sd_calls = 0, sd_cpu_splits = 0, sd_gpu_splits = 0;
 
+    // Per-split-INDEX timing (GGML_MOE_SPLIT_IDX_DIAG=1). The aggregate above cannot say WHICH split got
+    // slower. When two runs execute a structurally identical graph (same n_splits, same order) but one is
+    // slower in wall clock while doing LESS measured work, the difference must sit in specific splits, so
+    // accumulate per index and report the largest. Like split_diag this settles the async compute, so both
+    // runs are serialized identically and are comparable to each other (not to an uninstrumented run).
+    static const bool split_idx_diag = getenv("GGML_MOE_SPLIT_IDX_DIAG") != nullptr;
+    static std::vector<int64_t> si_copy_ns;
+    static std::vector<int64_t> si_comp_ns;
+    static int64_t si_calls = 0;
+    if (split_idx_diag && (int) si_copy_ns.size() < sched->n_splits) {
+        si_copy_ns.resize(sched->n_splits, 0);
+        si_comp_ns.resize(sched->n_splits, 0);
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         const bool sd_is_cpu = split_diag && (split_backend_id == sched->n_backends - 1); // last backend is CPU
-        const int64_t sd_copy0 = split_diag ? ggml_time_us() : 0;
+        const int64_t sd_copy0 = (split_diag || split_idx_diag) ? ggml_time_us() : 0;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1690,7 +1704,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (sd_is_cpu) { sd_cpu_copy_ns += now - sd_copy0; sd_cpu_splits++; }
             else           { sd_gpu_copy_ns += now - sd_copy0; sd_gpu_splits++; }
         }
-        const int64_t sd_comp0 = split_diag ? ggml_time_us() : 0;
+        if (split_idx_diag) { si_copy_ns[split_id] += ggml_time_us() - sd_copy0; }
+        const int64_t sd_comp0 = (split_diag || split_idx_diag) ? ggml_time_us() : 0;
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -1699,7 +1714,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
             // for the diagnostic, force the async compute to settle so the timer reflects real GPU time
             // (only when diag is on; normal runs keep the async overlap). CPU splits are already sync.
-            if (split_diag && !sd_is_cpu) { ggml_backend_synchronize(split_backend); }
+            if ((split_diag || split_idx_diag) && !sd_is_cpu) { ggml_backend_synchronize(split_backend); }
         } else {
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
@@ -1745,6 +1760,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             const int64_t now = ggml_time_us();
             if (sd_is_cpu) { sd_cpu_comp_ns += now - sd_comp0; }
             else           { sd_gpu_comp_ns += now - sd_comp0; }
+        }
+        if (split_idx_diag) { si_comp_ns[split_id] += ggml_time_us() - sd_comp0; }
+    }
+
+    // report the heaviest split indices (single-token decode = one splits call per token)
+    if (split_idx_diag && sched->n_splits > 1) {
+        si_calls++;
+        if (si_calls % 64 == 0) {
+            std::vector<int> order((size_t) sched->n_splits);
+            for (int i = 0; i < sched->n_splits; i++) { order[(size_t) i] = i; }
+            std::sort(order.begin(), order.end(), [](int a, int b) {
+                return (si_copy_ns[a] + si_comp_ns[a]) > (si_copy_ns[b] + si_comp_ns[b]);
+            });
+            int64_t tot_copy = 0, tot_comp = 0;
+            for (int i = 0; i < sched->n_splits; i++) { tot_copy += si_copy_ns[i]; tot_comp += si_comp_ns[i]; }
+            const double f = 1000.0 * 64.0; // us -> ms per call
+            GGML_LOG_WARN("SPLIT-IDX/64: %d splits, copy %.2fms + comp %.2fms = %.2fms per call\n",
+                          sched->n_splits, tot_copy/f, tot_comp/f, (tot_copy+tot_comp)/f);
+            for (int k = 0; k < 12 && k < sched->n_splits; k++) {
+                const int i = order[(size_t) k];
+                const ggml_tensor * n0 = splits[i].graph.n_nodes > 0 ? splits[i].graph.nodes[0] : NULL;
+                GGML_LOG_WARN("SPLIT-IDX/64:   #%-4d %-6s %-14s %-28s copy %.3fms comp %.3fms\n", i,
+                              ggml_backend_name(sched->backends[splits[i].backend_id]),
+                              n0 ? ggml_op_name(n0->op) : "-",
+                              (n0 && n0->name[0]) ? n0->name : "-",
+                              si_copy_ns[i]/f, si_comp_ns[i]/f);
+            }
+            std::fill(si_copy_ns.begin(), si_copy_ns.end(), 0);
+            std::fill(si_comp_ns.begin(), si_comp_ns.end(), 0);
         }
     }
 

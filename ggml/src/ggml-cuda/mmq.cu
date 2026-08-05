@@ -173,13 +173,36 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
+    // fork: op_params[0], when set to a value in (0, ne02), declares that only src0 channels [0, n_real) can
+    // hold real weights and that channels [n_real, ne02) are permanently zero. The MoE-streaming fork points
+    // dropped routing positions at those "sentinel" channels, so their contribution is exactly zero and the
+    // GEMM tiles for them can be skipped outright instead of multiplying against zeroed quantized blocks.
+    // Zero (the default for every stock caller) disables this and the code below is unchanged.
+    int n_real = ne02;
+    {
+        int32_t p0 = 0;
+        memcpy(&p0, dst->op_params, sizeof(int32_t));
+        if (p0 > 0 && p0 < ne02) {
+            n_real = p0;
+            // Skipped tiles never write their dst columns, and dst memory is recycled by ggml-alloc, so it
+            // must be zeroed first for those positions to read as the zeros they represent.
+            CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
+        }
+    }
+
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
+        // The helper only fills ids_src1 for the rows it keeps; the src1 quantization below still walks all
+        // ne_get_rows entries, so the skipped tail must be a valid index rather than uninitialized pool memory.
+        if (n_real != ne02) {
+            CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows*sizeof(int32_t), stream));
+        }
+
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, n_real, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 

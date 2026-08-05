@@ -346,3 +346,96 @@ ggml_tensor * llama_moe_layer_cache_remap(llama_moe_layer_cache * c,
                                           ggml_tensor *           weights,
                                           float                   threshold,
                                           int                     sync_budget);
+
+// fork: PREFILL EXPERT-GROUP SWEEP (LLAMA_MOE_PREFILL_SWEEP=1, opt-in).
+//
+// The plain prefill remap above is bounded by `capacity`: once a step's unique experts exceed the
+// resident slots it stops loading and the remainder drop to a zero sentinel, so their gate weight is
+// simply lost (the router already normalized). For an MoE with many experts and a small top-k this
+// bites immediately - a few hundred tokens light up essentially every expert - which is why a wide
+// prefill ubatch degrades quality while ubatch 1 does not.
+//
+// The sweep removes the cap instead of rationing against it. The expert INDEX space is partitioned
+// into fixed groups of at most `capacity` entries, and the whole MoE FFN is evaluated once per group.
+// Within a group every expert the ubatch selected is guaranteed resident (the group cannot exceed
+// capacity by construction), so there is no miss and nothing to drop. Positions routed outside the
+// group resolve to a zero sentinel and contribute exactly 0, so summing the per-group outputs
+// reproduces the full result losslessly. Cost is one extra FFN pass per group, not extra expert bytes:
+// each expert is still read at most once per ubatch step.
+//
+// The partition is static (derived from n_expert and capacity, both run-constant), so graph topology
+// stays fixed - no data-dependent shapes, no new kernels, mul_mat_id and its grouped-GEMM path are
+// used unchanged.
+//
+// `dep` MUST be a tensor produced by the previous group's FFN output (any cheap 1-element derivative
+// of it). It is read for its scheduling edge only, never for its value: it forces the scheduler to
+// finish group g-1's device kernels before this callback runs, because group g reuses - and therefore
+// overwrites - group g-1's slots. Pass nullptr for the first group.
+bool llama_moe_prefill_sweep_enabled(void);
+
+// Zero sentinel slots per layer cache. Single source of truth shared by llama_moe_auto_capacity
+// (which must subtract these from the VRAM budget) and the cache allocation.
+int llama_moe_sentinel_count(int n_used);
+
+// fork: queue an opportunistic prefetch of `n_ids` expert ids for the MoE layer at index `il`. Non-blocking
+// hint only - it appends to that layer cache's prefetch queue and returns; the background loader services it
+// at the top of its next pass, in ascending layer order. Nothing downstream depends on the bytes arriving:
+// until the loader publishes, the expert still reads as non-resident, so the remap callback applies its
+// ordinary sync-budget / coverage / stale-reuse rules to it. A late prefetch is wasted, never wrong. H2D on
+// the calling thread is not an option (ggml_backend_tensor_set synchronizes per call), hence the hand-off.
+//
+// The exploitable case is a layer whose routing does not depend on the hidden state. DeepSeek-V4 routes its
+// first dsv4_hash_layer_count layers through a static token-id -> expert table, so the exact expert set is a
+// pure function of the token id and is known before the graph is built - a prefetch oracle with no prediction
+// error. Opt in with LLAMA_MOE_HASH_PREFETCH=1 (both this and the caller gate on it).
+//
+// MEASURED NEGATIVE on dsv4 IQ2 / cap=36, which is why it is off by default. Keep the mechanism, do not
+// re-try it blindly. What was verified:
+//  - the oracle is exact: the ids read here match the ids the graph's mul_mat_id receives, byte for byte
+//    (LLAMA_MOE_PFDBG prints both sides)
+//  - those layers really are the worst in the model: ~43-51% VRAM hit / ~47-55% stale versus ~64-70% /
+//    ~22-27% everywhere else, in every configuration tried (with and without the prefill sweep, on
+//    repetitive and on varied output), so the target was worth attacking
+//  - the plumbing works: requests are queued and the loader publishes hundreds of them per generation
+//  - and yet the hit rate of those layers does not move, across four variants: drain once per loader pass;
+//    drain between every cache; pin the published slot so nothing can recycle it; and batch per layer
+//    through parallel_load for 16-way reads plus a single device synchronize.
+// The reason is horizon, not accuracy or eviction. Entry-time residency (see g_moe_pf_resident) matches the
+// callback's hit rate almost exactly, so nothing is being lost between decode entry and the FFN - the
+// prefetched bytes simply arrive after that layer's matmul has already read the slot table, and by the next
+// token the ids have changed. Covering even one hash layer means moving ~n_used expert slabs inside the few
+// ms between the token becoming known and layer 0 executing, which is tens of GB/s. This is the same wall
+// the cross-layer prefetch hit, for a different reason: there the predictions were wrong, here they are
+// perfect and there is no time to act on them.
+void llama_moe_layer_prefetch(int il, const int32_t * ids, int n_ids);
+
+// Resident slot count of this layer cache (excludes the zero sentinel slots).
+int llama_moe_layer_cache_capacity(const llama_moe_layer_cache * c);
+
+ggml_tensor * llama_moe_layer_cache_remap_group(llama_moe_layer_cache * c,
+                                                ggml_context *          ctx0,
+                                                ggml_tensor *           selected_experts,
+                                                int                     group,
+                                                ggml_tensor *           dep);
+
+// A sweep leaves every layer cache holding its LAST expert group - an index range unrelated to what
+// decode will route to - so decode would run cold for the rest of the generation. These two restore
+// the score-ranked working set once, at the first single-token step after a sweep. Call
+// llama_moe_refill_vram_caches only after the device is synchronized: it overwrites slabs that the
+// just-finished graph read.
+bool llama_moe_sweep_refill_pending(void);
+void llama_moe_refill_vram_caches(void);
+
+// Dump every layer cache's resident expert set (LLAMA_MOE_RESDBG). Used to answer "does the sweep leave
+// a different resident set than an ordinary prefill" by measurement instead of by comparing throughput.
+void llama_moe_dump_residency(const char * tag);
+
+// One-shot VRAM audit, run once after allocation: warns when the auto-sized expert cache has left too
+// little device memory for the graph's transients (a silent shared-memory spill that costs throughput).
+void llama_moe_vram_audit(void);
+
+// Two-phase auto capacity: llama_context sets defer=true for its first pp graph reserve so the compute
+// buffer can be measured with no expert caches allocated, publishes that size, then clears defer so the
+// later reserve passes create the caches sized against the real number instead of a flat guess.
+void llama_moe_set_defer_caches(bool v);
+void llama_moe_set_compute_reserve(size_t bytes);

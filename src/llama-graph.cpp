@@ -2020,6 +2020,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // With a warm RAM tier these syncs read from locked RAM, not disk, so the CPU-op cost is far lower
     // than the disk-bound worst case.
     ggml_tensor * moe_cache_ids = nullptr;
+    // fork: prefill expert-group sweep (LLAMA_MOE_PREFILL_SWEEP=1). When on, prefill does NOT build a
+    // single capacity-capped ids tensor; it evaluates the FFN once per static expert-index group with a
+    // per-group ids tensor, so nothing is ever dropped. Only useful when capacity < n_expert (otherwise
+    // there is one group and the plain path is already lossless).
+    bool moe_prefill_sweep = false;
+    if (moe_lc && moe_stream && moe_stream_async && n_tokens > 1 && llama_moe_prefill_sweep_enabled()) {
+        const int cap = llama_moe_layer_cache_capacity(moe_lc);
+        // Every projection must resolve to a device cache tensor. If any does not, mm_id_exps would fall
+        // through to the compaction gather, which builds the FULL expert set - each group would then
+        // compute every expert and the sum would scale the layer output by n_groups. Refuse instead.
+        const bool dev_ok = (!gate_up_exps || llama_moe_layer_cache_dev(moe_lc, gate_up_exps)) &&
+                            (!gate_exps    || llama_moe_layer_cache_dev(moe_lc, gate_exps))    &&
+                            (!up_exps      || llama_moe_layer_cache_dev(moe_lc, up_exps))      &&
+                            (!down_exps    || llama_moe_layer_cache_dev(moe_lc, down_exps));
+        moe_prefill_sweep = cap > 0 && cap < (int) n_expert && dev_ok;
+    }
     if (moe_lc && moe_stream_async) {
         const int64_t n_sel = selected_experts->ne[0] * selected_experts->ne[1];
         const bool ok_shape = n_sel > 0 && selected_experts->ne[2] == 1 && selected_experts->ne[3] == 1;
@@ -2047,7 +2063,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 decode_cpu_sync = true;
             }
         }
-        if (n_tokens > 1 || decode_cpu_sync) {
+        if (moe_prefill_sweep) {
+            // ids are built per expert group further down; leave moe_cache_ids null
+        } else if (n_tokens > 1 || decode_cpu_sync) {
             moe_cache_ids = llama_moe_layer_cache_remap(moe_lc, ctx0, selected_experts, weights, moe_sync_threshold, moe_sync_budget);
         } else if (ok_shape) {
             // decode: device get_rows over the [1,n_expert] STALE table (no CPU split). Flatten to
@@ -2104,7 +2122,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
-    auto mm_id_exps = [&](ggml_tensor * exps, ggml_tensor * input) -> ggml_tensor * {
+    // `ids` is the slot-id tensor this call must route through: the layer's single frozen assignment on
+    // the normal path, or one expert group's assignment during the prefill sweep.
+    auto mm_id_exps = [&](ggml_tensor * exps, ggml_tensor * input, ggml_tensor * ids) -> ggml_tensor * {
         if (!moe_stream) {
             return build_lora_mm_id(exps, input, selected_experts);
         }
@@ -2112,10 +2132,33 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // assignment for the whole layer (moe_cache_ids), shared across gate/up/down: a CPU
         // threshold sync-load on prefill, a pure-GPU get_rows on decode.
         if (moe_stream_async) {
-            if (moe_lc && moe_cache_ids) {
+            if (moe_lc && ids) {
                 ggml_tensor * dev = llama_moe_layer_cache_dev(moe_lc, exps);
                 if (dev) {
-                    return ggml_mul_mat_id(ctx0, dev, input, moe_cache_ids);
+                    ggml_tensor * mm = ggml_mul_mat_id(ctx0, dev, input, ids);
+                    // fork: tell the CUDA MMQ path that channels [capacity, capacity+n_sentinel) of `dev` are
+                    // the permanently-zero sentinel slabs, so it can skip their GEMM tiles instead of
+                    // multiplying against zeros. Provably bit-identical: those slabs are zeroed once at cache
+                    // creation and no write path can ever target a slot >= capacity (every victim search is
+                    // bounded by capacity, the prewarm loop is `s < capacity`, stale_of_expert maps every
+                    // expert to a slot < capacity, and slot_table maps a miss to exactly `capacity`).
+                    // Worth the most under the prefill group sweep, where (n_groups-1)/n_groups of all routing
+                    // positions are sentinels - 7/8 of them at capacity 36 on dsv4.
+                    // Backends that ignore op_params still compute the zero slabs and get the same answer.
+                    // Default ON: proven bit-identical (a --temp 0 run with the loader frozen produced a
+                    // byte-for-byte identical completion), and it strictly removes work. Measured +0.6% at
+                    // capacity 36 on dsv4 (8 groups), i.e. inside noise but already paying for its two
+                    // memsets, rising to +9.3% at capacity 8 (32 groups) where the skipped fraction is
+                    // larger. Smaller cards get smaller capacities and therefore more groups, so this helps
+                    // most exactly where it is needed. Set LLAMA_MOE_SENTINEL_SKIP=0 to A/B it.
+                    static const bool sentinel_skip = moe_env_on("LLAMA_MOE_SENTINEL_SKIP", true);
+                    if (sentinel_skip && mm) {
+                        const int32_t cap = (int32_t) llama_moe_layer_cache_capacity(moe_lc);
+                        if (cap > 0 && cap < dev->ne[2]) {
+                            memcpy(mm->op_params, &cap, sizeof(int32_t));
+                        }
+                    }
+                    return mm;
                 }
             }
             // per-layer cache unavailable (LLAMA_MOE_ASYNC off, creation failed, or an empty
@@ -2125,6 +2168,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (n_tokens <= 1) {
                 const char * cap_env = getenv("LLAMA_MOE_CACHE_CAP");
                 const int    cap     = cap_env ? atoi(cap_env) : 0; // 0 => full (n_expert)
+                if (getenv("LLAMA_MOE_SLOTDBG")) {
+                    LLAMA_LOG_WARN("MoE AUDIT per-tensor fallback: il=%d n_tokens=%d cap_req=%d n_expert=%d\n",
+                                   il, (int) n_tokens, cap, (int) n_expert);
+                }
                 ggml_tensor * cache_ids = nullptr;
                 ggml_tensor * cache     = nullptr;
                 if (getenv("LLAMA_MOE_CACHE_GETROWS")) {
@@ -2156,9 +2203,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return ggml_mul_mat_id(ctx0, compact, input, stream_ids);
     };
 
+    // The whole expert FFN (gate/up, activation, down, per-expert bias/scale, routing weight) as a
+    // function of one slot-id assignment. Called once normally, or once per expert group when the
+    // prefill sweep is on. `cur`/`up`/`experts` stay the enclosing variables so the body below is
+    // unchanged from the single-pass version; each pass re-derives `cur` from the saved FFN input.
+    ggml_tensor * moe_in = cur;
+
+    auto build_experts = [&](ggml_tensor * ids) -> ggml_tensor * {
+    cur = moe_in;
+    up  = nullptr;
+
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = mm_id_exps(gate_up_exps, cur); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = mm_id_exps(gate_up_exps, cur, ids); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (gate_up_exps_b) {
@@ -2182,7 +2239,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = mm_id_exps(up_exps, cur); // [n_ff, n_expert_used, n_tokens]
+        up = mm_id_exps(up_exps, cur, ids); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_b) {
@@ -2200,7 +2257,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = mm_id_exps(gate_exps, cur); // [n_ff, n_expert_used, n_tokens]
+            cur = mm_id_exps(gate_exps, cur, ids); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2294,7 +2351,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = mm_id_exps(down_exps, cur); // [n_embd, n_expert_used, n_tokens]
+    experts = mm_id_exps(down_exps, cur, ids); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {
@@ -2314,6 +2371,41 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
+    }
+
+    return experts;
+    };
+
+    if (moe_prefill_sweep) {
+        // One pass per static expert-index group. Every in-group expert this ubatch selected is
+        // resident by construction (group span <= capacity), and out-of-group positions route to a zero
+        // sentinel and contribute exactly 0, so the sum over groups reproduces the full MoE output with
+        // nothing dropped. Expert bytes read are unchanged: each expert is still touched at most once
+        // per ubatch step. The extra cost is n_groups FFN passes, not n_groups expert loads.
+        const int cap      = llama_moe_layer_cache_capacity(moe_lc);
+        const int n_groups = ((int) n_expert + cap - 1) / cap;
+        ggml_tensor * acc = nullptr;
+        ggml_tensor * dep = nullptr;
+        for (int g = 0; g < n_groups; ++g) {
+            ggml_tensor * ids = llama_moe_layer_cache_remap_group(moe_lc, ctx0, selected_experts, g, dep);
+            if (!ids) {
+                acc = nullptr; // cache refused (it logs why): fall back to the single capped pass
+                break;
+            }
+            ggml_tensor * part = build_experts(ids);
+            // Cheap 1-element derivative of this group's output, handed to the NEXT group's remap as its
+            // second input purely for the scheduling edge: group g+1's CPU callback recycles the slots
+            // group g's matmuls read, so it must not run before those kernels have retired.
+            dep = ggml_cont(ctx0, ggml_view_1d(ctx0, part, 1, 0));
+            acc = acc ? ggml_add(ctx0, acc, part) : part;
+        }
+        experts = acc;
+        if (experts) {
+            cb(experts, "ffn_moe_sweep_sum", il);
+        }
+    }
+    if (!experts) {
+        experts = build_experts(moe_cache_ids);
     }
 
     ggml_build_forward_expand(gf, experts);

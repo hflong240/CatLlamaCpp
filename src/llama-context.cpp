@@ -623,6 +623,7 @@ void llama_context::sched_reserve() {
         n_nodes_pp  = ggml_graph_n_nodes(gf);
     }
 
+
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
@@ -1275,11 +1276,20 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // fork: per-phase timing of one ubatch (LLAMA_UBATCH_DIAG). Exists because a wall-clock decode
+    // regression was traced to time spent OUTSIDE ggml_backend_sched_compute_splits: the sum of the
+    // scheduler's own per-split timers was smaller than the step's wall time, which can only happen if
+    // the cost is in graph reuse/build, memory-context apply, or set_inputs. Splits those three apart.
+    static const bool ub_diag = getenv("LLAMA_UBATCH_DIAG") != nullptr;
+    static uint64_t ub_apply_ns = 0, ub_build_ns = 0, ub_inputs_ns = 0, ub_compute_ns = 0, ub_calls = 0;
+    const int64_t ub_t0 = ub_diag ? ggml_time_us() : 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    const int64_t ub_t1 = ub_diag ? ggml_time_us() : 0;
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -1334,7 +1344,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t ub_t3 = ub_diag ? ggml_time_us() : 0;
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (ub_diag) {
+        const int64_t ub_t4 = ggml_time_us();
+        ub_apply_ns   += (uint64_t) (ub_t1 - ub_t0);
+        ub_build_ns   += (uint64_t) (ub_t3 - ub_t1); // graph reuse-check / build, minus set_inputs below
+        ub_compute_ns += (uint64_t) (ub_t4 - ub_t3);
+        ub_calls++;
+        if (ub_calls % 64 == 0) {
+            const double f = 1000.0 * 64.0; // us -> ms averaged over 64 ubatches
+            LLAMA_LOG_WARN("UBATCH-DIAG/64: n_tokens=%d | mctx->apply %.2fms | graph reuse+build+set_inputs "
+                           "%.2fms | graph_compute %.2fms | total %.2fms\n",
+                           (int) ubatch.n_tokens, ub_apply_ns/f, ub_build_ns/f, ub_compute_ns/f,
+                           (ub_apply_ns + ub_build_ns + ub_compute_ns)/f);
+            ub_apply_ns = ub_build_ns = ub_inputs_ns = ub_compute_ns = 0;
+        }
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1666,6 +1695,55 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
+
+    // fork: opportunistic expert prefetch for statically-routed MoE layers (LLAMA_MOE_HASH_PREFETCH=1).
+    // DeepSeek-V4's first dsv4_hash_layer_count layers select experts with
+    // get_rows(ffn_gate_tid2eid, inp_tokens) - a pure table lookup on the token id, with no dependence on the
+    // hidden state (see src/models/deepseek4.cpp). So on single-token decode the exact expert set for those
+    // layers is known HERE, before the graph is built, and can be queued for the background loader to land
+    // ahead of the FFN. This is the one prefetch in this fork that has no prediction error; every
+    // hidden-state-based scheme tried before it topped out well below usable accuracy.
+    //
+    // Strictly a hint: llama_moe_layer_prefetch does no I/O on this thread and the remap callback keeps
+    // applying its ordinary sync-budget / coverage rules to anything that has not landed by the time the FFN
+    // runs. The horizon it gets is this function's graph build plus the layer's attention (for dsv4, the
+    // lightning indexer), which is why it is worth trying at all.
+    if (batch_inp.n_tokens == 1 && batch_inp.token && cparams.moe_stream_async &&
+        hparams.dsv4_hash_layer_count > 0) {
+        extern void llama_moe_layer_prefetch(int il, const int32_t * ids, int n_ids);
+        static const bool hash_prefetch = []() {
+            const char * e = getenv("LLAMA_MOE_HASH_PREFETCH");
+            return e && atoi(e) != 0;
+        }();
+        const int32_t tok = hash_prefetch ? batch_inp.token[0] : -1;
+        if (tok >= 0) {
+            int32_t ids[LLAMA_MAX_EXPERTS];
+            for (uint32_t il = 0; il < hparams.dsv4_hash_layer_count && il < model.layers.size(); ++il) {
+                ggml_tensor * t = model.layers[il].ffn_gate_tid2eid;
+                static bool pf_logged = false;
+                if (!pf_logged) {
+                    pf_logged = true;
+                    LLAMA_LOG_WARN("MoE HASH-PREFETCH probe: hash_layers=%u t=%p type=%s ne=[%lld,%lld] tok=%d\n",
+                                   hparams.dsv4_hash_layer_count, (void *) t,
+                                   t ? ggml_type_name(t->type) : "null",
+                                   t ? (long long) t->ne[0] : 0, t ? (long long) t->ne[1] : 0, (int) tok);
+                }
+                if (!t || t->type != GGML_TYPE_I32) {
+                    break; // unexpected layout; the table is the ids themselves or this is not usable
+                }
+                const int64_t n_per = t->ne[0];
+                if (n_per <= 0 || n_per > LLAMA_MAX_EXPERTS || tok >= t->ne[1]) {
+                    break;
+                }
+                ggml_backend_tensor_get(t, ids, (size_t) tok * t->nb[1], (size_t) n_per * sizeof(int32_t));
+                if (getenv("LLAMA_MOE_PFDBG")) {
+                    LLAMA_LOG_WARN("MoE PFDBG caller il=%u tok=%d ids=%d,%d,%d,%d,%d,%d\n", il, (int) tok,
+                                   ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
+                }
+                llama_moe_layer_prefetch((int) il, ids, (int) n_per);
+            }
+        }
+    }
 
     const int64_t n_vocab = vocab.n_tokens();
     const int64_t n_embd  = hparams.n_embd_inp();
@@ -2022,6 +2100,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    // fork: time everything after the last process_ubatch (LLAMA_UBATCH_DIAG). graph_compute is ASYNC,
+    // so a step whose CPU splits do not force the host to wait leaves the GPU tail to be paid here, in
+    // the output-extraction / boundary-sync tail. Splitting this out separates "the tail is long" from
+    // "one of the fork's own hooks is expensive".
+    static const bool tail_diag = getenv("LLAMA_UBATCH_DIAG") != nullptr;
+    static uint64_t tail_moe_ns = 0, tail_all_ns = 0, tail_calls = 0;
+    const int64_t tail_t0 = tail_diag ? ggml_time_us() : 0;
+
     // MoE token-boundary backpressure sync (fork): on the single-token decode path, if
     // LLAMA_MOE_SYNC_BOUNDARY=N is set, force this token's compute to finish and then synchronously
     // load any of each layer's top-N (highest-weight) experts the background loader has not kept
@@ -2029,7 +2115,41 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // stale experts to one token while decode itself stays on the pure-GPU path. Only forces the
     // (otherwise deferred) sync when enabled, so the default async overlap is unaffected. Reading the
     // graph output on the next step would sync anyway, so the added cost here is ~nil.
+    const int64_t tail_moe_t0 = tail_diag ? ggml_time_us() : 0;
     if (n_tokens_all == 1 && cparams.moe_stream_async) {
+        // fork: a prefill expert-group sweep (LLAMA_MOE_PREFILL_SWEEP) walks the whole expert index
+        // space, so each layer cache ends up holding the sweep's LAST group - an arbitrary index
+        // range, not the experts this generation will route to. Restore the score-ranked working set
+        // once here, at the first decode token, sourcing bytes from the warm RAM pool. Skipping this
+        // leaves decode several times slower for the rest of the generation, which more than cancels
+        // the sweep's prefill win on anything but a very short completion.
+        extern bool llama_moe_sweep_refill_pending(void);
+        extern void llama_moe_refill_vram_caches(void);
+        extern void llama_moe_dump_residency(const char *);
+        extern void llama_moe_vram_audit(void);
+        static bool moe_audit_done = false;
+        if (!moe_audit_done) {
+            // once, at the first decode step: everything (weights, KV, expert caches, compute buffer) is
+            // allocated by now, so free VRAM here is the number that actually matters
+            moe_audit_done = true;
+            llama_moe_vram_audit();
+        }
+        static bool moe_resdbg_done = false;
+        if (!moe_resdbg_done && getenv("LLAMA_MOE_RESDBG")) {
+            // one-shot: the resident set as prefill left it, and (if a sweep ran) after the refill
+            moe_resdbg_done = true;
+            synchronize();
+            llama_moe_dump_residency("pre");
+            if (llama_moe_sweep_refill_pending()) {
+                llama_moe_refill_vram_caches();
+                llama_moe_dump_residency("post");
+            }
+        }
+        if (llama_moe_sweep_refill_pending()) {
+            synchronize(); // the refill overwrites slabs the just-finished graph read
+            llama_moe_refill_vram_caches();
+        }
+
         static const int moe_boundary_budget = []() {
             const char * e = getenv("LLAMA_MOE_SYNC_BOUNDARY");
             const int b = e ? atoi(e) : 0;
@@ -2039,6 +2159,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
             extern int llama_moe_boundary_sync(int budget);
             synchronize();
             llama_moe_boundary_sync(moe_boundary_budget);
+        }
+    }
+
+    if (tail_diag) {
+        tail_moe_ns += (uint64_t) (ggml_time_us() - tail_moe_t0);
+        const int64_t tail_t1 = ggml_time_us();
+        tail_all_ns += (uint64_t) (tail_t1 - tail_t0);
+        tail_calls++;
+        if (tail_calls % 64 == 0) {
+            const double f = 1000.0 * 64.0;
+            LLAMA_LOG_WARN("UBATCH-DIAG/64 tail: post-ubatch total %.2fms (of which fork MoE hooks %.2fms)\n",
+                           tail_all_ns/f, tail_moe_ns/f);
+            tail_all_ns = tail_moe_ns = 0;
         }
     }
 

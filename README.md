@@ -22,12 +22,18 @@ LLM inference in C/C++
 
 This fork lets you run very large Mixture-of-Experts (MoE) models on modest hardware by keeping the
 routed expert weights **out of VRAM** and pulling only the experts each token actually needs, on the fly.
-As a milestone, it runs a **170 GB / 299B-parameter Hunyuan-v3 MoE on a single 32 GB GPU** by streaming
-experts from an SSD.
+It runs models whose routed experts are several times the size of VRAM *and* system RAM combined: the
+current primary target is **DeepSeek-V4-Flash** (78 GiB of routed experts alone, on a 24 GB GPU + 64 GB
+RAM), and it also runs a **170 GB / 299B-parameter Hunyuan-v3 MoE on a single 32 GB GPU**.
+
+Prompt processing is **lossless** here, not just fluent: the prefill expert-group sweep (on by default)
+evaluates every routed expert a batch selects, so nothing is dropped or substituted. See
+[What's new](#whats-new).
 
 ### Technical background
 
-In a MoE layer only a handful of experts (e.g. 8 of 192) are active per token, yet upstream keeps the
+In a MoE layer only a handful of experts (6 of 256 for DeepSeek-V4-Flash, 8 of 192 for Hunyuan-v3) are
+active per token, yet upstream keeps the
 entire `[n_embd, n_ff, n_expert]` expert tensor resident. For large models that tensor dwarfs the rest of
 the weights, which is what forces huge VRAM/RAM requirements. This fork treats the experts as a
 three-tier cache instead:
@@ -52,6 +58,29 @@ should not run together. Use `-fit off` with streaming (see the note under Usage
 
 ### What's new
 
+- **DeepSeek-V4-Flash (`deepseek4`) architecture support**: 43 MoE layers, 256 experts with 6 active,
+  hyper-connections, a lightning indexer, and static token-id expert routing on the first layers. Ported
+  from [ggml-org/llama.cpp#24162](https://github.com/ggml-org/llama.cpp/pull/24162). This is the fork's
+  main test target; the streaming defaults below are tuned on it.
+- **Lossless prefill via the expert-group sweep** (`LLAMA_MOE_PREFILL_SWEEP`, **on by default** with
+  `--moe-stream-async`): prompt processing no longer rations a batch against the VRAM cache and drop the
+  rest. The expert *index* space is partitioned into `ceil(n_expert / capacity)` static groups and the MoE
+  FFN runs once per group, so every selected expert is evaluated and the per-group sum reproduces the full
+  layer output exactly. This replaces the old `-ub 1` workaround: measured on DeepSeek-V4-Flash IQ2
+  (1195-token prompt, 24 GB card), prefill **75.9 tok/s lossless vs 13.4 tok/s** for `-ub 1`
+  (**5.7x**) at the same decode rate, where `-ub 1` still only got 4.18 of 6 routing positions right per
+  token. Set `LLAMA_MOE_PREFILL_SWEEP=0` for the old behaviour.
+- **Capacity auto-sizing fixed to the measured throughput knee**: filling VRAM to the last byte is
+  *slower*, not faster. The driver pages part of the working set once total committed VRAM crosses a
+  threshold, and this is invisible in every VRAM counter - it shows up only as throughput, on **both**
+  prefill and decode (~1.5x on DeepSeek-V4-Flash IQ2 past the knee), while extra cache below the knee buys
+  nothing. The auto sizer now leaves an absolute reserve (`LLAMA_MOE_VRAM_RESERVE_MB`, default 3072) instead
+  of a thin fragmentation margin. See the sizing note under [Tuning](#tuning-environment-variables) for how
+  to re-measure it on your own card - the number is hardware- and configuration-dependent.
+- **Sentinel GEMM skip** (`LLAMA_MOE_SENTINEL_SKIP`, on by default, CUDA): during the sweep most routing
+  positions point at permanently-zero "sentinel" expert slots, and their GEMM tiles are now skipped rather
+  than multiplied against zeros. Provably bit-identical (verified byte-for-byte on a greedy run), and it
+  matters more the smaller the VRAM cache is.
 - **MoE expert streaming** (opt-in, off by default): stream routed experts from disk instead of keeping
   them resident. Two flags (`--moe-stream`, `--moe-stream-async`), see [Usage](#moe-streaming-usage).
 - **Auto-sized cache tiers**: both the VRAM expert cache (`LLAMA_MOE_CACHE_CAP`) and the host-RAM pool
@@ -80,7 +109,7 @@ memory, so only the experts selected or cached each step occupy VRAM. There are 
 | Flag | What it does | Correctness |
 |------|--------------|-------------|
 | `--moe-stream` | **Compaction.** Each step copies only the experts selected that step to VRAM and runs the stock kernels over that small tensor. | Byte-identical to a non-streamed run. Largest VRAM saving, lowest throughput (experts cross PCIe every token). |
-| `--moe-stream-async` | **Persistent VRAM expert cache.** Hot experts stay resident and reused across tokens. Enables the recommended async-streaming config by default (per-layer cache, off-page-cache reads, top-2 sync budget, RAM-pool prefill) - the per-layer streaming cache needed when a model exceeds VRAM *and* RAM. | Diverges from a non-streamed run (opt-in via this flag). For byte-identical output use `--moe-stream` or run non-streamed. Best balance of VRAM vs speed. Set any `LLAMA_MOE_*=0` to opt out of a piece. |
+| `--moe-stream-async` | **Persistent VRAM expert cache.** Hot experts stay resident and reused across tokens. Enables the recommended async-streaming config by default (per-layer cache, off-page-cache reads, top-2 sync budget, RAM-pool prefill, **lossless prefill sweep**) - the per-layer streaming cache needed when a model exceeds VRAM *and* RAM. | Diverges from a non-streamed run (opt-in via this flag). For byte-identical output use `--moe-stream` or run non-streamed. Best balance of VRAM vs speed. Set any `LLAMA_MOE_*=0` to opt out of a piece. |
 
 `LLAMA_MOE_CACHE_CAP` (VRAM experts/layer) and `LLAMA_MOE_RAM_CAP` (host-RAM experts/layer) are both
 **auto-sized** - you normally set neither. For a model that fits in VRAM, or one only modestly larger,
@@ -117,8 +146,13 @@ Measured on an RTX 4090D (24 GB) + 64 GB RAM, coherent and non-degenerate throug
 
 | Model | Fits in | Decode | Prefill |
 |-------|---------|--------|---------|
+| DeepSeek-V4-Flash **IQ2** (78 GiB routed experts) | neither VRAM nor RAM | **~14.5 tok/s** | **~76 tok/s (lossless)** |
 | Hunyuan-v3 **IQ2** (~92 GB) | neither VRAM nor RAM | **~13 tok/s** | ~20-40 tok/s |
 | Hunyuan-v3 **Q4** (~170 GB) | neither VRAM nor RAM | **~3.8 tok/s** | ~10-15 tok/s |
+
+The DeepSeek-V4-Flash row is the shipped default configuration (`--moe-stream-async -fit off -ub 2048`),
+N=3 medians on a 1195-token prompt with a 320-token generation. Its prefill is both lossless and ~5.7x the
+old `-ub 1` path; the Hunyuan-v3 prefill figures predate the expert-group sweep.
 
 Q4 is slower than IQ2 because each expert slab is ~1.8x the bytes, so fewer experts fit resident (both
 tiers hold fewer) and the working set overflows VRAM+RAM further - decode is bounded by NVMe read
@@ -148,25 +182,47 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 > decode (`llama-cli`/`llama-completion`) - treat it as experimental.
 
 > [!IMPORTANT]
-> **`SYNC_BUDGET` governs decode only - prompt processing (prefill) uses a different, lossy path.**
-> The top-N `SYNC_BUDGET`/`SYNC_COVER` selection engages only on single-token steps (`n_tokens <= 1`).
-> A multi-token prefill batch (`n_tokens > 1`) instead loads each layer's working set bounded by
-> `CACHE_CAP` and **drops the rest to a zeroed expert** (no stale reuse across a batch). When a model is
-> far larger than VRAM so `CACHE_CAP` is a small fraction of the experts a batch touches, a prompt can be
-> processed with most of each token's experts zeroed - the output stays fluent but can misread the prompt
-> (e.g. ignoring injected instructions or tool definitions), and raising `SYNC_BUDGET` does **not** help
-> because it never applies to prefill. Measured on Hunyuan-v3 IQ2 (192 experts, ~40 resident, 24 GB card):
-> prompt perplexity 6.66 with the default `-ub`/large batch vs 3.07 lossless - a 2.17x gap.
+> **`SYNC_BUDGET` governs decode only.** The top-N `SYNC_BUDGET`/`SYNC_COVER` selection engages only on
+> single-token steps (`n_tokens <= 1`). Prefill takes a different path, and since the expert-group sweep that
+> path is **lossless** (see below), so raising `SYNC_BUDGET` neither helps nor hurts prompt processing.
+
+> [!NOTE]
+> **Prefill is lossless by default (the expert-group sweep), and `-ub 1` is obsolete.**
+> Historically a multi-token prefill batch loaded each layer's working set bounded by `CACHE_CAP` and
+> **dropped the rest to a zeroed expert**. On a model far larger than VRAM that meant most of each token's
+> experts were zeroed: output stayed fluent but could misread the prompt (ignoring injected instructions or
+> tool definitions), and the only fix was `-ub 1`, which serialized prefill token by token.
 >
-> **Workaround: `-ub 1`.** With a micro-batch of one, every prefill token takes the same `n_tokens <= 1`
-> path as decode, so `SYNC_BUDGET`/`SYNC_COVER` apply to prefill too and misses reuse a real (stale)
-> expert instead of zero - prompt quality returns to the decode-path level (measured PPL back in the
-> lossless band). The cost is speed: `-ub 1` serializes prefill token-by-token (measured ~7 tok/s prompt
-> processing on the hy3-IQ2 case above, vs faster-but-lossy large batches), so it suits agent/tool use
-> where following the prompt matters more than prompt-eval latency. This gap is specific to models whose
-> per-batch expert working set exceeds the resident cache; a MoE that fits (or nearly fits) in VRAM does
-> not zero experts and large `-ub` stays correct and faster. The byte-identical `--moe-stream` (compaction)
-> mode is lossless at any `-ub`.
+> `LLAMA_MOE_PREFILL_SWEEP` (on by default) removes the loss instead of working around it: the expert index
+> space is split into `ceil(n_expert / capacity)` static groups, the MoE FFN is evaluated once per group with
+> out-of-group positions routed to a genuine zero, and the group outputs are summed - reproducing the full
+> layer exactly with nothing dropped. Expert *bytes read* are unchanged (each expert still reaches VRAM at
+> most once per step); the cost is `n_groups` FFN passes, which measurement shows is a small share of prefill
+> because prefill is bound by moving expert weights, not by arithmetic.
+>
+> Measured on DeepSeek-V4-Flash IQ2 (1195-token prompt, 320-token generation, 24 GB card + 64 GB RAM, N=3
+> medians):
+>
+> | Prefill path | Prompt eval | Decode | Routing positions correct |
+> |---|---|---|---|
+> | sweep (default, `-ub 2048`) | **75.9 tok/s** | 14.45 tok/s | **6 of 6** |
+> | `-ub 1` (`LLAMA_MOE_PREFILL_SWEEP=0`) | 13.4 tok/s | 14.39 tok/s | 4.18 of 6 |
+>
+> So the sweep is ~5.7x faster than the old lossless-ish workaround *and* strictly more correct, at the same
+> decode rate. It engages only when `capacity < n_expert` (a model that fits needs no grouping) and only on
+> multi-token batches. Note it raises the per-layer zero-sentinel count to `n_expert_used`, which costs a few
+> expert slabs of VRAM per layer and therefore a slightly smaller auto capacity; if you specifically want
+> `-ub 1`, set `LLAMA_MOE_PREFILL_SWEEP=0` so the sentinel count drops back to 1.
+>
+> The byte-identical `--moe-stream` (compaction) mode remains lossless at any `-ub`.
+
+> [!TIP]
+> **Long prompts are bound by expert bytes, not compute.** Every ubatch step must bring each expert it
+> selects into VRAM once, and on DeepSeek-V4-Flash a 2048-token step selects nearly all 256 experts in every
+> layer - about 59 GiB of expert weights per step, moved at PCIe and NVMe speed (measured: 77% of prompt-eval
+> wall time is inside the expert loader). That cost is **per step**, so a 15k-token prompt at `-ub 2048` pays
+> it 8 times. A larger `-ub` is therefore the main lever on long-prompt latency, and a warm RAM pool
+> (`LLAMA_MOE_RAM_CAP`, auto) is what keeps half of those reads off the disk.
 
 ### Tuning (environment variables)
 
@@ -181,6 +237,7 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 | `LLAMA_MOE_RAM_CAP=N` | auto | Experts-per-layer held in a locked host-RAM pool (three-tier: VRAM cache -> RAM pool -> disk). A VRAM miss reads from RAM (~25 GB/s) instead of faulting the model file from disk. **Unset = auto:** sized from available system RAM to fill the host, leaving headroom for the OS + mmap working set. Set `0` to disable the tier, or `N` to override. |
 | `LLAMA_MOE_NOMMAP` | on with `--moe-stream-async` | Read experts from the model file by offset (own file handles) instead of the mmap pointer, bypassing the OS page cache so host RAM stays under the locked pool's control rather than an unbounded page cache that thrashes when the model is larger than RAM. Set `LLAMA_MOE_NOMMAP=0` to use the mmap path. |
 | `LLAMA_MOE_FUSED=1` | off | Use the fused CUDA MoE-FFN op on the async decode path: one CUDA-native op does the expert sync-load + gate/up + SwiGLU + down + weighted sum, instead of a per-layer CPU remap op that forces a scheduler split (160 splits/token -> 4). Quality-identical, but measured decode is **~20% slower** on this disk/H2D-bound path (the fused op serializes the load with compute, losing the split's load//compute overlap), so it is **off by default**. Decode only; prefill, non-hy3 layers, and non-CUDA backends fall back automatically. |
+| `LLAMA_MOE_PREFILL_SWEEP` | on with `--moe-stream-async` | **Lossless prefill.** Partition the expert index space into `ceil(n_expert / capacity)` static groups and evaluate the MoE FFN once per group, so a prompt batch never has to drop experts it selected. Replaces the old `-ub 1` workaround (measured 5.7x faster *and* strictly more correct on DeepSeek-V4-Flash IQ2). Engages only when `capacity < n_expert` and only on multi-token batches, so decode is untouched. Costs `n_expert_used` sentinel slots per layer (see `LLAMA_MOE_SENTINELS`). Set `0` to restore capacity-rationed, lossy prefill. |
 | `LLAMA_MOE_PREFILL` | on with `--moe-stream-async` | Fill the host-RAM expert pool at full NVMe bandwidth once, during the prompt-eval window, instead of letting decode warm it token by token. The decode rate then reflects the warm steady state from the first token. Set `LLAMA_MOE_PREFILL=0` to disable. |
 | `LLAMA_MOE_PREFILL_VRAM` | on with `--moe-stream-async` | After the RAM pool is warm, also fill each layer's VRAM slot cache with its top-scoring experts from the RAM pool (~25 GB/s) before decode, instead of warming VRAM one miss at a time over the first tokens. Quality-safe (VRAM is a subset of the RAM set; a wrong pick is just LRU-evicted). Set `LLAMA_MOE_PREFILL_VRAM=0` to disable. |
 
@@ -188,8 +245,8 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `LLAMA_MOE_VRAM_FRAC=F` | `0.97` | Fraction of free VRAM (minus the reserve) the auto VRAM cache may use. Lower it if you see a system-memory spill. Ignored when `LLAMA_MOE_CACHE_CAP` is set. |
-| `LLAMA_MOE_VRAM_RESERVE_MB=N` | `512` | VRAM (MiB) the auto cache keeps free as a fragmentation margin. KV/compute are already excluded from the measured free, so this is small; raise only if a spill persists. |
+| `LLAMA_MOE_VRAM_FRAC=F` | `0.97` | Fraction of (free VRAM minus the reserve) the auto VRAM cache may use. Deliberately near 1.0: the real allowance is the absolute reserve below, because the amount of VRAM that must stay free does **not** scale with card size. Ignored when `LLAMA_MOE_CACHE_CAP` is set. |
+| `LLAMA_MOE_VRAM_RESERVE_MB=N` | `3072` | VRAM (MiB) the auto cache leaves free. This is the knob that decides capacity. It is not a fragmentation margin: past a total-committed-VRAM threshold the driver pages part of the working set, costing ~1.5x on **both** prefill and decode, and no VRAM counter reveals it (see the sizing note below). The default is the measured knee on DeepSeek-V4-Flash IQ2 / 24 GB; it is configuration-dependent, so re-measure on other cards, contexts or `-ub` values. |
 | `LLAMA_MOE_RAM_FRAC=F` | `0.97` | Hard ceiling on the auto RAM pool as a fraction of available RAM. Only binds when `LLAMA_MOE_RAM_RESERVE_MB` is set too low to be safe on its own. Ignored when `LLAMA_MOE_RAM_CAP` is set. |
 | `LLAMA_MOE_RAM_RESERVE_MB=N` | `5120` | System RAM (MiB) the auto pool leaves free, for the OS + the growing mmap working set. **Exact:** set `N` and that much available RAM stays free. Raise it if other software gets squeezed, or if you see paging / a runtime slowdown. |
 
@@ -201,28 +258,50 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 | `LLAMA_MOE_SYNC_THRESHOLD=F` | `0.5` | With `LLAMA_MOE_ASYNC=1`: on **prefill**, a step sync-loads its experts when the fraction of not-yet-resident routed experts exceeds `F` (else drops misses). Bounds the cold first step's disk reads to `CACHE_CAP` experts/layer. |
 | `LLAMA_MOE_RAM_FILL=N` | `1024` | Experts the background loader promotes into the RAM pool per tick (across all layers). Its disk reads run off the lock, so this is fill speed, not stall - keep it high so a large pool fills before the sync path misses to disk. |
 | `LLAMA_MOE_WEIGHTED_EVICT=0` | on | Loader protects recurring high-weight (top-1/top-2) experts from eviction so the stable core stays resident. Set `0` for plain age-LRU. |
-| `LLAMA_MOE_SENTINELS=N` | `1` | With `LLAMA_MOE_ASYNC=1`: zero "sentinel" slots per layer for dropped experts (each costs one expert slab of VRAM/layer). `1` suffices in practice. |
+| `LLAMA_MOE_SENTINELS=N` | `n_expert_used` with the sweep, else `1` | With `LLAMA_MOE_ASYNC=1`: zero "sentinel" slots per layer that dropped or out-of-group experts route to (each costs one expert slab of VRAM/layer, so it reduces the auto capacity). The prefill sweep needs one per routing position, since a token can have all of them outside the current group; without the sweep, `1` suffices. |
+| `LLAMA_MOE_SENTINEL_SKIP=0` | on (CUDA) | Skip the GEMM tiles of the zero sentinel slots instead of multiplying against zeroed weights. Bit-identical (the slabs are zeroed once at cache creation and no code path can ever write a slot above the capacity), and worth more the more groups the sweep uses: measured +0.6% at capacity 36 (8 groups) and +9.3% at capacity 8 (32 groups) on DeepSeek-V4-Flash IQ2. Implemented via `op_params` on `ggml_mul_mat_id`; other backends ignore it and compute the same zeros. |
+| `LLAMA_MOE_PREFILL_DRAIN=1` | off | Block the first decode token until the background loader has worked off its backlog. Measured **negative on both axes** (decode slower *and* seconds of added wall clock) because its "loader went idle" condition is never reached while the RAM pool is still chasing a target it cannot hold, so it always runs to its internal deadline. Off by default; kept only for A/B. |
 | `LLAMA_MOE_PINNED_STAGE=0` | on | Stage no-mmap expert reads through a single shared page-locked host buffer so the H2D runs at full PCIe rate. On by default; `0` uses a plain pageable buffer. Byte-identical either way. |
 
 **Diagnostics:**
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `LLAMA_MOE_DIAG=1` | off | Print decode miss-rate, per-token load/lock-wait timing, and top-2 residency. |
+| `LLAMA_MOE_DIAG=1` | off | Print decode miss-rate, per-token load/lock-wait timing and top-2 residency, plus the per-ubatch-step prefill breakdown (loader wall time, disk vs H2D, experts loaded, RAM-pool hit rate) - the numbers that show whether prefill is bound by bytes or by compute. |
+| `LLAMA_MOE_LAYERDBG=1` | off | Per-layer decode residency profile (hit / stale-substitution percentage per MoE layer). Reveals layers that are structurally harder than the aggregate suggests - on DeepSeek-V4-Flash the statically token-id-routed first layers run far colder than the rest, because their locality follows the output token distribution rather than the hidden state. |
+| `LLAMA_MOE_SWEEPDBG=1` | off | Verify the prefill sweep's invariant: over the `n_groups` passes of a step every routing position must resolve to its real expert exactly once, so the reported HIT rate must equal `1/n_groups`. |
 | `GGML_MOE_SPLIT_DIAG=1` | off | Per-token breakdown of scheduler split time (CPU-split vs GPU-split copy/sync and compute). |
 
 > [!IMPORTANT]
 > **`LLAMA_MOE_CACHE_CAP` and `LLAMA_MOE_RAM_CAP` are auto-sized by default** - you normally set neither.
-> The VRAM cache uses about `(CACHE_CAP + LLAMA_MOE_SENTINELS) x n_moe_layers x per_expert_slab_bytes`; if
-> it overflows the device the driver does **not** error - it silently spills to system RAM (CUDA "system
-> memory fallback"), and decode becomes PCIe-bound and can be ~10x slower. The auto sizing measures free
-> VRAM / available RAM once at the first MoE layer (before any cache allocates, so the reading is the true
-> ceiling) and applies the **same** cap to every layer, filling the device and host uniformly - it adapts
-> to `-c` context size, card, and quantization (a bigger per-expert slab yields a smaller cap). The chosen
-> values print at startup (`auto CACHE_CAP=N -> ~X GiB`, `auto RAM_CAP=N -> ~Y GiB`). If you see a VRAM
-> spill, lower `LLAMA_MOE_VRAM_FRAC`; if the RAM pool starves the OS, raise `LLAMA_MOE_RAM_RESERVE_MB`. For
-> reference, Hunyuan-v3 Q4 has an ~11.7 MiB per-expert slab (~0.9 GiB per cap unit across its 80 MoE
-> layers), so `CACHE_CAP=16` (~21.5 GB) fills a 24 GB card; IQ2's ~6.4 MiB slab lets ~36 experts/layer fit.
+> The VRAM cache uses about `(CACHE_CAP + LLAMA_MOE_SENTINELS) x n_moe_layers x per_expert_slab_bytes`. The
+> auto sizer measures free VRAM once at the first MoE layer and applies the **same** cap to every layer,
+> filling the device uniformly; it adapts to `-c`, card and quantization (a bigger per-expert slab yields a
+> smaller cap). The chosen values print at startup (`auto CACHE_CAP=N -> ~X GiB`, `auto RAM_CAP=N -> ~Y GiB`).
+>
+> **Bigger is not better, and you cannot see the limit in any VRAM counter.** Once total committed VRAM
+> crosses a threshold the driver keeps part of the working set out of dedicated VRAM and pages it over PCIe.
+> Measured on DeepSeek-V4-Flash IQ2 (24 GB card, 43 MoE layers, 7.19 MiB per expert, sweep on so each layer
+> holds `cap + 6` slabs), prefill / decode tok/s against total slots per layer:
+>
+> | slots/layer | 38 | **42** | 44 | 46 | 47 | 50 |
+> |---|---|---|---|---|---|---|
+> | prefill | 63.8 | **76.1** | 75.9 | 47.3 | 47.6 | 50.3 |
+> | decode | 14.44 | **14.61** | 12.21 | 10.86 | 9.35 | 10.41 |
+>
+> The knee is sharp between 44 and 46 slots and costs roughly 1.5x on **both** axes past it, while extra
+> cache below the knee buys nothing. `LLAMA_MOE_VRAM_RESERVE_MB=3072` puts the default just under it here.
+>
+> Do **not** try to find that knee with a free-VRAM reading: the figure reported after allocation sits near
+> 0.00 GiB at *any* cache size, because whatever headroom the sizer leaves is absorbed afterwards (raising the
+> reserve by ~1 GiB left the reported free VRAM unchanged and simply grew the unaccounted portion). Sweep
+> `LLAMA_MOE_CACHE_CAP` against measured tok/s instead - the knee is sharp and shows on prefill as well as
+> decode, so a couple of runs per value is enough. `tools/dev/bench_moe.sh` does the repetition, standby-list
+> purge and median reporting.
+>
+> For reference: DeepSeek-V4-Flash IQ2 has a ~7.19 MiB per-expert slab (~309 MiB per cap unit across its 43
+> MoE layers); Hunyuan-v3 Q4 has ~11.7 MiB (~0.9 GiB per cap unit across 80 layers) and IQ2 ~6.4 MiB. If the
+> RAM pool starves the OS, raise `LLAMA_MOE_RAM_RESERVE_MB`.
 
 > [!NOTE]
 > The RAM reserve is sampled **once**, before the context, the KV cache and `llama-server`'s context
