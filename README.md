@@ -62,6 +62,24 @@ should not run together. Use `-fit off` with streaming (see the note under Usage
   hyper-connections, a lightning indexer, and static token-id expert routing on the first layers. Ported
   from [ggml-org/llama.cpp#24162](https://github.com/ggml-org/llama.cpp/pull/24162). This is the fork's
   main test target; the streaming defaults below are tuned on it.
+- **Chunked lightning-indexer scoring** (`deepseek4`, on by default): the indexer scores every cached key
+  against every query head, so its intermediate is `[n_lid, n_tokens, indexer_n_head]` - and it is
+  materialized **twice**, as the `mul_mat` result and as its transposed copy, because the per-head weighting
+  has to reduce over the head axis. That is `2 * n_lid * indexer_n_head * 4` bytes **per token** (2 MiB/token
+  at `n_lid` 4096 and 64 heads), and `n_lid` is the indexer's own KV size, i.e. `n_ctx/4`. The term therefore
+  grows as `n_ubatch * n_ctx` and dominated the reserved compute buffer: **34 GiB** measured at
+  `-c 131072 -ub 2048`. That is the real reason long-context runs needed a hand-tuned VRAM reserve or simply
+  ran out of memory - it was never the expert cache.
+  The fix needs no new kernel. Each token's indexer scores depend only on its own query row and on all
+  `n_lid` key rows, so the token axis is scored in passes and the per-pass masked scores are concatenated
+  along the token axis, with a single `ggml_top_k` at the end. The result is still a set of **global** row
+  indices, so nothing has to be remapped and every downstream mask keeps its shape. Peak becomes
+  `pass_size * n_lid * indexer_n_head * 8` bytes instead of the whole ubatch. Measured compute buffer at
+  `-ub 2048`: **34013 -> 2885 MiB** at `-c 131072`, **5149 -> 1170 MiB** at `-c 16384`. Byte-identical
+  (greedy MD5 over a 411-token prompt spanning 4 passes, 4 runs, loader frozen), and decode is untouched -
+  a single-token step is a single pass, and the `bs=1` graph stays node-for-node identical. Tune with
+  `LLAMA_DSV4_LID_CHUNK_MB` / `LLAMA_DSV4_LID_MIN_CHUNK`; `LLAMA_DSV4_LID_CHUNK_MB=0` restores the old
+  single-pass graph.
 - **Lossless prefill via the expert-group sweep** (`LLAMA_MOE_PREFILL_SWEEP`, **on by default** with
   `--moe-stream-async`): prompt processing no longer rations a batch against the VRAM cache and drop the
   rest. The expert *index* space is partitioned into `ceil(n_expert / capacity)` static groups and the MoE
@@ -74,9 +92,24 @@ should not run together. Use `-fit off` with streaming (see the note under Usage
   *slower*, not faster. The driver pages part of the working set once total committed VRAM crosses a
   threshold, and this is invisible in every VRAM counter - it shows up only as throughput, on **both**
   prefill and decode (~1.5x on DeepSeek-V4-Flash IQ2 past the knee), while extra cache below the knee buys
-  nothing. The auto sizer now leaves an absolute reserve (`LLAMA_MOE_VRAM_RESERVE_MB`, default 3072) instead
-  of a thin fragmentation margin. See the sizing note under [Tuning](#tuning-environment-variables) for how
-  to re-measure it on your own card - the number is hardware- and configuration-dependent.
+  nothing. The auto sizer therefore holds back an absolute amount rather than a thin fragmentation margin.
+- **Capacity sized against the *measured* compute buffer** (on by default): the capacity has to be chosen
+  during graph build, before any compute buffer exists, so on its own it can only hold back a flat guess
+  (`LLAMA_MOE_VRAM_RESERVE_MB`, 3072). No flat value can be right for a buffer that scales with
+  `n_ubatch * n_ctx`: at `-c 131072` the buffer measured 4.3 GiB at `-ub 256` and 34 GiB at `-ub 2048`, so
+  lowering `-ub` only shrank the overshoot linearly and a hand-tuned reserve was unavoidable.
+  Instead, the first reserve pass now runs with the flat guess purely to *build* the graph - the buffer size
+  does not depend on the capacity, since the slot pools live in their own allocation - then the real
+  device-side size is read back, the caches are dropped, and the capacity is recomputed against it. No
+  estimation coefficients are involved; the only remaining constant is what free VRAM still does not
+  account for (`LLAMA_MOE_VRAM_MARGIN_MB`). This splits the old unportable 3072 into a part that varies with
+  the configuration (now measured) and a part that does not (now the only knob). Measured on
+  DeepSeek-V4-Flash IQ2 / 24 GB: capacity is left **unchanged** wherever the flat guess was already right
+  (`-c 16384 -ub 2048` -> 36; `-c 131072 -ub 512/256` -> 33) and tightened only where it was not
+  (`-c 131072 -ub 2048`: the 2885 MiB buffer left the flat 3072 with a 187 MiB margin, so 33 was
+  overcommitted -> 28). Throughput is unchanged there (both sit below the knee, as the sizing note predicts);
+  what it buys is 1.6 GiB less committed VRAM, which is the difference between running and not running on a
+  card that was previously OOMing. Set `LLAMA_MOE_AUTOCAP_RECAP=0` for the flat-guess behaviour.
 - **Sentinel GEMM skip** (`LLAMA_MOE_SENTINEL_SKIP`, on by default, CUDA): during the sweep most routing
   positions point at permanently-zero "sentinel" expert slots, and their GEMM tiles are now skipped rather
   than multiplied against zeros. Provably bit-identical (verified byte-for-byte on a greedy run), and it
@@ -246,7 +279,9 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `LLAMA_MOE_VRAM_FRAC=F` | `0.97` | Fraction of (free VRAM minus the reserve) the auto VRAM cache may use. Deliberately near 1.0: the real allowance is the absolute reserve below, because the amount of VRAM that must stay free does **not** scale with card size. Ignored when `LLAMA_MOE_CACHE_CAP` is set. |
-| `LLAMA_MOE_VRAM_RESERVE_MB=N` | `3072` | VRAM (MiB) the auto cache leaves free. This is the knob that decides capacity. It is not a fragmentation margin: past a total-committed-VRAM threshold the driver pages part of the working set, costing ~1.5x on **both** prefill and decode, and no VRAM counter reveals it (see the sizing note below). The default is the measured knee on DeepSeek-V4-Flash IQ2 / 24 GB; it is configuration-dependent, so re-measure on other cards, contexts or `-ub` values. |
+| `LLAMA_MOE_VRAM_RESERVE_MB=N` | `3072` | VRAM (MiB) the auto cache leaves free **before the compute buffer has been measured**, i.e. the first reserve pass only. It is not a fragmentation margin: past a total-committed-VRAM threshold the driver pages part of the working set, costing ~1.5x on **both** prefill and decode, and no VRAM counter reveals it (see the sizing note below). Setting it explicitly pins the reserve for *both* passes, disabling the measured path below. |
+| `LLAMA_MOE_AUTOCAP_RECAP=0` | on | After the first reserve pass, read the real device-side compute-buffer size, drop the expert caches, and recompute the capacity against it (see [What's new](#whats-new)). Zero estimation coefficients - the capacity follows a measured number, so it adapts to `-c`, `-ub`, KV quantisation and architecture on its own. Costs one extra reserve pass plus one extra VRAM prewarm at startup. Set `0` to keep the flat-guess capacity. |
+| `LLAMA_MOE_VRAM_MARGIN_MB=N` | `1856` | With the measured path above: VRAM (MiB) held back **in addition to** the compute buffer, which by then is already excluded from the free figure. This is the portable half of the old flat 3072 - the part that does not vary with `-c` / `-ub`. It is not just fragmentation: the driver starts paging before free VRAM reaches zero. The default is reverse-engineered to leave the capacity unchanged wherever the flat guess was already right, so it is a **no-regression value, not a swept optimum** - `1536` measured one capacity step past the knee (decode 7.69/7.67/7.15 vs 10.01/8.28/8.17 tok/s, non-overlapping). Re-sweep it per card against tok/s; the VRAM audit cannot find the knee for you. |
 | `LLAMA_MOE_RAM_FRAC=F` | `0.97` | Hard ceiling on the auto RAM pool as a fraction of available RAM. Only binds when `LLAMA_MOE_RAM_RESERVE_MB` is set too low to be safe on its own. Ignored when `LLAMA_MOE_RAM_CAP` is set. |
 | `LLAMA_MOE_RAM_RESERVE_MB=N` | `5120` | System RAM (MiB) the auto pool leaves free, for the OS + the growing mmap working set. **Exact:** set `N` and that much available RAM stays free. Raise it if other software gets squeezed, or if you see paging / a runtime slowdown. |
 
@@ -272,6 +307,20 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 | `LLAMA_MOE_SWEEPDBG=1` | off | Verify the prefill sweep's invariant: over the `n_groups` passes of a step every routing position must resolve to its real expert exactly once, so the reported HIT rate must equal `1/n_groups`. |
 | `GGML_MOE_SPLIT_DIAG=1` | off | Per-token breakdown of scheduler split time (CPU-split vs GPU-split copy/sync and compute). |
 
+**Compute buffer** (`deepseek4`; these size the reserved graph buffer, not the expert cache):
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `LLAMA_DSV4_LID_CHUNK_MB=N` | `256` | Byte budget for one pass of the chunked lightning-indexer scoring (see [What's new](#whats-new)). The pass size is derived as `N MiB / (2 * n_lid * indexer_n_head * 4)`, i.e. a **budget rather than a token count**, because `n_lid` is `n_ctx/4` - a fixed token count would let the peak grow with the context instead of holding it constant. Set `0` to score the whole ubatch in one pass (the pre-chunking graph). Lowering it below the default buys almost nothing: at `-c 16384 -ub 2048`, 64 MiB saved a further 8 MiB of compute buffer over 256 MiB while adding ~14000 graph nodes, because by then the indexer is no longer the peak. |
+| `LLAMA_DSV4_LID_MIN_CHUNK=N` | `64` | Floor on the pass size in tokens, which wins over the budget above. Needed because the budget alone makes the pass **count** grow with `n_lid`, and each pass costs ~7 graph nodes per MoE layer, while `graph_max_nodes` falls back to `32 * n_tensors` below roughly 1000 tokens - so a small ubatch has the *least* node headroom exactly where the budget wants the *most* passes. Without this floor, `-c 131072 -ub 2048` asked for 128 passes and exhausted the graph context's object pool. With it, a very long context raises the peak instead of failing to build. |
+
+One CLI flag belongs to the same accounting: **`--n-outputs-max N`** (`llama-cli` / `llama-completion`,
+default `0` = `-b`). The reserved graph holds an `[n_vocab, N]` logits tensor, so `1` shrinks it to a single
+row when only the last token is ever sampled - 1009 MiB to 0.5 MiB on DeepSeek-V4-Flash at `-ub 2048`. The
+*net* compute-buffer saving is far smaller than the tensor (109 MiB measured) because the buffer is a
+**peak**, not a sum, and the logits do not overlap whatever else is peaking. The library raises the value to
+`--parallel` if set lower, since `output_reserve` floors its request at `n_seq_max`.
+
 > [!IMPORTANT]
 > **`LLAMA_MOE_CACHE_CAP` and `LLAMA_MOE_RAM_CAP` are auto-sized by default** - you normally set neither.
 > The VRAM cache uses about `(CACHE_CAP + LLAMA_MOE_SENTINELS) x n_moe_layers x per_expert_slab_bytes`. The
@@ -290,14 +339,24 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 > | decode | 14.44 | **14.61** | 12.21 | 10.86 | 9.35 | 10.41 |
 >
 > The knee is sharp between 44 and 46 slots and costs roughly 1.5x on **both** axes past it, while extra
-> cache below the knee buys nothing. `LLAMA_MOE_VRAM_RESERVE_MB=3072` puts the default just under it here.
+> cache below the knee buys nothing. With the measured path on (the default), what puts the capacity under
+> the knee is `LLAMA_MOE_VRAM_MARGIN_MB` on top of the measured compute buffer, not the flat
+> `LLAMA_MOE_VRAM_RESERVE_MB=3072` that produced this table - the margin default was reverse-engineered to
+> land on the same capacity here, and one step past it (margin 1536) was measurably slower on decode.
 >
 > Do **not** try to find that knee with a free-VRAM reading: the figure reported after allocation sits near
 > 0.00 GiB at *any* cache size, because whatever headroom the sizer leaves is absorbed afterwards (raising the
-> reserve by ~1 GiB left the reported free VRAM unchanged and simply grew the unaccounted portion). Sweep
+> reserve by ~1 GiB left the reported free VRAM unchanged and simply grew the unaccounted portion). It is
+> insensitive at the ~1 GiB scale, not useless: freeing the ~4 GiB the indexer chunking recovered did move it
+> (0.00 -> 2.04 GiB at the same settings). Sweep
 > `LLAMA_MOE_CACHE_CAP` against measured tok/s instead - the knee is sharp and shows on prefill as well as
 > decode, so a couple of runs per value is enough. `tools/dev/bench_moe.sh` does the repetition, standby-list
 > purge and median reporting.
+>
+> When you sweep, make sure the prompt spans **several** `-ub`-sized steps. A prompt short enough to fit one
+> step measures startup and RAM-pool prefill, not prefill throughput: on a 411-token prompt at `-ub 2048` the
+> *same* configuration returned 13.4 to 20.4 tok/s across runs, a 52% spread that swamps any real effect,
+> while a 6894-token prompt put the same runs at 70-92 tok/s - the range this table was measured in.
 >
 > For reference: DeepSeek-V4-Flash IQ2 has a ~7.19 MiB per-expert slab (~309 MiB per cap unit across its 43
 > MoE layers); Hunyuan-v3 Q4 has ~11.7 MiB (~0.9 GiB per cap unit across 80 layers) and IQ2 ~6.4 MiB. If the

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -212,6 +213,40 @@ static ggml_tensor * dsv4_build_kq_zero_bias(
 
 static constexpr int64_t DSV4_CSA_RATIO  = 4;
 static constexpr int64_t DSV4_HCA_RATIO  = 128;
+
+// Tokens per pass of the lightning-indexer scoring loop (see build_lid_top_k). Scoring materialises
+// [n_lid, n_tokens, indexer_n_head] twice - the mul_mat result and its transposed copy - so the cost
+// is 2*n_lid*indexer_n_head*4 bytes per token and at a large ubatch it dominates the reserved compute
+// buffer. Chunking bounds that peak. The knob is a byte budget rather than a token count because n_lid
+// scales with the context, so a fixed token count would not hold the peak constant across contexts.
+// 0 scores every token in one pass, i.e. the unchunked graph.
+//
+// The pass count needs its own floor on the chunk size: the budget alone makes the pass count grow
+// linearly with n_lid, and each pass costs ~7 nodes per MoE layer. graph_max_nodes falls back to
+// 32*n_tensors below ~1000 tokens, so a small ubatch has the LEAST node headroom while the budget
+// wants the MOST passes there - at n_ctx 131072 that overruns the graph object pool (ggml.c:1786).
+// The floor wins over the budget, so a very long context raises the peak instead of failing to build.
+static int64_t dsv4_lid_chunk_tokens(int64_t nts, int64_t n_lid, int64_t n_head) {
+    static const int64_t budget = []() {
+        const char * env = getenv("LLAMA_DSV4_LID_CHUNK_MB");
+        return env ? atoll(env) : 256;
+    }();
+    static const int64_t min_chunk = []() {
+        const char * env = getenv("LLAMA_DSV4_LID_MIN_CHUNK");
+        return env ? atoll(env) : 64;
+    }();
+
+    if (budget <= 0) {
+        return nts;
+    }
+
+    const int64_t per_token = 2*n_lid*n_head*(int64_t) sizeof(float);
+    int64_t n_chunk = budget*1024*1024/std::max<int64_t>(per_token, 1);
+
+    n_chunk = std::max(n_chunk, min_chunk);
+
+    return std::min(std::max<int64_t>(n_chunk, 1), nts);
+}
 
 static ggml_tensor * dsv4_hc_affine(
         ggml_context * ctx,
@@ -575,31 +610,59 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     cb(indexer_k, "lid_k", il);
 
     const int64_t n_stream = indexer_k->ne[3];
-    indexer_q = ggml_view_4d(ctx0, indexer_q,
-            indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream,
-            indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
-    indexer_weights = ggml_view_4d(ctx0, indexer_weights,
-            indexer_weights->ne[0], indexer_weights->ne[1]/n_stream, indexer_weights->ne[2], n_stream,
-            indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
 
-    indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);
-    cb(indexer_q, "lid_q", il);
+    GGML_ASSERT(nt%n_stream == 0);
+    GGML_ASSERT(inp_lid.kq_mask->ne[3] == n_stream);
+
+    const int64_t nts = nt/n_stream;
+
     indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
     cb(indexer_k, "lid_k", il);
 
-    ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q);
-    cb(indexer_kq, "lid_kq", il);
+    const int64_t n_chunk = dsv4_lid_chunk_tokens(nts, n_lid, n_indexer_head);
 
-    indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
-    cb(indexer_kq, "lid_kq", il);
+    ggml_tensor * indexer_score = nullptr;
 
-    ggml_tensor * indexer_score = ggml_relu(ctx0, indexer_kq);
-    indexer_score = ggml_mul(ctx0, indexer_score, indexer_weights);
-    indexer_score = ggml_sum_rows(ctx0, indexer_score);
-    indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
-    cb(indexer_score, "lid_score", il);
+    // Streams own contiguous token blocks (stream s holds tokens [s*nts, (s+1)*nts)), so a chunk is a
+    // strided 4-D view: the byte offset walks the token axis, nb[3] steps between streams.
+    for (int64_t i0 = 0; i0 < nts; i0 += n_chunk) {
+        const int64_t nc = std::min(n_chunk, nts - i0);
 
-    indexer_score = ggml_add(ctx0, indexer_score, inp_lid.kq_mask);
+        ggml_tensor * q_cur = ggml_view_4d(ctx0, indexer_q,
+                indexer_q->ne[0], indexer_q->ne[1], nc, n_stream,
+                indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[2]*nts,
+                indexer_q->nb[2]*i0);
+        q_cur = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
+        cb(q_cur, "lid_q", il);
+
+        ggml_tensor * w_cur = ggml_view_4d(ctx0, indexer_weights,
+                indexer_weights->ne[0], nc, 1, n_stream,
+                indexer_weights->nb[1], indexer_weights->nb[1]*nc, indexer_weights->nb[1]*nts,
+                indexer_weights->nb[1]*i0);
+
+        ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, q_cur);
+        indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
+        cb(indexer_kq, "lid_kq", il);
+
+        ggml_tensor * score = ggml_relu(ctx0, indexer_kq);
+        score = ggml_mul(ctx0, score, w_cur);
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+        cb(score, "lid_score", il);
+
+        // a single pass covers the whole mask, so alias it rather than spending a view on it: at
+        // n_ctx 131072 the graph context pool has only a few hundred spare bytes (ggml.c:1786)
+        ggml_tensor * mask_cur = inp_lid.kq_mask;
+        if (nc != nts) {
+            mask_cur = ggml_view_4d(ctx0, inp_lid.kq_mask,
+                    n_lid, nc, 1, n_stream,
+                    inp_lid.kq_mask->nb[1], inp_lid.kq_mask->nb[2], inp_lid.kq_mask->nb[3],
+                    inp_lid.kq_mask->nb[1]*i0);
+        }
+        score = ggml_add(ctx0, score, mask_cur);
+
+        indexer_score = indexer_score ? ggml_concat(ctx0, indexer_score, score, 1) : score;
+    }
     cb(indexer_score, "lid_score_masked", il);
 
     const uint32_t n_top_k = indexer_score->ne[0] < hparams.indexer_top_k ? indexer_score->ne[0] : hparams.indexer_top_k;

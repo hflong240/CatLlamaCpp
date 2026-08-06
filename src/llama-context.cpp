@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-stream.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -195,6 +196,8 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.n_outputs_max = params.n_outputs_max == 0 ? cparams.n_batch : params.n_outputs_max;
+    // output_reserve() floors its request at n_seq_max, so a smaller cap would abort there
+    cparams.n_outputs_max = std::max(cparams.n_outputs_max, cparams.n_seq_max);
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
@@ -621,6 +624,29 @@ void llama_context::sched_reserve() {
 
         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_pp  = ggml_graph_n_nodes(gf);
+    }
+
+    // fork: the MoE expert-cache capacity was picked during the graph build above, before any compute
+    // buffer existed, so it could only hold back a flat guess. Publish the real device-side size and
+    // re-reserve once so the caches are rebuilt against it (see llama_moe_recap_from_compute_reserve).
+    if (!model.hparams.no_alloc) {
+        size_t compute_dev = 0;
+        for (auto * backend : backend_ptrs) {
+            auto * dev = ggml_backend_get_device(backend);
+            if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                compute_dev += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            }
+        }
+
+        if (llama_moe_recap_from_compute_reserve(compute_dev)) {
+            auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+            if (!gf) {
+                throw std::runtime_error("failed to allocate compute pp buffers after MoE capacity recap");
+            }
+
+            n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
+            n_nodes_pp  = ggml_graph_n_nodes(gf);
+        }
     }
 
 

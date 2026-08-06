@@ -437,5 +437,16 @@ void llama_moe_vram_audit(void);
 // Two-phase auto capacity: llama_context sets defer=true for its first pp graph reserve so the compute
 // buffer can be measured with no expert caches allocated, publishes that size, then clears defer so the
 // later reserve passes create the caches sized against the real number instead of a flat guess.
+// NOTE: the defer=true variant is a dead end (no cache => build_moe_ffn takes the compaction path, whose
+// transient is the full n_expert-wide expert tensor, so the measured buffer is larger than the real one).
+// llama_moe_recap_from_compute_reserve below is the working form: measure with a flat-guess cache in
+// place (same graph shape, and the buffer does not depend on the capacity), then rebuild against it.
 void llama_moe_set_defer_caches(bool v);
 void llama_moe_set_compute_reserve(size_t bytes);
+
+// Publish the MEASURED device-side compute-buffer size and invalidate the expert caches so the next
+// graph build re-sizes them against it instead of LLAMA_MOE_VRAM_RESERVE_MB's flat guess. Returns true
+// if anything was invalidated, i.e. the caller must re-run its graph reserve. No-op when the capacity is
+// pinned by hand (LLAMA_MOE_CACHE_CAP), when the per-tensor compaction pools are in use, or when
+// LLAMA_MOE_AUTOCAP_RECAP=0. Call during startup only, before llama_moe_prefill_once.
+bool llama_moe_recap_from_compute_reserve(size_t compute_bytes);

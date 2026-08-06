@@ -527,6 +527,11 @@ static std::atomic<int> g_moe_pf_pending{0};
 static std::atomic<uint64_t> g_moe_pf_resident{0};
 static std::atomic<bool>   g_moe_defer_caches{false};
 static std::atomic<size_t> g_moe_compute_reserve{0};
+// Cap chosen by llama_moe_auto_capacity, cached across layers. File-scope rather than a function-local
+// static so llama_moe_recap_from_compute_reserve can invalidate it after the real compute-buffer size
+// is measured; the first (max dev_free) result is the one every layer must share, see the note there.
+static int g_moe_cached_cap = 0;
+static bool g_moe_autocap_logged = false;
 // dev_free as llama_moe_auto_capacity saw it, plus the cache size it then budgeted. The audit subtracts both
 // from the free VRAM measured after everything is allocated: whatever is left is VRAM that got consumed AFTER
 // the capacity decision was made, which is precisely what auto capacity cannot see and must reserve for.
@@ -554,8 +559,8 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
     // layers a smaller cap, leaving VRAM unused (measured: per-layer recompute filled only ~17 GB where
     // a uniform cap fills ~21.5 GB on a 24 GB card). A single model runs one geometry, so caching the
     // first (max-free) result is correct and reproduces the hand-tuned uniform-cap behaviour.
-    static int cached_cap = 0;
-    if (cached_cap > 0) { return cached_cap; }
+    // Reset by llama_moe_recap_from_compute_reserve once the real compute-buffer size is known.
+    if (g_moe_cached_cap > 0) { return g_moe_cached_cap; }
 
     ggml_backend_t backend = llama_moe_pick_device_backend(sched);
     if (!backend) { return 0; }
@@ -610,11 +615,31 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
     // host RAM, NOT a dedicated-VRAM spill, so it is excluded here. A plain mmap'd file's page-cache working
     // set is not cudaHostRegister'd and does not count.)
     uint64_t reserve = (uint64_t) 3072 * 1024 * 1024;
-    // Prefer the MEASURED compute-buffer size over the flat guess (see g_moe_compute_reserve). Add a
-    // fragmentation margin on top: the measurement is the graph's steady-state buffer, not the peak of
-    // every pool allocation the backend makes around it (CUDA's own workspace, top-k sort scratch, etc).
-    if (const size_t measured = g_moe_compute_reserve.load(std::memory_order_acquire)) {
-        reserve = (uint64_t) measured + (uint64_t) 512 * 1024 * 1024;
+    // Second pass, after llama_moe_recap_from_compute_reserve published a measured size: the compute
+    // buffer is ALREADY allocated by then, so the dev_free read above has it subtracted. Subtracting the
+    // measured size again double-counts it - measured on dsv4/24GiB, ctx 131072/ub 2048: cap 33 -> 23,
+    // i.e. WORSE than the flat guess it was meant to replace. What is left to hold back here is only what
+    // dev_free still does NOT account for, which is the whole point of splitting the old flat reserve:
+    //   flat 3072 MiB = compute buffer (varies with ctx x ubatch) + everything else (does not)
+    // and only the second part is a portable constant. "Everything else" is not just fragmentation: the
+    // driver starts paging part of the working set over PCIe before dev_free reaches zero, and that is
+    // invisible in every VRAM counter (llama_moe_vram_audit reads ~0 free at any cache size) - it shows
+    // up only as throughput. Measured on dsv4 IQ2 / 24 GiB / ctx 16384 / ub 2048, N=3 alternating runs
+    // with a 6894-token prompt and a standby purge before each: margin 1536 -> cap 37 (43 slots) decoded
+    // 7.69 / 7.67 / 7.15 tok/s against the flat-guess cap 36 (42 slots) at 10.01 / 8.28 / 8.17 -
+    // non-overlapping, i.e. ONE capacity step past the knee, matching the older 42-vs-44-slot sweep.
+    // 1856 is the margin that leaves cap unchanged wherever the flat guess was already right (ctx 16384
+    // ub 2048 -> 36, ctx 131072 ub 512/256 -> 33) and only tightens where it was not (ctx 131072 ub 2048:
+    // compute buffer 2885 MiB left the flat 3072 with a 187 MiB margin, so cap 33 was overcommitted ->
+    // 28). It is therefore a no-regression default reverse-engineered from known-good configurations,
+    // NOT a swept optimum - re-sweep LLAMA_MOE_VRAM_MARGIN_MB per card against tok/s, the audit cannot
+    // find the knee for you.
+    if (g_moe_compute_reserve.load(std::memory_order_acquire) != 0) {
+        reserve = (uint64_t) 1856 * 1024 * 1024;
+        if (const char * me = getenv("LLAMA_MOE_VRAM_MARGIN_MB")) {
+            const long long m = atoll(me);
+            if (m >= 0) { reserve = (uint64_t) m * 1024 * 1024; }
+        }
     }
     if (const char * re = getenv("LLAMA_MOE_VRAM_RESERVE_MB")) {
         const long long r = atoll(re);
@@ -637,20 +662,22 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
 
     if (cap < n_used)   { cap = n_used; }     // below the per-token activation is unusable; clamp up
     if (cap > n_expert) { cap = n_expert; }   // no point exceeding the whole layer
-    static bool logged = false;
-    if (!logged) {
-        logged = true;
+    if (!g_moe_autocap_logged) {
+        g_moe_autocap_logged = true;
         const double gib = 1024.0*1024.0*1024.0;
         const double cache_gib = (double) ((uint64_t)(cap + n_sen) * denom) / gib;
+        const bool   measured  = g_moe_compute_reserve.load(std::memory_order_acquire) != 0;
         // WARN level so it is visible before llama-completion pauses the log for generation.
         LLAMA_LOG_WARN("MoE stream: auto CACHE_CAP=%lld -> ~%.1f GiB expert cache across %d MoE layers "
-                       "(free %.1f GiB, reserve %.1f GiB for KV/compute, frac %.2f, %.1f MiB/expert). "
+                       "(free %.1f GiB, reserve %.1f GiB for KV/compute [%s], frac %.2f, %.1f MiB/expert). "
                        "Override with LLAMA_MOE_CACHE_CAP; tune LLAMA_MOE_VRAM_FRAC / LLAMA_MOE_VRAM_RESERVE_MB.\n",
-                       cap, cache_gib, n_moe_layers, dev_free/gib, reserve/gib, frac, per_expert/(1024.0*1024.0));
+                       cap, cache_gib, n_moe_layers, dev_free/gib, reserve/gib,
+                       measured ? "margin only; compute buffer already in free" : "flat guess, pre-measurement",
+                       frac, per_expert/(1024.0*1024.0));
     }
     g_moe_autocap_free.store(dev_free, std::memory_order_release);
     g_moe_autocap_planned.store((size_t) ((uint64_t) (cap + n_sen) * denom), std::memory_order_release);
-    cached_cap = (int) cap; // reuse for all remaining layers (see note at function top)
+    g_moe_cached_cap = (int) cap; // reuse for all remaining layers (see note at function top)
     return (int) cap;
 }
 
@@ -4319,6 +4346,70 @@ int llama_moe_boundary_sync(int budget) {
         }
     }
     return n_loaded;
+}
+
+// fork: re-decide the expert-cache capacity once the REAL compute-buffer size is known.
+//
+// llama_moe_auto_capacity has to run at the first MoE layer's cache creation, i.e. during graph BUILD,
+// before any compute buffer exists - so on its own it can only hold back a flat guess
+// (LLAMA_MOE_VRAM_RESERVE_MB, 3 GiB). That guess cannot be right: the buffer is O(n_ubatch x n_kv) and
+// measured 1170 MiB at n_ctx 16384 / ub 2048 but 34 GiB at n_ctx 131072 / ub 2048 before the
+// lightning-indexer scoring was chunked. Too small a guess overcommits VRAM (the driver then pages part
+// of the working set over PCIe, invisible in every VRAM counter and visible only as throughput); too
+// large leaves whole capacity steps unused.
+//
+// So: let the first reserve pass run with the flat guess (it only has to BUILD, and the buffer size does
+// not depend on the capacity - the slot pools live in their own buffer), then publish the measured size
+// here, drop the caches, and let the next graph build re-create them against the real number. The
+// earlier attempt at this deferred cache creation entirely, which made build_moe_ffn fall back to the
+// compaction gather whose transient is the full n_expert-wide expert tensor - a graph that needs MORE
+// compute buffer than the real one, so the measurement was useless. Keeping a real (flat-guess) cache
+// for the measurement pass avoids that: same graph shape, same buffer.
+//
+// Returns true if the caps were invalidated and the caller must re-reserve. The RAM residency pools are
+// dropped with the caches, but llama_moe_prefill_once has not run yet at this point in startup, so no
+// prefill work is thrown away - only the VRAM prewarm is paid twice.
+bool llama_moe_recap_from_compute_reserve(size_t compute_bytes) {
+    if (compute_bytes == 0) { return false; }
+    if (getenv("LLAMA_MOE_CACHE_CAP"))          { return false; } // capacity pinned by hand
+    if (!moe_env_on("LLAMA_MOE_AUTOCAP_RECAP", true)) { return false; }
+
+    // Only the per-layer (async) caches are rebuilt here. If the per-tensor compaction pools are in use
+    // the graph holds their device tensors too, and dropping them is not worth a second code path.
+    if (!g_moe_cache_pools.empty()) { return false; }
+
+    if (g_moe_loader_run.exchange(false)) {
+        if (g_moe_loader_thread.joinable()) {
+            g_moe_loader_thread.join();
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
+
+    if (g_moe_layer_caches.empty()) { return false; }
+
+    for (auto & kv : g_moe_layer_caches) {
+        llama_moe_layer_cache * c = kv.second;
+        if (!c) { continue; }
+        for (auto & pr : c->proj) {
+            if (pr.ram) {
+                llama_moe_ram_free(pr.ram, (size_t) c->ram_capacity * (size_t) pr.stride);
+                pr.ram = nullptr;
+            }
+            if (pr.fp)    { fclose(pr.fp);    pr.fp    = nullptr; }
+            if (pr.fp_ld) { fclose(pr.fp_ld); pr.fp_ld = nullptr; }
+        }
+        if (c->buffer) { ggml_backend_buffer_free(c->buffer); c->buffer = nullptr; }
+        if (c->ctx)    { ggml_free(c->ctx);                   c->ctx    = nullptr; }
+        delete c;
+    }
+    g_moe_layer_caches.clear();
+
+    g_moe_compute_reserve.store(compute_bytes, std::memory_order_release);
+    g_moe_cached_cap = 0;
+    g_moe_autocap_logged = false;
+
+    return true;
 }
 
 void llama_moe_cache_shutdown(void) {

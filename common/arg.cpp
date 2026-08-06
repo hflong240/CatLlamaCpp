@@ -1309,6 +1309,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--n-outputs-max"}, "N",
+        string_format("max tokens per batch that logits are computed for (default: %d, 0 = --batch-size).\n"
+            "the reserved compute buffer holds an [n_vocab, N] logits tensor, so 1 shrinks it to a single row\n"
+            "when only the last token is ever sampled; raised to --parallel if set below it", params.n_outputs_max),
+        [](common_params & params, int value) {
+            params.n_outputs_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_N_OUTPUTS_MAX"));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {
