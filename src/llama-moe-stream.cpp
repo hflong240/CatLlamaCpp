@@ -3752,10 +3752,18 @@ static void llama_moe_layer_remap_group_cb(ggml_tensor * dst, const ggml_tensor 
             if (c->slot_expert[(size_t) s] < 0) { victim = s; break; }
             if (c->slot_age[(size_t) s] < oldest) { oldest = c->slot_age[(size_t) s]; victim = s; }
         }
-        // Unreachable by construction: |need| <= group span <= capacity, and only this group's own
-        // experts hold pins, so an unpinned slot always remains. Bail rather than corrupt if the
-        // invariant is ever broken by a capacity change.
-        GGML_ASSERT(victim >= 0);
+        // The pin-only argument (|need| <= group span <= capacity, only this group holds pins) guarantees
+        // an UNPINNED slot remains - but the loop above also skips slots the background async loader is
+        // mid-write on (slot_loading), and the loader is deliberately NOT suspended during a sweep. On a
+        // full group (|need| == capacity) the single unpinned slot can be exactly the one the loader is
+        // writing, leaving no victim. Mirror the single-pass remap (llama_moe_layer_remap_cb): stop here
+        // and let the remaining in-group experts fall through to a zero sentinel for this ubatch (the dst
+        // writer below already maps expert_slot < 0 to a sentinel). Spin-waiting would deadlock - the
+        // loader's publish needs THIS mutex - so drop rather than wait: a little quality for one ubatch
+        // step, never a torn read. (Was GGML_ASSERT(victim >= 0), which crashed on this benign race.)
+        if (victim < 0) {
+            break;
+        }
         const int old_e = c->slot_expert[(size_t) victim];
         if (old_e >= 0 && old_e < c->n_expert) {
             ggml_backend_tensor_set(c->slot_table, &c->capacity, (size_t) old_e * sizeof(int32_t), sizeof(int32_t));
