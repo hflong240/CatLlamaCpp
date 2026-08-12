@@ -62,6 +62,67 @@ should not run together. Use `-fit off` with streaming (see the note under Usage
   hyper-connections, a lightning indexer, and static token-id expert routing on the first layers. Ported
   from [ggml-org/llama.cpp#24162](https://github.com/ggml-org/llama.cpp/pull/24162). This is the fork's
   main test target; the streaming defaults below are tuned on it.
+- **Fused hyper-connection Sinkhorn** (`deepseek4`, on by default, `LLAMA_DSV4_FUSED_SINKHORN=0` to opt out):
+  **the largest single decode win in the fork so far, 1.29x end to end.** dsv4 normalises a per-token
+  hyper-connection mixing matrix with 20 Sinkhorn iterations. That matrix is `[hc_mult, hc_mult, n_tokens]`,
+  i.e. **64 bytes per token**, but the iteration was expressed as a ggml op chain: each pass is a
+  `sum_rows` + `add` + `div` (plus a `cont`/`permute` for the transposed direction), so one call emits about
+  **180 nodes**. It runs twice per layer, so on 43 layers that is about **15500 of the 33700 nodes** in a
+  single-token decode graph - 46% of the graph, moving essentially zero bytes, and strictly serial because
+  every iteration depends on the previous one.
+  The cost was priced before writing any kernel, with a **semantics-free probe**: append `k` extra
+  normalisation pairs whose result is never consumed and pin them into the graph. The math is untouched, so
+  the output stays bit-identical (verified: same greedy MD5 at `k=0` and `k=20`), which means routing and
+  therefore expert-load time cannot drift between arms - the only variable is graph size. Result: **0.77-0.94
+  us per ggml node inside a replayed CUDA graph** on a 4090D, so the chain was worth 11.9-14.5 ms of a 65 ms
+  token. That per-node figure is a reusable constant: dsv4 decode turned out to be **node-count-bound**
+  (33691 nodes x 0.85 us is 41-43% of the token), not byte-bound or compute-bound.
+  The fix is one new op, `GGML_OP_HC_SINKHORN` (CUDA), doing all 20 iterations in a single launch with one
+  thread per token and the matrix in registers. Measured: decode graph **33691 -> 18297 nodes** (exactly the
+  predicted `-15480 +86`), prefill **37862 -> 22468**, graph splits unchanged at 88 (the op stays on CUDA;
+  had it spilled to the CPU backend it would have added two splits per occurrence), CUDA-graph capture still
+  active. End to end on DeepSeek-V4-Flash IQ2 (4090D, `-c 4096`, everything else pinned, 4 alternating
+  repeats): **64.3 -> 49.7 ms/token, 15.6 -> 20.1 tok/s, 1.29x**, with the two arms' ranges not overlapping.
+  Note that this op **cannot** be byte-identical to the chain it replaces: ggml's CUDA backend is built with
+  `-use_fast_math`, so a fused kernel and a chain of separately compiled kernels are reassociated differently
+  and the last bits differ - and dsv4 applies this matrix to the residual stream 86 times per token, which
+  amplifies that into a different greedy token stream. Quality was therefore verified statistically instead:
+  perplexity ratio **0.999766 +/- 0.002951** over 5120 tokens (indistinguishable from 1.0), correlation
+  99.85%, plus a spot check where both arms answered an arithmetic, a strict-format, a factual and a code
+  task correctly. `LLAMA_DSV4_SINKHORN_PAD` and `LLAMA_DSV4_SINKHORN_ITERS` are kept as measurement knobs
+  (the latter changes the math, so it is not a tuning knob).
+- **Per-(expert, projection) read units, and a batched slot publish**: two smaller decode wins on the
+  streaming side, both byte-identical.
+  The inline read path split its work by *expert*, and `n_threads = min(LLAMA_MOE_IO_THREADS, nl)` where `nl`
+  is the number of experts this call loads. At decode a layer loads 0-1 experts per token, so `nl` was 0 or 1
+  and **`n_threads` collapsed to 1** - the configured 16 io threads never engaged, and the 3 projection slabs
+  of the one expert were read back to back on a single thread. Making the work unit `(expert, projection)`
+  lets even a single-expert load use `n_proj` threads. Measured with a new wall-clock read-phase counter (see
+  below): inline read-phase bandwidth **1.45-1.9x**, with the 1-thread and 16-thread distributions not
+  overlapping across 12 windows. Output is byte-identical, and provably so: 1 thread and 16 threads produce
+  the same greedy MD5, and the 1-thread path visits units in the same order as the old nested loop.
+  Going *finer* than one projection slab is a dead end and was measured as such: striping a slab into 512 KiB
+  or 256 KiB chunks was worse in **24 of 24 paired windows**, because every chunk costs its own seek plus its
+  own synchronous H2D (a full `cudaStreamSynchronize`), which a 2.4 MiB request already amortises.
+  Separately (`LLAMA_MOE_PUBLISH_BATCH`, on by default): the per-layer cache's `slot_table` device tensor has
+  **no reader at all** - no graph op consumes it, nothing reads it back, its accessor has no callers - yet it
+  was written 4 bytes at a time on every eviction and every load, and each such write is a `cudaMemcpyAsync`
+  plus a `cudaStreamSynchronize`. `stale_table` (which *is* read, by the pure-GPU decode remap) was written
+  the same way, although the host mirror is the source of truth. Skipping the dead writes and uploading
+  `stale_table` once per step cut publish-path device syncs **3.66x** (26 -> 6.9 per token, 12 of 12 paired
+  windows), byte-identical on both the CPU-remap and GPU-`get_rows` paths.
+- **Fixed the streaming instrumentation** (`LLAMA_MOE_DIAG`): the previous breakdown could not be read
+  correctly. `read`/`H2D` are thread-sums accumulated by the io threads while `parallel_load` is wall time on
+  the calling thread, so the printed `other = parallel_load - read - H2D` residual went *negative*; the
+  background loader's reads landed in the same counters as the callback's although `parallel_load` never
+  covered them; the per-step divisor was hardcoded to 80 layers (dsv4 has 43, so every per-step figure was
+  1.86x too large); the sweep's lock-wait leaked into the first decode print; and the expert-cache VRAM
+  counter was never rolled back when the auto-capacity recap freed and rebuilt the caches, so the audit line
+  and its "approaching device capacity" warning both roughly doubled. All of these fed tuning decisions.
+  The breakdown is now a closed wall-clock sum, `callback = parallel_load + publish + remap` and
+  `parallel_load = setup + read-phase + H2D-batch`, with the thread-sums labelled as such, a wall-clock
+  read-phase timer plus a byte count so read bandwidth is directly comparable across runs, and the background
+  loader reported on its own line.
 - **Chunked lightning-indexer scoring** (`deepseek4`, on by default): the indexer scores every cached key
   against every query head, so its intermediate is `[n_lid, n_tokens, indexer_n_head]` - and it is
   materialized **twice**, as the `mul_mat` result and as its transposed copy, because the per-head weighting
@@ -273,6 +334,10 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 | `LLAMA_MOE_PREFILL_SWEEP` | on with `--moe-stream-async` | **Lossless prefill.** Partition the expert index space into `ceil(n_expert / capacity)` static groups and evaluate the MoE FFN once per group, so a prompt batch never has to drop experts it selected. Replaces the old `-ub 1` workaround (measured 5.7x faster *and* strictly more correct on DeepSeek-V4-Flash IQ2). Engages only when `capacity < n_expert` and only on multi-token batches, so decode is untouched. Costs `n_expert_used` sentinel slots per layer (see `LLAMA_MOE_SENTINELS`). Set `0` to restore capacity-rationed, lossy prefill. |
 | `LLAMA_MOE_PREFILL` | on with `--moe-stream-async` | Fill the host-RAM expert pool at full NVMe bandwidth once, during the prompt-eval window, instead of letting decode warm it token by token. The decode rate then reflects the warm steady state from the first token. Set `LLAMA_MOE_PREFILL=0` to disable. |
 | `LLAMA_MOE_PREFILL_VRAM` | on with `--moe-stream-async` | After the RAM pool is warm, also fill each layer's VRAM slot cache with its top-scoring experts from the RAM pool (~25 GB/s) before decode, instead of warming VRAM one miss at a time over the first tokens. Quality-safe (VRAM is a subset of the RAM set; a wrong pick is just LRU-evicted). Set `LLAMA_MOE_PREFILL_VRAM=0` to disable. |
+| `LLAMA_MOE_PUBLISH_BATCH` | **on** | Skip the per-layer cache's `slot_table` device writes (that tensor has no reader: no graph op consumes it and nothing reads it back) and upload `stale_table` once per step from its host mirror instead of 4 bytes per loaded expert. Each of those writes is a `cudaMemcpyAsync` + `cudaStreamSynchronize`; batching them cut publish-path device syncs **3.66x** (26 -> 6.9 per token). Byte-identical on both the CPU-remap and the pure-GPU `get_rows` paths. Set `0` to restore the per-expert writes. |
+| `LLAMA_DSV4_FUSED_SINKHORN` | **on** (`deepseek4`, CUDA) | Run the hyper-connection Sinkhorn normalisation as one `GGML_OP_HC_SINKHORN` kernel instead of ~180 tiny ggml nodes per call, twice per layer. Decode graph **33691 -> 18297 nodes**, end to end **1.29x** (64.3 -> 49.7 ms/token). See [What's new](#whats-new) for the measurement and why the result is *not* byte-identical to the op chain (`-use_fast_math`) - perplexity ratio is 0.999766 +/- 0.002951. Falls back to the op chain when no CUDA device is registered, or when `hc_mult` is not 2 or 4. Set `0` to opt out. |
+| `LLAMA_DSV4_SINKHORN_PAD=k` | `0` | **Measurement only.** Append `k` extra Sinkhorn normalisation pairs whose result is never consumed, so the graph grows by `k*9` nodes per call while the output stays bit-identical. This is how the op chain was priced before the fused kernel was written (0.77-0.94 us per ggml node inside a replayed CUDA graph); it is the clean alternative to `LLAMA_DSV4_SINKHORN_ITERS`, which changes the math and therefore the routing. |
+| `LLAMA_DSV4_SINKHORN_ITERS=N` | from the GGUF | **Measurement only, changes the model output.** Override the Sinkhorn iteration count. Useful for bisecting the fused kernel against the op chain one stage at a time; not a tuning knob. |
 
 **Auto-sizing** (only if the auto `CACHE_CAP` / `RAM_CAP` needs nudging):
 
@@ -509,6 +574,21 @@ Caveats:
   quality forces each layer's true top-2 experts resident before its matmul, and it is bounded by NVMe
   read bandwidth: the per-token working set overflows VRAM+RAM, so misses fault from disk. A smaller
   quantization (more experts fit resident) or more VRAM/RAM is the lever, not the execution model.
+- **DeepSeek-V4-Flash IQ2 (~85 GB) on an RTX 4090D (24 GB) + 64 GB RAM**, decode, `-c 4096`: **20.1 tok/s
+  (49.7 ms/token)** with the current defaults, up from **15.6 tok/s (64.3 ms/token)** with the fused Sinkhorn
+  and the batched slot publish disabled - **1.29x**, measured over 4 alternating repeats with the two arms'
+  ranges not overlapping. Prefill on the same setup is **75.9 tok/s** lossless via the expert-group sweep.
+  Where the remaining decode token goes, measured: the MoE streaming callback is ~21-26% of it (and about
+  85-90% of *that* is the inline disk read), and the rest is graph dispatch plus the attention and
+  lightning-indexer compute. After the Sinkhorn fusion, graph dispatch is ~14% of the token, down from
+  41-43% before it.
+  > Reproducing any of this requires pinning the auto-sized knobs, or run-to-run spread swamps the effect.
+  > With `LLAMA_MOE_CACHE_CAP`, `LLAMA_MOE_SENTINELS`, `LLAMA_MOE_AUTOCAP_RECAP=0`, `LLAMA_MOE_RAM_CAP`,
+  > `LLAMA_MOE_NOLOADER=1` and `LLAMA_MOE_IO_THREADS` all fixed, plus a standby-cache purge before each arm,
+  > within-arm spread is about **1.05x**. Leave the capacity auto-sized (it picks a value and then recaps) or
+  > let the RAM pool follow whatever RAM happened to be available at startup, and it becomes **1.7x** - large
+  > enough to "prove" either direction. Prefer counters (node counts, device syncs, bytes moved) over tok/s
+  > for anything below ~1.1x.
 
 Caveats:
 

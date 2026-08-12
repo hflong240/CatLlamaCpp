@@ -576,6 +576,32 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
     }
     if (per_expert == 0) { return 0; }
 
+    // Byte budget (LLAMA_MOE_CACHE_BYTES, set by --moe-stream-cache N[MB|GB]): a total-VRAM budget for the
+    // expert cache across all MoE layers, converted here because this is the first point that knows both
+    // n_moe_layers and the per-expert byte cost. Precedence is LLAMA_MOE_CACHE_CAP (explicit experts/layer)
+    // > this > auto-from-free-VRAM; the CAP check lives at the call site, so reaching here means CAP was
+    // unset. The budget covers the cache slabs only - sentinel slots and every other device allocation are
+    // on top of it.
+    if (const char * be = getenv("LLAMA_MOE_CACHE_BYTES")) {
+        const unsigned long long want = strtoull(be, nullptr, 10);
+        if (want > 0) {
+            const uint64_t denom = (uint64_t) n_moe_layers * per_expert;
+            long long cap = denom ? (long long) ((uint64_t) want / denom) : 0;
+            if (cap < 1)        { cap = 1; }
+            if (cap > n_expert) { cap = n_expert; }
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                const double gib = 1024.0*1024.0*1024.0;
+                LLAMA_LOG_WARN("MoE stream: CACHE_BYTES budget %.2f GiB -> CACHE_CAP=%lld (~%.2f GiB across "
+                               "%d MoE layers, %.1f MiB/expert); sentinel slots are extra.\n",
+                               (double) want / gib, cap, (double) ((uint64_t) cap * denom) / gib,
+                               n_moe_layers, per_expert / (1024.0*1024.0));
+            }
+            return (int) cap;
+        }
+    }
+
     // Fraction of (dev_free - reserve) the expert cache may claim. Kept near 1.0 deliberately: the real
     // "something else will want VRAM" allowance is the ABSOLUTE reserve below, not this. See the reserve
     // comment for why the distinction matters when moving between cards.
@@ -1245,6 +1271,21 @@ static void moe_layer_load_into_slot(llama_moe_layer_cache * c, int e, int slot,
 
 static uint64_t g_moe_layer_vram_bytes = 0; // cumulative device bytes of all per-layer caches (under mutex)
 
+// LLAMA_MOE_PUBLISH_BATCH (default ON, set =0 to opt out): skip the write-only slot_table device writes and
+// publish stale_table once per step instead of once per loaded expert. The layer cache's slot_table has no
+// reader - no graph op consumes it, nothing calls ggml_backend_tensor_get on it, and its accessor has no
+// callers - so those writes are dead work. stale_table IS read (by the pure-GPU decode remap), but the host
+// mirror stale_of_expert is the source of truth, so one whole-table upload at the end of the step lands
+// identical bytes. Measured: device syncs in the publish path down 3.66x (26 -> 6.9 per token), output
+// byte-identical on both the budget>0 (CPU remap) and budget==0 (GPU get_rows over stale_table) paths.
+static bool llama_moe_publish_batch(void) {
+    static const bool on = moe_env_on("LLAMA_MOE_PUBLISH_BATCH", true);
+    return on;
+}
+// device set_tensor calls issued by the publish path. Each is a cudaMemcpyAsync + cudaStreamSynchronize, so
+// this COUNT (not a timer) is the acceptance criterion when batching them.
+static std::atomic<uint64_t> g_diag_pub_cnt{0};
+
 // decode-path timing breakdown (under g_moe_layer_mutex); printed by the diag block, then reset.
 static uint64_t g_diag_cb_ns    = 0; // total time inside the remap callback
 static uint64_t g_diag_pl_ns    = 0; // of which, in parallel_load (disk fread + H2D of synced experts)
@@ -1252,8 +1293,38 @@ static uint64_t g_diag_sync_cnt = 0; // experts sync-loaded (per layer, summed)
 static uint64_t g_diag_ram_hit  = 0; // of those, how many were served from the RAM pool (no disk)
 static uint64_t g_diag_lockwait_ns = 0; // time the remap callback waited to ACQUIRE g_moe_layer_mutex
 static uint64_t g_diag_publish_ns = 0; // time in the slot_table/stale_table publish sync sets (batching target)
-static std::atomic<uint64_t> g_diag_read_ns{0}; // parallel_load: time in disk fread (no-mmap miss path)
-static std::atomic<uint64_t> g_diag_h2d_ns{0};  // parallel_load: time in H2D (staged sync set + async batch sync)
+// read/h2d are summed across the io threads, so they are THREAD-SUMS: with N threads they can exceed
+// the wall time of the parallel_load they are inside. Never subtract them from a wall figure.
+static std::atomic<uint64_t> g_diag_read_ns{0};     // parallel_load: disk fread, thread-sum
+static std::atomic<uint64_t> g_diag_h2d_ns{0};      // parallel_load: staged per-expert H2D, thread-sum
+static std::atomic<uint64_t> g_diag_h2d_wall_ns{0}; // parallel_load: async H2D batch, WALL (issuing thread)
+// The background loader calls parallel_load too, on its own thread, and g_diag_pl_ns does NOT cover it.
+// Its reads therefore must not land in the counters above, or "read" ends up larger than the
+// parallel_load it looks like a subset of - which is what made the old breakdown unreadable.
+static std::atomic<uint64_t> g_diag_ldr_read_ns{0}; // background loader: disk fread, thread-sum
+static std::atomic<uint64_t> g_diag_ldr_h2d_ns{0};  // background loader: staged H2D, thread-sum
+static std::atomic<uint64_t> g_diag_ldr_cnt{0};     // background loader: expert-projections it moved
+// WALL time of the whole read phase (spawn -> join, or the inline call at n_threads==1) plus the bytes
+// actually freaded in it. These two are what a "did the io get faster" question needs: the wall figure is
+// comparable across runs and the byte count normalises it, so read-phase bandwidth does not depend on
+// which experts the generated text happened to route to. The thread-sums above cannot do either.
+static std::atomic<uint64_t> g_diag_rdphase_ns{0};     // read phase, WALL (calling thread)
+static std::atomic<uint64_t> g_diag_read_bytes{0};     // bytes freaded in it
+static std::atomic<uint64_t> g_diag_ldr_rdphase_ns{0}; // same, background loader
+static std::atomic<uint64_t> g_diag_ldr_bytes{0};
+static uint64_t g_diag_sweep_lockwait_ns = 0; // sweep-path lock wait, kept out of g_diag_lockwait_ns so
+                                              // the decode print cannot report prefill contention
+static const int g_diag_steps = 16; // decode steps covered by one timing print
+
+// MoE layer count, for diag step accounting only. Every expert tensor is registered at load time,
+// before any layer cache exists, so this is exact from the first call. Do not hardcode a layer count:
+// dsv4 has 43 and hy3 has 80, and a wrong divisor silently rescales every per-step figure.
+static int llama_moe_diag_n_layers(const llama_moe_layer_cache * c) {
+    const size_t np = (c && !c->proj.empty()) ? c->proj.size() : 0;
+    if (np == 0 || g_moe_expert_files.size() < np) { return 1; }
+    const int n = (int) (g_moe_expert_files.size() / np);
+    return n > 0 ? n : 1;
+}
 
 // fork audit probe (LLAMA_MOE_SLOTDBG): read-only census of how each routing position's slot id was
 // resolved in the dst loop. HIT = the routed expert is resident; SENTINEL = zeroed drop slot; SPARE =
@@ -1723,7 +1794,8 @@ void llama_moe_layer_prefetch(int il, const int32_t * ids, int n_ids) {
 // What must NOT be evicted is another expert of the same token (prefetch_keep), plus the usual
 // loading/pinned guards.
 static void llama_moe_layer_parallel_load(llama_moe_layer_cache * c, const std::vector<int> & load_e,
-                                          const std::vector<int> & load_slot, bool allow_pinned);
+                                          const std::vector<int> & load_slot, bool allow_pinned,
+                                          bool from_loader);
 
 static void moe_drain_prefetch(std::vector<char> & ldbuf) {
     (void) ldbuf;
@@ -1802,7 +1874,7 @@ static void moe_drain_prefetch(std::vector<char> & ldbuf) {
         // UNLOCKED: nothing points at a claimed slot, so the bytes can land without the mutex. Must skip
         // the global pinned arena (see the note on llama_moe_layer_parallel_load) precisely because this
         // runs unlocked and the decode callback can be inside parallel_load at the same time.
-        llama_moe_layer_parallel_load(c, load_e, load_slot, /*allow_pinned=*/false);
+        llama_moe_layer_parallel_load(c, load_e, load_slot, /*allow_pinned=*/false, /*from_loader=*/true);
         {
             std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
             for (size_t i = 0; i < load_e.size(); ++i) {
@@ -2708,7 +2780,8 @@ static void llama_moe_ensure_stage(llama_moe_layer_cache * c, int n_threads) {
 static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
                                           const std::vector<int> &  load_e,
                                           const std::vector<int> &  load_slot,
-                                          bool                      allow_pinned = true) {
+                                          bool                      allow_pinned = true,
+                                          bool                      from_loader  = false) {
     const size_t nl = load_e.size();
     if (nl == 0) {
         return;
@@ -2731,10 +2804,21 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
         }
     }
 
+    // The work unit is (expert, projection), not (expert). At decode a layer loads 0-1 experts per token,
+    // so splitting by expert made n_threads collapse to 1 and the n_proj slabs of that one expert were
+    // read back to back on a single thread. Splitting by unit lets even a single-expert load use n_proj
+    // threads. Prefill is unaffected in kind: nu is just n_proj times larger and still clamps to the env.
+    //
+    // Going FINER than one projection slab was tried and is a dead end: striping a slab into chunks made
+    // read-phase bandwidth worse in 24 of 24 paired windows at both 512 KiB and 256 KiB, because each chunk
+    // costs its own seek plus its own synchronous H2D (a full cudaStreamSynchronize), and a 2.4 MiB request
+    // already amortises that. One projection slab is the right granularity.
+    const size_t np = c->proj.size() ? c->proj.size() : 1;
+    const size_t nu = nl * np;
     const char * env = getenv("LLAMA_MOE_IO_THREADS");
     int n_threads = env ? atoi(env) : 16;
     if (n_threads < 1) { n_threads = 1; }
-    if (n_threads > (int) nl) { n_threads = (int) nl; }
+    if (n_threads > (int) nu) { n_threads = (int) nu; }
 
     // Fast-path accelerations (LLAMA_MOE_PINNED_STAGE, default on; set =0 to A/B against the old path).
     //  - parallel no-mmap reads: each thread opens its own FILE* and uses positioned reads, so no-mmap
@@ -2780,15 +2864,16 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
         std::vector<FILE *> tfp;                   // this thread's private no-mmap handles (per proj)
         const bool par_read = fast && any_fp;      // this thread does its own file reads
         if (par_read) {
+            // opened lazily below: a unit-split thread usually touches ONE projection, so eagerly opening
+            // all of them cost n_proj fopen per thread per call for handles that were never used.
             tfp.resize(c->proj.size(), nullptr);
-            for (size_t pi = 0; pi < c->proj.size(); ++pi) {
-                if (!c->proj[pi].fpath.empty()) { tfp[pi] = fopen(c->proj[pi].fpath.c_str(), "rb"); }
-            }
         }
-        for (size_t idx = lo; idx < hi; ++idx) {
+        for (size_t u = lo; u < hi; ++u) {
+            const size_t idx = u / np;
+            const size_t pi  = u % np;
             const int e    = load_e[order[idx]];
             const int slot = load_slot[order[idx]];
-            for (size_t pi = 0; pi < c->proj.size(); ++pi) {
+            {
                 const llama_moe_proj_store & pr = c->proj[pi];
                 const size_t stride = (size_t) pr.stride;
                 // Prefer a directly-addressable source (RAM pool or mmap): H2D straight from it.
@@ -2807,6 +2892,9 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
                     scratch.resize(stride);
                     stg = scratch.data();
                 }
+                if (par_read && !tfp[pi] && !pr.fpath.empty()) {
+                    tfp[pi] = fopen(pr.fpath.c_str(), "rb"); // first unit of this projection on this thread
+                }
                 bool ok;
                 const int64_t t_rd0 = diag ? ggml_time_us() : 0;
                 if (par_read && tfp[pi]) {
@@ -2815,7 +2903,12 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
                     // single-thread / no private handle: use the shared read path (holds compute fp)
                     ok = llama_moe_read_expert(c, pi, e, stg);
                 }
-                if (diag) { g_diag_read_ns += (uint64_t) (ggml_time_us() - t_rd0); }
+                if (diag) {
+                    const uint64_t dt = (uint64_t) (ggml_time_us() - t_rd0);
+                    const uint64_t by = ok ? (uint64_t) stride : 0;
+                    if (from_loader) { g_diag_ldr_read_ns += dt; g_diag_ldr_cnt += 1; g_diag_ldr_bytes  += by; }
+                    else            { g_diag_read_ns     += dt; g_diag_read_bytes += by; }
+                }
                 if (ok) {
                     // NOTE: in async mode a pinned staging slot is reused per (thread,proj) across
                     // experts, so we must issue its H2D before the next expert overwrites it. With the
@@ -2824,7 +2917,11 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
                     // only async-batch the direct-source (RAM/mmap, stable pointer) copies above.
                     const int64_t t_h0 = diag ? ggml_time_us() : 0;
                     ggml_backend_tensor_set(pr.dev, stg, (size_t) slot * stride, stride);
-                    if (diag) { g_diag_h2d_ns += (uint64_t) (ggml_time_us() - t_h0); }
+                    if (diag) {
+                        const uint64_t dt = (uint64_t) (ggml_time_us() - t_h0);
+                        if (from_loader) { g_diag_ldr_h2d_ns += dt; }
+                        else            { g_diag_h2d_ns     += dt; }
+                    }
                 }
             }
         }
@@ -2835,21 +2932,37 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
         }
     };
 
+    const int64_t t_rp0 = diag ? ggml_time_us() : 0;
     if (n_threads <= 1) {
-        load_range(0, nl, 0);
+        load_range(0, nu, 0);
     } else {
+        // spawn n_threads-1 and run the last range on the calling thread: one fewer std::thread per
+        // parallel_load call, which matters because decode calls this once per MoE layer per token.
         std::vector<std::thread> pool;
-        pool.reserve((size_t) n_threads);
-        for (int t = 0; t < n_threads; ++t) {
-            const size_t lo = (size_t) ((long long) t       * (long long) nl / n_threads);
-            const size_t hi = (size_t) ((long long) (t + 1) * (long long) nl / n_threads);
+        pool.reserve((size_t) n_threads - 1);
+        for (int t = 0; t < n_threads - 1; ++t) {
+            const size_t lo = (size_t) ((long long) t       * (long long) nu / n_threads);
+            const size_t hi = (size_t) ((long long) (t + 1) * (long long) nu / n_threads);
             if (lo < hi) {
                 pool.emplace_back(load_range, lo, hi, t);
             }
         }
+        {
+            const int    t  = n_threads - 1;
+            const size_t lo = (size_t) ((long long) t       * (long long) nu / n_threads);
+            const size_t hi = (size_t) ((long long) (t + 1) * (long long) nu / n_threads);
+            if (lo < hi) { load_range(lo, hi, t); }
+        }
         for (auto & th : pool) {
             th.join();
         }
+    }
+    // WALL time of the read phase just completed (spawn + reads + staged H2D + join). Together with the
+    // H2D batch below this closes parallel_load, so the printed decomposition is a real sum.
+    if (diag) {
+        const uint64_t dt = (uint64_t) (ggml_time_us() - t_rp0);
+        if (from_loader) { g_diag_ldr_rdphase_ns += dt; }
+        else             { g_diag_rdphase_ns     += dt; }
     }
 
     // async H2D batch: issue all direct-source copies on the device stream from THIS thread, then a
@@ -2861,7 +2974,13 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
             ggml_backend_tensor_set_async(c->dev_backend, p.dev, p.src, p.off, p.bytes);
         }
         ggml_backend_synchronize(c->dev_backend);
-        if (diag) { g_diag_h2d_ns += (uint64_t) (ggml_time_us() - t_b0); }
+        // wall time on the issuing thread, so it goes to its own counter: g_diag_h2d_ns holds thread-sums
+        // from the staged path and mixing the two units made the printed H2D figure uninterpretable.
+        if (diag) {
+            const uint64_t dt = (uint64_t) (ggml_time_us() - t_b0);
+            if (from_loader) { g_diag_ldr_h2d_ns += dt; }
+            else             { g_diag_h2d_wall_ns += dt; }
+        }
     }
 }
 
@@ -3037,10 +3156,15 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         int distinct = 0;
         for (int e = 0; e < c->n_expert; ++e) { if (sorted[(size_t) e] > 0) { distinct++; } }
         for (int e = 0; e < c->capacity && e < c->n_expert; ++e) { top_cap += sorted[(size_t) e]; }
-        LLAMA_LOG_WARN("MoE diag [cache %p]: %llu steps, miss frac %.0f%%, capacity=%d | top-2 core: "
+        // "latent" because diag_miss counts EVERY unique missing expert of the step, while the set that
+        // actually reaches VRAM is truncated by sync_budget and by coverage early-stop. The two are not
+        // the same quantity, so this figure must not be read as "the cache is too small".
+        LLAMA_LOG_WARN("MoE diag [cache %p]: %llu steps, latent miss frac %.0f%% (all unique misses, NOT "
+                       "the loaded set: budget=%d cover=%.2f truncate it), capacity=%d | top-2 core: "
                        "%d distinct experts ever in top-2, hottest %d cover %.0f%% of all top-2 picks\n",
                        (void *) c, (unsigned long long) c->diag_steps,
                        100.0 * (double) c->diag_miss / (double) (c->diag_unique ? c->diag_unique : 1),
+                       c->sync_budget, c->sync_cover,
                        c->capacity, distinct, c->capacity,
                        100.0 * (double) top_cap / (double) (total ? total : 1));
     }
@@ -3166,7 +3290,10 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         // overwritten), then claim the slot; the big byte copy happens in parallel afterwards
         const int old_e = c->slot_expert[(size_t) victim];
         if (old_e >= 0 && old_e < c->n_expert) {
-            ggml_backend_tensor_set(c->slot_table, &c->capacity, (size_t) old_e * sizeof(int32_t), sizeof(int32_t));
+            if (!llama_moe_publish_batch()) {
+                ggml_backend_tensor_set(c->slot_table, &c->capacity, (size_t) old_e * sizeof(int32_t), sizeof(int32_t));
+                g_diag_pub_cnt += 1;
+            }
             c->expert_slot[(size_t) old_e] = -1;
             moe_stale_on_evict(c, old_e, victim); // keep stale_table real for the pure-GPU decode path
         }
@@ -3229,10 +3356,25 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     // publish the freshly loaded slots into the device slot_table only after their data is in
     // place (keeps slot_table consistent for the background loader's bookkeeping)
     const int64_t diag_pub0 = ggml_time_us();
+    const bool pub_batch = llama_moe_publish_batch();
     for (size_t i = 0; i < load_e.size(); ++i) {
-        ggml_backend_tensor_set(c->slot_table, &load_slot[i], (size_t) load_e[i] * sizeof(int32_t), sizeof(int32_t));
-        moe_stale_on_load(c, load_e[i], load_slot[i]); // mirror into stale_table for the pure-GPU decode path
+        if (!pub_batch) {
+            ggml_backend_tensor_set(c->slot_table, &load_slot[i], (size_t) load_e[i] * sizeof(int32_t), sizeof(int32_t));
+            moe_stale_on_load(c, load_e[i], load_slot[i]); // mirror into stale_table for the pure-GPU decode path
+            g_diag_pub_cnt += 2;
+        } else if (c->stale_table && load_e[i] >= 0 && load_e[i] < c->n_expert &&
+                   (int) c->stale_of_expert.size() == c->n_expert) {
+            c->stale_of_expert[(size_t) load_e[i]] = load_slot[i]; // host mirror only; uploaded once below
+        }
         c->last_settled_slot = load_slot[i];
+    }
+    if (pub_batch && !load_e.empty() && c->stale_table &&
+        (int) c->stale_of_expert.size() == c->n_expert) {
+        // one whole-table upload instead of 2 per loaded expert. Must stay inside the mutex: the background
+        // loader writes the same host mirror, and after parallel_load so no slot is published early.
+        ggml_backend_tensor_set(c->stale_table, c->stale_of_expert.data(), 0,
+                                (size_t) c->n_expert * sizeof(int32_t));
+        g_diag_pub_cnt += 1;
     }
     if (getenv("LLAMA_MOE_DIAG")) { g_diag_publish_ns += (uint64_t) (ggml_time_us() - diag_pub0); }
 
@@ -3407,28 +3549,51 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         }
     }
 
-    // timing breakdown: accumulate total callback time; print + reset every 640 layer-calls (~8
-    // decode steps at 80 layers) when LLAMA_MOE_DIAG is set, so we can see where a token's time goes.
+    // timing breakdown: accumulate total callback time; print + reset every g_diag_steps DECODE STEPS
+    // when LLAMA_MOE_DIAG is set. The period is derived from the real MoE layer count so the printed
+    // totals always cover exactly that many steps on any architecture.
+    // Units: callback, parallel_load, publish, LOCK-WAIT and the derived remap are WALL time on this
+    // thread. read and H2D-staged are THREAD-SUMS over the io threads, so they are not on the same scale
+    // and no residual can be derived from them; H2D-batch is wall on the issuing thread. The LOADER line
+    // is the background thread's own disk work over the same window: it is NOT part of parallel_load, so
+    // it must be read as competition for the device and the disk, never as a component of the callback.
     g_diag_cb_ns += (uint64_t) (ggml_time_us() - diag_t0);
     if (getenv("LLAMA_MOE_DIAG") && n_tokens == 1) {
+        const uint64_t period = (uint64_t) llama_moe_diag_n_layers(c) * (uint64_t) g_diag_steps;
         static uint64_t calls = 0;
-        if (++calls % 640 == 0) {
-            const double cb_ms = g_diag_cb_ns / 1000.0;
-            const double pl_ms = g_diag_pl_ns / 1000.0;
-            const double lw_ms = g_diag_lockwait_ns / 1000.0;
+        if (period > 0 && ++calls % period == 0) {
+            const double cb_ms  = g_diag_cb_ns / 1000.0;
+            const double pl_ms  = g_diag_pl_ns / 1000.0;
+            const double lw_ms  = g_diag_lockwait_ns / 1000.0;
             const double pub_ms = g_diag_publish_ns / 1000.0;
-            const double rd_ms  = g_diag_read_ns.load() / 1000.0; // parallel_load: disk fread
-            const double h2d_ms = g_diag_h2d_ns.load() / 1000.0;  // parallel_load: H2D (staged sync + batch sync)
-            // per-step (640 calls / 80 layers = 8 steps): callback time and how much is disk/H2D load
+            const double rd_ms  = g_diag_read_ns.load() / 1000.0;
+            const double h2d_ms = g_diag_h2d_ns.load() / 1000.0;
+            const double h2dw_ms = g_diag_h2d_wall_ns.load() / 1000.0;
+            const double lrd_ms = g_diag_ldr_read_ns.load() / 1000.0;
+            const double lh2_ms = g_diag_ldr_h2d_ns.load() / 1000.0;
+            const double rp_ms  = g_diag_rdphase_ns.load() / 1000.0;
+            const double rb_mib = g_diag_read_bytes.load() / (1024.0 * 1024.0);
+            const double rbw    = rp_ms > 0.0 ? rb_mib / rp_ms / 1024.0 * 1000.0 : 0.0; // GiB/s
             const uint64_t sc = g_diag_sync_cnt ? g_diag_sync_cnt : 1;
-            LLAMA_LOG_WARN("MoE timing/640-calls: callback %.0fms, parallel_load %.0fms (read %.0f + H2D %.0f + other %.0f), "
-                           "publish %.0fms, remap %.0fms; LOCK-WAIT %.0fms; sync-loaded %llu (RAM-hit %.0f%%, DISK %llu)\n",
-                           cb_ms, pl_ms, rd_ms, h2d_ms, pl_ms - rd_ms - h2d_ms, pub_ms, cb_ms - pl_ms - pub_ms, lw_ms,
+            LLAMA_LOG_WARN("MoE timing/%d steps [wall]: callback %.0fms = parallel_load %.0f + publish %.0f "
+                           "+ remap %.0f; parallel_load %.0f = setup %.0f + read-phase %.0f + H2D-batch %.0f; "
+                           "LOCK-WAIT %.0fms; publish %llu device-syncs; read-phase moved %.0f MiB = %.2f GiB/s "
+                           "| [thread-sums, not subtractable] read %.0fms, H2D-staged %.0fms | sync-loaded %llu "
+                           "(RAM-hit %.0f%%, DISK %llu) | LOADER (separate thread, not in callback): "
+                           "read %.0fms, H2D %.0fms, %llu expert-proj\n",
+                           g_diag_steps, cb_ms, pl_ms, pub_ms, cb_ms - pl_ms - pub_ms,
+                           pl_ms, pl_ms - rp_ms - h2dw_ms, rp_ms, h2dw_ms,
+                           lw_ms, (unsigned long long) g_diag_pub_cnt.load(), rb_mib, rbw,
+                           rd_ms, h2d_ms,
                            (unsigned long long) g_diag_sync_cnt,
                            100.0 * (double) g_diag_ram_hit / (double) sc,
-                           (unsigned long long) (g_diag_sync_cnt - g_diag_ram_hit));
+                           (unsigned long long) (g_diag_sync_cnt - g_diag_ram_hit),
+                           lrd_ms, lh2_ms, (unsigned long long) g_diag_ldr_cnt.load());
             g_diag_cb_ns = g_diag_pl_ns = g_diag_sync_cnt = g_diag_ram_hit = g_diag_lockwait_ns = g_diag_publish_ns = 0;
-            g_diag_read_ns = 0; g_diag_h2d_ns = 0;
+            g_diag_read_ns = 0; g_diag_h2d_ns = 0; g_diag_h2d_wall_ns = 0;
+            g_diag_ldr_read_ns = 0; g_diag_ldr_h2d_ns = 0; g_diag_ldr_cnt = 0;
+            g_diag_rdphase_ns = 0; g_diag_read_bytes = 0;
+            g_diag_ldr_rdphase_ns = 0; g_diag_ldr_bytes = 0; g_diag_pub_cnt = 0;
         }
     }
 }
@@ -3636,7 +3801,10 @@ static void llama_moe_layer_remap_group_cb(ggml_tensor * dst, const ggml_tensor 
 
     const int64_t diag_lock0 = ggml_time_us();
     std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
-    if (getenv("LLAMA_MOE_DIAG")) { g_diag_lockwait_ns += (uint64_t) (ggml_time_us() - diag_lock0); }
+    // sweep-path wait goes to the sweep counter. It used to land in g_diag_lockwait_ns, which only the
+    // decode print reads and resets, so a whole prefill worth of contention showed up as decode LOCK-WAIT
+    // in the first print after the prompt.
+    if (getenv("LLAMA_MOE_DIAG")) { g_diag_sweep_lockwait_ns += (uint64_t) (ggml_time_us() - diag_lock0); }
 
     // New pin generation, which releases the PREVIOUS group's pins. This is only safe because `dep`
     // gave the scheduler a data edge from that group's FFN output into this callback, so its matmuls
@@ -3840,26 +4008,37 @@ static void llama_moe_layer_remap_group_cb(ggml_tensor * dst, const ggml_tensor 
     // and the sweep does not go through it at all, so prefill had no breakdown - the one number needed to
     // decide whether the sweep's cost is BYTES (every selected expert must reach VRAM once per ubatch step)
     // or COMPUTE (n_groups full-width FFN passes, of which (n_groups-1)/n_groups multiplies zero sentinel
-    // slabs). Printed once per ubatch step: 43 layers x n_groups group-calls.
+    // slabs). Printed once per ubatch step: n_moe_layers x n_groups group-calls.
     if (getenv("LLAMA_MOE_DIAG")) {
         static std::atomic<uint64_t> gcalls{0};
         const uint64_t gc = gcalls.fetch_add(1, std::memory_order_relaxed) + 1;
         const int      n_groups = (c->n_expert + c->capacity - 1) / c->capacity;
-        const uint64_t per_step = (uint64_t) 43 * (uint64_t) (n_groups > 0 ? n_groups : 1);
+        const int      n_lay    = llama_moe_diag_n_layers(c);
+        const uint64_t per_step = (uint64_t) n_lay * (uint64_t) (n_groups > 0 ? n_groups : 1);
         if (per_step > 0 && (gc % per_step) == 0) {
             const double pl_ms  = g_diag_pl_ns / 1000.0;
             const double rd_ms  = g_diag_read_ns.load() / 1000.0;
             const double h2d_ms = g_diag_h2d_ns.load() / 1000.0;
+            const double h2dw_ms = g_diag_h2d_wall_ns.load() / 1000.0;
+            const double lw_ms  = g_diag_sweep_lockwait_ns / 1000.0;
+            const double rp_ms  = g_diag_rdphase_ns.load() / 1000.0;
+            const double rb_mib = g_diag_read_bytes.load() / (1024.0 * 1024.0);
+            const double rbw    = rp_ms > 0.0 ? rb_mib / rp_ms / 1024.0 * 1000.0 : 0.0; // GiB/s
             const uint64_t sc   = g_diag_sync_cnt ? g_diag_sync_cnt : 1;
-            LLAMA_LOG_WARN("MoE SWEEP timing/ubatch-step (%llu group-calls, n_groups=%d): parallel_load "
-                           "%.0fms (read %.0f + H2D %.0f + other %.0f); experts loaded %llu "
-                           "(RAM-hit %.0f%%, DISK %llu)\n",
-                           (unsigned long long) per_step, n_groups, pl_ms, rd_ms, h2d_ms,
-                           pl_ms - rd_ms - h2d_ms, (unsigned long long) g_diag_sync_cnt,
+            LLAMA_LOG_WARN("MoE SWEEP timing/ubatch-step (%llu group-calls, %d layers x n_groups=%d): "
+                           "[wall] parallel_load %.0fms = setup %.0f + read-phase %.0f + H2D-batch %.0f; "
+                           "LOCK-WAIT %.0fms; read-phase moved %.0f MiB = %.2f GiB/s | "
+                           "[thread-sums, not subtractable] read %.0fms, H2D-staged %.0fms | "
+                           "experts loaded %llu (RAM-hit %.0f%%, DISK %llu)\n",
+                           (unsigned long long) per_step, n_lay, n_groups,
+                           pl_ms, pl_ms - rp_ms - h2dw_ms, rp_ms, h2dw_ms,
+                           lw_ms, rb_mib, rbw,
+                           rd_ms, h2d_ms, (unsigned long long) g_diag_sync_cnt,
                            100.0 * (double) g_diag_ram_hit / (double) sc,
                            (unsigned long long) (g_diag_sync_cnt - g_diag_ram_hit));
-            g_diag_pl_ns = g_diag_sync_cnt = g_diag_ram_hit = 0;
-            g_diag_read_ns = 0; g_diag_h2d_ns = 0;
+            g_diag_pl_ns = g_diag_sync_cnt = g_diag_ram_hit = g_diag_sweep_lockwait_ns = 0;
+            g_diag_read_ns = 0; g_diag_h2d_ns = 0; g_diag_h2d_wall_ns = 0;
+            g_diag_rdphase_ns = 0; g_diag_read_bytes = 0;
         }
     }
 
@@ -4412,6 +4591,10 @@ bool llama_moe_recap_from_compute_reserve(size_t compute_bytes) {
         delete c;
     }
     g_moe_layer_caches.clear();
+    // every freed buffer above was counted into g_moe_layer_vram_bytes, and the map is now empty, so the
+    // running total must go back to zero. Without this the second pass adds on top of the first and the
+    // VRAM AUDIT line plus the "approaching device capacity" warning both report roughly double.
+    g_moe_layer_vram_bytes = 0;
 
     g_moe_compute_reserve.store(compute_bytes, std::memory_order_release);
     g_moe_cached_cap = 0;

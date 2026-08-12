@@ -283,6 +283,47 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
 
     // comb is [dst_hc, src_hc, n_tokens]. Sinkhorn follows the reference:
     // row softmax over dst, one column normalization, then repeated row/column normalization.
+    //
+    // LLAMA_DSV4_FUSED_SINKHORN=1 runs the whole thing as one GGML_OP_HC_SINKHORN kernel instead of the op
+    // chain below. The chain is about 180 ggml nodes per call and this runs twice per layer, so on dsv4 it
+    // is roughly 15500 of the 33700 nodes in a single-token decode graph - and a node inside a replayed CUDA
+    // graph was measured at 0.77-0.94 us on this box, i.e. 12-15 ms of a 70 ms token. Default off so the
+    // chain stays available for A/B.
+    // LLAMA_DSV4_FUSED_SINKHORN (default ON, set =0 to fall back to the op chain below) runs the whole
+    // Sinkhorn as one GGML_OP_HC_SINKHORN kernel. The chain is about 180 ggml nodes per call and this runs
+    // twice per layer, so on dsv4 it was roughly 15500 of the 33700 nodes in a single-token decode graph -
+    // and a node inside a replayed CUDA graph measures 0.77-0.94 us on a 4090D, i.e. 12-15 ms of a 65 ms
+    // token. Measured end to end: 64.3 -> 49.7 ms/token (1.29x), graph nodes 33691 -> 18297.
+    // The op is CUDA-only, so fall back to the chain when no CUDA device is registered rather than letting
+    // the scheduler hand an unimplemented op to the CPU backend.
+    static const bool fused = []() {
+        const char * e = getenv("LLAMA_DSV4_FUSED_SINKHORN");
+        if (e && atoi(e) == 0) {
+            return false;
+        }
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
+            if (name && strstr(name, "CUDA") != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    // Resolved before the branch so both paths honour the same iteration count. LLAMA_DSV4_SINKHORN_ITERS
+    // is a MEASUREMENT knob (it changes the math, hence the output); it is also how the fused kernel and the
+    // op chain get bisected against each other one stage at a time.
+    uint32_t n_iter = hparams.dsv4_hc_sinkhorn_iters;
+    if (const char * e = getenv("LLAMA_DSV4_SINKHORN_ITERS")) {
+        const int v = atoi(e);
+        if (v > 0) { n_iter = (uint32_t) v; }
+    }
+    if (fused && comb->ne[0] == comb->ne[1] && comb->ne[3] == 1 &&
+        (comb->ne[0] == 2 || comb->ne[0] == 4)) {
+        ggml_tensor * a = ggml_is_contiguous(comb) ? comb : ggml_cont(ctx0, comb);
+        return ggml_hc_sinkhorn(ctx0, a, hparams.dsv4_hc_eps, (int) n_iter);
+    }
+
     comb = ggml_soft_max(ctx0, comb);
 
     ggml_tensor * eps = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
@@ -305,9 +346,30 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
     };
 
     norm_cols();
-    for (uint32_t i = 1; i < hparams.dsv4_hc_sinkhorn_iters; ++i) {
+    for (uint32_t i = 1; i < n_iter; ++i) {
         norm_rows();
         norm_cols();
+    }
+
+    // MEASUREMENT ONLY: LLAMA_DSV4_SINKHORN_PAD=k appends k extra norm_rows/norm_cols pairs whose result is
+    // never consumed. The math is untouched, so the output stays BIT IDENTICAL (MD5 across k is the validity
+    // check) while the graph grows by 9 nodes per pad unit per call. The real chain above is about 20 of
+    // these units, so ms/token against k extrapolates by ~20 to the cost of the whole chain - which is the
+    // number that decides whether fusing it into one kernel is worth a new ggml op.
+    // Unlike LLAMA_DSV4_SINKHORN_ITERS this leaves the routing alone, so MoE load time cannot drift between
+    // arms and confound the slope.
+    static const int pad = []() {
+        const char * e = getenv("LLAMA_DSV4_SINKHORN_PAD");
+        return e ? atoi(e) : 0;
+    }();
+    if (pad > 0) {
+        ggml_tensor * keep = comb; // the lambdas write through `comb`, so hold on to the real result
+        for (int i = 0; i < pad; ++i) {
+            norm_rows();
+            norm_cols();
+        }
+        ggml_build_forward_expand(gf, comb); // pin the dead tail so it is actually executed
+        comb = keep;
     }
 
     return comb;

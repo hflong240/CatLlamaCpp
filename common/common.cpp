@@ -1601,6 +1601,18 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         setenv("LLAMA_MOE_STREAM", "1", 1);
 #endif
     }
+    // --moe-stream-cache N[MB|GB] parsed a byte budget into moe_stream_cache_bytes. Hand it to the
+    // streaming code, which converts it to experts/layer once it knows the layer count and the per-expert
+    // size. Before this the value was parsed and then never read by anything, so the flag silently did
+    // nothing except turn streaming on.
+    if (params.moe_stream_cache_bytes > 0) {
+        const std::string v = std::to_string(params.moe_stream_cache_bytes);
+#ifdef _WIN32
+        _putenv_s("LLAMA_MOE_CACHE_BYTES", v.c_str());
+#else
+        setenv("LLAMA_MOE_CACHE_BYTES", v.c_str(), 1);
+#endif
+    }
     if (params.moe_stream_async) {
 #ifdef _WIN32
         _putenv_s("LLAMA_MOE_STREAM_ASYNC", "1");

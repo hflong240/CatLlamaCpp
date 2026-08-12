@@ -1080,9 +1080,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "MOE_FFN",
+    "HC_SINKHORN",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1192,9 +1193,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "moe_ffn(x)",
+    "hc_sinkhorn(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6106,6 +6108,31 @@ struct ggml_tensor * ggml_moe_ffn(
     result->src[3] = gate_dev;
     result->src[4] = up_dev;
     result->src[5] = down_dev;
+
+    return result;
+}
+
+// ggml_hc_sinkhorn (fork)
+
+struct ggml_tensor * ggml_hc_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        float                 eps,
+        int                   n_iter) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(a->ne[0] == a->ne[1]);           // square: the doubly stochastic target
+    GGML_ASSERT(a->ne[0] == 2 || a->ne[0] == 4); // hc*hc must fit one warp
+    GGML_ASSERT(a->ne[3] == 1);
+    GGML_ASSERT(n_iter >= 0);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, n_iter);
+
+    result->op     = GGML_OP_HC_SINKHORN;
+    result->src[0] = a;
 
     return result;
 }

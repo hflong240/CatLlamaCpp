@@ -2827,6 +2827,127 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// fork: fused Sinkhorn normalisation (GGML_OP_HC_SINKHORN) - see ggml_hc_sinkhorn in ggml.c / ggml.h.
+// Replaces the op chain dsv4's build_hc_sinkhorn used to emit: about 180 ggml nodes per call, twice per
+// layer, all on a [hc,hc,n_tokens] tensor of 64 bytes per token. Measured on this fork, a node inside a
+// replayed CUDA graph costs 0.77-0.94 us, so that chain was 12-15 ms of a 70 ms decode token.
+//
+// Layout: ne[0] = hc is the fast axis (call it i, the dst_hc index), ne[1] = hc is j (src_hc), ne[2] is the
+// token. Element (i,j) lives at j*hc + i. The chain being reproduced, in order:
+//   softmax over i (per j), then +eps on every element, then one normalisation over j, then (n_iter - 1)
+//   pairs of [normalise over i, normalise over j]. Every sum gets +eps before the divide.
+// One thread per token: hc*hc <= 16 values stay in registers, the summation order is fixed and there is no
+// shared state, so the result is deterministic. At decode n_tokens is 1 and the launch dominates anyway.
+//
+// The sums reproduce ggml's warp butterfly order rather than accumulating left to right. warp_reduce_sum
+// (common.cuh) runs x += shfl_xor(x, offset) for offset 16,8,4,2,1; with 4 active lanes and zeros above,
+// the offsets 16/8/4 add exact zeros and what remains is (v0+v2) + (v1+v3). Matching it makes the fused op
+// bit-identical to the op chain - fp32 addition is not associative, and dsv4 applies this matrix to the
+// residual stream twice per layer, so a 1e-5 discrepancy compounds over 43 layers and flips greedy tokens.
+template <int HC>
+static __device__ __forceinline__ float hc_sum(const float * v, const int stride) {
+    if (HC == 4) {
+        return (v[0] + v[2*stride]) + (v[stride] + v[3*stride]);
+    }
+    return v[0] + v[stride];
+}
+
+template <int HC>
+static __global__ void hc_sinkhorn_f32(const float * __restrict__ src, float * __restrict__ dst,
+                                       const int n_tokens, const float eps, const int n_iter) {
+    const int t = blockIdx.x*blockDim.x + threadIdx.x;
+    if (t >= n_tokens) {
+        return;
+    }
+
+    const float * sp = src + (size_t) t*HC*HC;
+    float *       dp = dst + (size_t) t*HC*HC;
+
+    float m[HC*HC];
+
+    // softmax over i, for each j
+    for (int j = 0; j < HC; ++j) {
+        float mx = -INFINITY;
+        for (int i = 0; i < HC; ++i) {
+            mx = fmaxf(mx, sp[j*HC + i]);
+        }
+        for (int i = 0; i < HC; ++i) {
+            m[j*HC + i] = expf(sp[j*HC + i] - mx);
+        }
+        const float sum = hc_sum<HC>(m + j*HC, 1);
+        // ggml's softmax normalises by multiplying with the reciprocal (softmax.cu: inv_sum = 1.0f/tmp;
+        // dst = vals*inv_sum), which is not the same in fp32 as dividing. The Sinkhorn steps below DO
+        // divide, because there the graph used ggml_div.
+        const float inv_sum = 1.0f / sum;
+        for (int i = 0; i < HC; ++i) {
+            m[j*HC + i] *= inv_sum;
+        }
+    }
+
+    for (int k = 0; k < HC*HC; ++k) {
+        m[k] += eps;
+    }
+
+    // normalise over j (the graph's norm_cols): each (i,j) divided by the sum over j, plus eps
+    for (int i = 0; i < HC; ++i) {
+        const float sum = hc_sum<HC>(m + i, HC) + eps;
+        for (int j = 0; j < HC; ++j) {
+            m[j*HC + i] /= sum;
+        }
+    }
+
+    for (int it = 1; it < n_iter; ++it) {
+        // normalise over i (the graph's norm_rows)
+        for (int j = 0; j < HC; ++j) {
+            const float sum = hc_sum<HC>(m + j*HC, 1) + eps;
+            for (int i = 0; i < HC; ++i) {
+                m[j*HC + i] /= sum;
+            }
+        }
+        // normalise over j
+        for (int i = 0; i < HC; ++i) {
+            const float sum = hc_sum<HC>(m + i, HC) + eps;
+            for (int j = 0; j < HC; ++j) {
+                m[j*HC + i] /= sum;
+            }
+        }
+    }
+
+    for (int k = 0; k < HC*HC; ++k) {
+        dp[k] = m[k];
+    }
+}
+
+static void ggml_cuda_op_hc_sinkhorn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(src0->ne[0] == src0->ne[1]);
+    GGML_ASSERT(src0->ne[3] == 1);
+
+    float eps = 0.0f;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    const int n_iter   = ((const int32_t *) dst->op_params)[1];
+    const int hc       = (int) src0->ne[0];
+    const int n_tokens = (int) src0->ne[2];
+
+    const float * src_d = (const float *) src0->data;
+    float *       dst_d = (float *)       dst->data;
+    cudaStream_t  stream = ctx.stream();
+
+    const int block = 64;
+    const int grid  = (n_tokens + block - 1) / block;
+
+    switch (hc) {
+        case 2: hc_sinkhorn_f32<2><<<grid, block, 0, stream>>>(src_d, dst_d, n_tokens, eps, n_iter); break;
+        case 4: hc_sinkhorn_f32<4><<<grid, block, 0, stream>>>(src_d, dst_d, n_tokens, eps, n_iter); break;
+        default: GGML_ABORT("hc_sinkhorn: unsupported hc %d (expected 2 or 4)", hc);
+    }
+}
+
 // fork: fused MoE FFN (GGML_OP_MOE_FFN) - see ggml_moe_ffn in ggml.c / ggml.h.
 // Replaces the per-layer CPU map_custom1 remap (which forces a scheduler split) with a single CUDA-native
 // op: host callback plans residency + sync-loads missing experts, then gate/up + SwiGLU + down + weighted
@@ -3400,6 +3521,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MOE_FFN:
             ggml_cuda_op_moe_ffn(ctx, dst);
+            break;
+        case GGML_OP_HC_SINKHORN:
+            ggml_cuda_op_hc_sinkhorn(ctx, dst);
             break;
         default:
             return false;
@@ -5736,6 +5860,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_MOE_FFN:
             return true; // fork: fused MoE FFN, CUDA-native decode path
+        case GGML_OP_HC_SINKHORN:
+            // fork: fused Sinkhorn. Must be claimed here or the scheduler spills it to the CPU backend,
+            // which would add two splits per occurrence (86 per decode token) and lose the whole point.
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] == op->src[0]->ne[1] &&
+                   (op->src[0]->ne[0] == 2 || op->src[0]->ne[0] == 4) &&
+                   op->src[0]->ne[3] == 1 &&
+                   ggml_is_contiguous(op->src[0]);
 
         default:
             return false;

@@ -585,6 +585,8 @@ extern "C" {
 
         GGML_OP_MOE_FFN, // fork: fused MoE FFN with on-device expert sync-load (CUDA only, decode path)
 
+        GGML_OP_HC_SINKHORN, // fork: fused Sinkhorn normalisation for dsv4 hyper-connections (see ggml_hc_sinkhorn)
+
         GGML_OP_COUNT,
     };
 
@@ -2680,6 +2682,17 @@ extern "C" {
             ggml_moe_ffn_sync_fn  sync_fn,    // host residency/sync-load callback
             ggml_moe_ffn_cpu_fn   cpu_fn,     // optional CPU expert lane (nullptr = off)
             void                * cache);     // llama_moe_layer_cache*
+
+    // fork: fused Sinkhorn normalisation. `a` is a contiguous [hc, hc, n_tokens] f32 tensor. Runs a softmax
+    // over dim 0, adds eps, then one column normalisation followed by (n_iter - 1) row/column pairs, adding
+    // eps to every sum. This is the node chain dsv4's build_hc_sinkhorn used to emit (about 180 tiny nodes
+    // per call, twice per layer) collapsed into one launch. eps and n_iter are op_params written at build
+    // time only, so the op stays CUDA-graph capturable.
+    GGML_API struct ggml_tensor * ggml_hc_sinkhorn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,       // [hc, hc, n_tokens] f32, contiguous, hc is 2 or 4
+            float                 eps,
+            int                   n_iter); // total passes = 1 + 2*(n_iter - 1); n_iter <= 1 gives one norm_cols
 
     // loss function
 
