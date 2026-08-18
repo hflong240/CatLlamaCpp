@@ -435,9 +435,7 @@ static bool parse_bool_value(const std::string & value) {
 //
 
 bool common_params_handle_models(common_params & params, llama_example curr_ex) {
-    const bool spec_type_draft_mtp = std::find(params.speculative.types.begin(),
-                                         params.speculative.types.end(),
-                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_type_draft_mtp = params.speculative.has_draft_mtp();
 
     common_download_opts opts;
     opts.bearer_token    = params.hf_token;

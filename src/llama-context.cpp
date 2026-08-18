@@ -1771,6 +1771,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // fork: per-token freshness stride (LLAMA_MOE_SYNC_STRIDE, off by default). Decide here, once per
+    // decode step and before the graph is built, whether this step keeps the full synchronous expert
+    // budget or free-flies on stale reuse. The MoE remap callback runs once per MoE layer and only reads
+    // the decision, so the phase must be settled here. Passing batch_inp.n_tokens == 1 is also the prefill
+    // guard: any prompt or re-prompt batch disarms the stride and restarts the phase. stop_tok resolves
+    // the reasoning-close token for LLAMA_MOE_SYNC_STRIDE_THINK_ONLY (bound to the first context's vocab,
+    // which is also the only configuration the streaming decode fast path supports).
+    if (cparams.moe_stream_async) {
+        extern void llama_moe_stride_begin_step(bool single_token, int32_t tok, int32_t stop_tok);
+        static const llama_token stride_stop_tok = [&]() {
+            const char *      s = getenv("LLAMA_MOE_SYNC_STRIDE_THINK_END");
+            const std::string t = s ? s : "</think>";
+            const llama_token id = vocab.text_to_token(t);
+            if (getenv("LLAMA_MOE_SYNC_STRIDE_THINK_ONLY")) {
+                if (id == LLAMA_TOKEN_NULL) {
+                    LLAMA_LOG_WARN("MoE stride: \"%s\" is not a single vocab token - THINK_ONLY is inert, "
+                                   "the stride will run over the whole generation. Set "
+                                   "LLAMA_MOE_SYNC_STRIDE_THINK_END to a token this vocab has.\n", t.c_str());
+                } else {
+                    LLAMA_LOG_WARN("MoE stride: reasoning-close token \"%s\" -> id %d\n", t.c_str(), (int) id);
+                }
+            }
+            return id;
+        }();
+        const int32_t tok = (batch_inp.n_tokens == 1 && batch_inp.token) ? batch_inp.token[0] : -1;
+        llama_moe_stride_begin_step(batch_inp.n_tokens == 1, tok, (int32_t) stride_stop_tok);
+    }
+
     const int64_t n_vocab = vocab.n_tokens();
     const int64_t n_embd  = hparams.n_embd_inp();
 

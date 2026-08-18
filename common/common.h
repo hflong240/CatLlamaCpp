@@ -361,12 +361,14 @@ struct common_params_speculative {
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
     }
 
-    uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
+    bool has_draft_mtp() const {
+        return std::any_of(types.begin(), types.end(), [](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
         });
+    }
 
-        return needs_rs_seq ? draft.n_max : 0u;
+    uint32_t need_n_rs_seq() const {
+        return has_draft_mtp() ? draft.n_max : 0u;
     }
 };
 

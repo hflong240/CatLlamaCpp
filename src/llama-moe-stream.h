@@ -241,6 +241,39 @@ void llama_moe_cache_shutdown(void);
 // stall). No-op if budget<=0. Safe to call unconditionally on the single-token decode path.
 int llama_moe_boundary_sync(int budget);
 
+// Per-token freshness stride (LLAMA_MOE_SYNC_STRIDE=N, N<=1 = off, the default).
+//
+// Every N-th single-token decode step keeps the ordinary synchronous expert budget; the N-1 steps in
+// between inspect no routing position at all and fall through to the existing per-position stale reuse
+// (pos_slot), so synchronous loads per token drop by roughly 1/N. This scales a runtime count only - no
+// node is added or removed and no graph is rebuilt, so graph reuse and CUDA-graph replay are unaffected
+// and the "with bs=1" graph-splits count must stay identical to a non-strided run.
+//
+// llama_moe_stride_begin_step must be called exactly ONCE PER DECODE STEP, before the graph runs. The
+// remap callback runs once per MoE layer, so it must never derive the phase itself. Arguments:
+//   single_token - false for any prompt / re-prompt batch: disarms the stride AND restarts the phase.
+//                  This is the only prefill guard that works (with -ub 1 every prompt ubatch looks like
+//                  a single token inside the callback) and the only thing that makes the first generated
+//                  token of turn 2 and later fresh, since c->pos_init is never cleared again.
+//   tok          - this step's input token id, or -1.
+//   stop_tok     - reasoning-close token id, or -1. With LLAMA_MOE_SYNC_STRIDE_THINK_ONLY=1 the stride
+//                  is dropped for the rest of the turn once stop_tok has been fed back in, so only the
+//                  reasoning span is strided and the final answer runs at full freshness.
+//
+// LLAMA_MOE_SYNC_STRIDE_KEEP_LAYERS=K keeps layers with il < K out of the stride (they always sync-load).
+// Default 0 = stride every layer. K=3 on DeepSeek-V4-Flash matches its token-id hash-routed front layers,
+// whose pos_slot donor is the slot the PREVIOUS token's table row used and so carries no locality; that
+// was measured to cost nothing in speed either way, so it is left as an experiment rather than a default.
+//
+// Steps 0 and 1 of every decode span always keep the budget: the one-shot post-sweep VRAM refill runs
+// between them and does not honour slot_pin, so a free-fly step 1 would reuse donors that pos_slot
+// recorded before the refill moved them. A layer also refuses to free-fly when n_sentinel < n_used,
+// where an unusable donor would fall back to a live WRONG expert at full gate weight.
+void llama_moe_stride_begin_step(bool single_token, int32_t tok, int32_t stop_tok);
+
+// True if this step is a free-fly step (no synchronous expert loading). Read by the remap callback.
+bool llama_moe_stride_freefly(void);
+
 // Register the on-disk location of an expert weight tensor so the layer cache can read experts
 // directly from the model file (fread) instead of from the tensor's mmap-backed `data` pointer.
 // This is the "no-mmap takeover" path: it lets the cache avoid touching the OS page cache for

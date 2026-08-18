@@ -3047,6 +3047,78 @@ static void llama_moe_layer_remap_cov_cb(ggml_tensor * dst, const ggml_tensor * 
     llama_moe_layer_remap_cb(dst, a, ith, nth, userdata);
 }
 
+// fork: per-token freshness stride (LLAMA_MOE_SYNC_STRIDE=N, N<=1 = off). Every N-th single-token decode
+// step keeps the ordinary synchronous expert budget; the N-1 steps between it inspect no routing position
+// and fall through to the existing per-position stale reuse (pos_slot). State lives here and is written
+// ONCE PER DECODE STEP from llama_context::decode(); the remap callback runs once per MoE layer and only
+// reads it - a counter advanced in the callback would stride LAYERS inside one token, which is a
+// different experiment that still produces plausible ms/token numbers.
+static std::atomic<bool>     g_stride_freefly{false};
+static std::atomic<uint64_t> g_stride_applied{0}; // layer-steps that really ran free-fly (no-op detector)
+static std::atomic<int>      g_stride_keep_il{0}; // layers with il < this never free-fly
+
+void llama_moe_stride_begin_step(bool single_token, int32_t tok, int32_t stop_tok) {
+    static const int stride = []() {
+        const char * e = getenv("LLAMA_MOE_SYNC_STRIDE");
+        const int    v = e ? atoi(e) : 1;
+        return v > 1 ? v : 1; // <=1 disables; 0 and negatives are not a "skip everything" mode
+    }();
+    static const bool think_only = []() {
+        const char * e = getenv("LLAMA_MOE_SYNC_STRIDE_THINK_ONLY");
+        return e && atoi(e) != 0;
+    }();
+    static const int keep_il = []() {
+        const char * e = getenv("LLAMA_MOE_SYNC_STRIDE_KEEP_LAYERS");
+        const int    v = e ? atoi(e) : 0;
+        return v > 0 ? v : 0; // 0 = stride every layer (default)
+    }();
+    static uint64_t step        = 0;
+    static bool     think_ended = false;
+
+    g_stride_keep_il.store(keep_il, std::memory_order_relaxed);
+
+    // Any multi-token step is a prompt or re-prompt: disarm and restart the phase. This is the only
+    // thing that keeps prompt processing off the stride (the callback's own n_tokens is 1 for every
+    // ubatch of a -ub 1 prompt) and the only thing that makes the first generated token of turn 2 and
+    // later fresh, since c->pos_init is never cleared again after cache creation.
+    if (stride <= 1 || !single_token) {
+        step        = 0;
+        think_ended = false;
+        g_stride_freefly.store(false, std::memory_order_relaxed);
+        return;
+    }
+    // reasoning-close token was just fed back in: the answer span starts here, stay fresh from now on
+    if (think_only && stop_tok >= 0 && tok == stop_tok) {
+        think_ended = true;
+    }
+    if (think_only && think_ended) {
+        g_stride_freefly.store(false, std::memory_order_relaxed);
+        return;
+    }
+    // Steps 0 and 1 always keep the budget: llama_moe_refill_vram_caches() consumes the post-sweep dirty
+    // flag after step 0 and rewrites up to cap experts per layer WITHOUT honouring slot_pin, so a
+    // free-fly step 1 would reuse donors that pos_slot recorded before the refill moved them.
+    const uint64_t s = step++;
+    g_stride_freefly.store(s >= 2 && (s % (uint64_t) stride) != 0, std::memory_order_relaxed);
+
+    if (s == 16) {
+        const uint64_t applied = g_stride_applied.load(std::memory_order_relaxed);
+        if (applied == 0) {
+            LLAMA_LOG_WARN("MoE stride: LLAMA_MOE_SYNC_STRIDE=%d is set but no free-fly layer-step "
+                           "engaged - the per-layer CPU remap is not on this decode graph (it needs "
+                           "LLAMA_MOE_SYNC_BUDGET>0)\n", stride);
+        } else {
+            LLAMA_LOG_WARN("MoE stride: N=%d keep_il=%d - %llu free-fly layer-steps in the first 16 "
+                           "decode steps\n", stride, g_stride_keep_il.load(std::memory_order_relaxed),
+                           (unsigned long long) applied);
+        }
+    }
+}
+
+bool llama_moe_stride_freefly(void) {
+    return g_stride_freefly.load(std::memory_order_relaxed);
+}
+
 // pattern on the per-tensor cache.
 //
 // Concurrency vs the background loader (shares g_moe_layer_mutex): this callback does NOT advance
@@ -3205,6 +3277,31 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         order_n = c->sync_budget; // steady state: only inspect the top-K positions
     }
     if (n_tokens == 1) { c->pos_init = true; }
+
+    // Per-token freshness stride (LLAMA_MOE_SYNC_STRIDE; phase decided once per step in
+    // llama_moe_stride_begin_step): on a free-fly step inspect nothing. The residency loop below then
+    // resolves and loads nothing, so every position takes the second pass's pos_slot donor. Zeroing
+    // order_n rather than sync_budget is deliberate: sync_budget also selects the ordering array above,
+    // decides whether the clamp applies, and gates the threshold branch below, so writing it at runtime
+    // is a mode switch, not a count change - and non-budget mode does not clamp order_n, so it would
+    // load MORE. Layers below keep_il stay fresh (hash-routed front layers have no donor locality), and
+    // a layer with fewer sentinels than routed positions refuses: there an unusable donor falls through
+    // to next_spare, i.e. a live WRONG expert applied at the intended expert's full gate weight.
+    if (!first_decode && order_n > 0 && llama_moe_stride_freefly() &&
+        c->il >= g_stride_keep_il.load(std::memory_order_relaxed)) {
+        if (c->n_sentinel >= (int) n_used) {
+            order_n = 0;
+            g_stride_applied.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                LLAMA_LOG_WARN("MoE stride: refusing to free-fly, n_sentinel=%d < n_used=%d - an unusable "
+                               "donor would fall back to a live wrong expert at full gate weight. The "
+                               "expert-group sweep raises n_sentinel to n_used; do not disable it.\n",
+                               c->n_sentinel, (int) n_used);
+            }
+        }
+    }
 
     // Coverage early-stop (LLAMA_MOE_SYNC_COVER, set via cov_cb into step_cover/step_wexp): sync missing
     // experts weight-descending but STOP once (already-cached + synced) gate-weight coverage reaches the
