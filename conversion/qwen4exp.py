@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Iterable, cast
+import re
+from typing import Any, Callable, Iterable, cast
 
 import torch
 from torch import Tensor
@@ -8,14 +9,140 @@ from torch import Tensor
 import gguf
 import numpy as np
 
-from .base import ModelBase
+from .base import ModelBase, TextModel
 from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 from .qwen3vl import Qwen3VLVisionModel
 
 
+class _Qwen4ExpMtpMixin:
+    """MTP export for Qwen4Exp (Qwen3.8-Flash-Next).
+
+    The checkpoint keeps the draft head under ``mtp.*``:
+
+    * ``mtp.layers.{k}.*``   – a full trunk-style decoder block (attn + MoE + HC)
+    * ``mtp.fc_embedding`` / ``mtp.fc_hidden`` – fused side-by-side into ``eh_proj``
+    * ``mtp.pre_fc_norm_embedding`` / ``mtp.pre_fc_norm_hidden`` – enorm / hnorm
+    * ``mtp.hyper_connection_mixer.*`` – per-block output mixer (nextn.hc_head_*)
+
+    We extend ``block_count`` by the number of MTP layers and remap the HF names so
+    the existing tensor_map handles them, following the _Qwen35MtpMixin pattern.
+    """
+
+    hparams: dict[str, Any]
+    model_arch: gguf.MODEL_ARCH
+    gguf_writer: gguf.GGUFWriter
+    block_count: int
+    tensor_map: gguf.TensorNameMap
+    no_mtp: bool
+    mtp_only: bool
+    _original_block_count: int | None = None
+    _mtp_fc_embedding: Tensor | None = None
+    _mtp_fc_hidden: Tensor | None = None
+    _mtp_fc_bid: int = 0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.block_count = self.hparams["num_hidden_layers"]
+        if not self.no_mtp:
+            self.block_count += self.hparams.get("mtp_num_hidden_layers", 0)
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        hparams = {**self.hparams, **self.hparams.get("text_config", {})}
+        key = next((k for k in ["n_layers", "num_hidden_layers", "n_layer", "num_layers"] if k in hparams), None)
+        type(self)._original_block_count = hparams.get(key)
+        return super().index_tensors(remote_hf_model_id=remote_hf_model_id)  # ty: ignore[unresolved-attribute]
+
+    @classmethod
+    def filter_tensors(cls, item):
+        assert cls._original_block_count is not None
+        if (titem := TextModel.filter_tensors(item)) is None:
+            return None
+        name, gen = titem
+
+        if name.startswith("model.mtp."):
+            name = name.replace("model.", "", 1)
+
+        if name.startswith("mtp."):
+            if cls.no_mtp:
+                return None
+            n_layer = cls._original_block_count
+            parts = name.split(".", 3)
+
+            if len(parts) >= 4 and parts[1] == "layers" and parts[2].isdecimal():
+                mtp_idx = int(parts[2])
+                name = f"model.layers.{n_layer + mtp_idx}.{parts[3]}"
+            elif len(parts) == 3:
+                if parts[1] == "fc_embedding":
+                    name = f"model.layers.{n_layer}.eh_proj_embedding.{parts[2]}"
+                elif parts[1] == "fc_hidden":
+                    name = f"model.layers.{n_layer}.eh_proj_hidden.{parts[2]}"
+                elif parts[1] == "pre_fc_norm_embedding":
+                    name = f"model.layers.{n_layer}.enorm.{parts[2]}"
+                elif parts[1] == "pre_fc_norm_hidden":
+                    name = f"model.layers.{n_layer}.hnorm.{parts[2]}"
+                elif parts[1] == "hyper_connection_mixer":
+                    name = f"model.layers.{n_layer}.hyper_connection_mixer.{parts[2]}"
+        elif cls.mtp_only:
+            keep = name in (
+                "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+                "embed_tokens.weight", "norm.weight",
+            )
+            if not keep:
+                return None
+
+        return name, gen
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Fuse fc_embedding + fc_hidden → eh_proj (order-independent)
+        if name.endswith(".eh_proj_embedding.weight"):
+            self._mtp_fc_embedding = data_torch
+            self._mtp_fc_bid = bid if bid is not None else 0
+            if self._mtp_fc_hidden is not None:
+                yield from self._fuse_eh_proj()
+            return
+        if name.endswith(".eh_proj_hidden.weight"):
+            self._mtp_fc_hidden = data_torch
+            if self._mtp_fc_embedding is not None:
+                yield from self._fuse_eh_proj()
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)  # ty: ignore[unresolved-attribute]
+
+    def _fuse_eh_proj(self) -> Iterable[tuple[str, Tensor]]:
+        assert self._mtp_fc_embedding is not None and self._mtp_fc_hidden is not None
+        # cat dim=1: the gguf framework transposes weights before writing, so dim=1 here
+        # becomes [2*n_embd, n_embd] in the GGUF, matching the C++ create_tensor shape.
+        eh_proj = torch.cat([self._mtp_fc_embedding, self._mtp_fc_hidden], dim=1)
+        self._mtp_fc_embedding = None
+        self._mtp_fc_hidden = None
+        gguf_name = self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, self._mtp_fc_bid, ".weight")
+        yield (gguf_name, eh_proj)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()  # ty: ignore[unresolved-attribute]
+        if self.no_mtp:
+            return
+        if (n := self.hparams.get("mtp_num_hidden_layers", 0)) > 0:
+            self.gguf_writer.add_nextn_predict_layers(n)
+
+    def prepare_metadata(self, vocab_only: bool):
+        from_dir = self.fname_out.is_dir()
+        super().prepare_metadata(vocab_only=vocab_only)  # ty: ignore[unresolved-attribute]
+
+        if not self.mtp_only or not from_dir:
+            return
+
+        output_type: str = self.ftype.name.partition("_")[2]  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+        fname_default: str = gguf.naming_convention(
+            self.metadata.name, self.metadata.basename, self.metadata.finetune,                  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+            self.metadata.version, size_label=None, output_type=output_type, model_type=None)    # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+        self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
+
+
 @ModelBase.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
 @ModelBase.example("Qwen/Qwen3.8-Flash-Next")
-class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
+class Qwen4ExpTextModel(_Qwen4ExpMtpMixin, _Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     """Qwen3.8-Flash-Next.
 
     Shares the Qwen3.5 gated delta net and interleaved mrope, and adds three things:
@@ -25,9 +152,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
+    supports_mtp_export = True
+    no_mtp = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

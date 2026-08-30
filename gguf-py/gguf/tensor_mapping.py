@@ -2468,6 +2468,16 @@ class TensorNameMap:
             MODEL_TENSOR.PLE_CONV1D: (
                 "model.layers.{bid}.ple.conv1d",
             ),
+            # MTP HC head (per-block, only present on MTP layers after remap)
+            MODEL_TENSOR.NEXTN_HC_HEAD_NORM: (
+                "model.layers.{bid}.hyper_connection_mixer.hc_norm",
+            ),
+            MODEL_TENSOR.NEXTN_HC_HEAD_DOWN: (
+                "model.layers.{bid}.hyper_connection_mixer.input_mix_weight_down",
+            ),
+            MODEL_TENSOR.NEXTN_HC_HEAD_UP: (
+                "model.layers.{bid}.hyper_connection_mixer.input_mix_weight_up",
+            ),
         },
     }
 

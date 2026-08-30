@@ -344,7 +344,6 @@ struct llama_hparams {
 
     // dimension of output embeddings
     uint32_t n_embd_out() const;
-
     // dimension of key/value embeddings for each head (per layer)
     uint32_t n_embd_head_k(uint32_t il = 0) const;
     uint32_t n_embd_head_v(uint32_t il = 0) const;
