@@ -14,6 +14,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -2025,6 +2026,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // per-group ids tensor, so nothing is ever dropped. Only useful when capacity < n_expert (otherwise
     // there is one group and the plain path is already lossless).
     bool moe_prefill_sweep = false;
+    // A multi-token batch only needs the sweep if its expert union can OVERFLOW the cache. MTP /
+    // speculative verify batches are k+1 fused decode steps, not prefill: their union fits, so the
+    // ordinary remap is lossless (see the threshold override below) and - unlike the sweep - it does
+    // not leave every cache holding an arbitrary group, so it never triggers the post-sweep VRAM
+    // refill. n_tokens * n_expert_used is the zero-overlap worst case, which is what a static graph
+    // decision has to assume: the real unique count is only known inside the callback.
+    bool moe_union_fits = false;
     if (moe_lc && moe_stream && moe_stream_async && n_tokens > 1 && llama_moe_prefill_sweep_enabled()) {
         const int cap = llama_moe_layer_cache_capacity(moe_lc);
         // Every projection must resolve to a device cache tensor. If any does not, mm_id_exps would fall
@@ -2034,7 +2042,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                             (!gate_exps    || llama_moe_layer_cache_dev(moe_lc, gate_exps))    &&
                             (!up_exps      || llama_moe_layer_cache_dev(moe_lc, up_exps))      &&
                             (!down_exps    || llama_moe_layer_cache_dev(moe_lc, down_exps));
-        moe_prefill_sweep = cap > 0 && cap < (int) n_expert && dev_ok;
+        moe_union_fits    = cap > 0 && (int64_t) n_tokens * n_expert_used <= (int64_t) cap;
+        moe_prefill_sweep = cap > 0 && cap < (int) n_expert && dev_ok && !moe_union_fits;
+        if (moe_prefill_sweep && n_tokens <= 64 && llama_moe_layer_cache_decoded(moe_lc)) {
+            // Small multi-token batch arriving after decode has started: a speculative/MTP verify
+            // batch too wide for the cache. Every such step sweeps AND dirties the caches, so the next
+            // single-token decode pays a full VRAM refill - seconds per accepted block. Say so once; it
+            // is a config problem (draft length vs capacity), not something the graph can fix. Gated on
+            // "already decoded" so warmup and the fork's measurement ubatches do not false-fire.
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                LLAMA_LOG_WARN("MoE: %d-token batch exceeds the expert cache union bound (%d tokens x %d "
+                               "used > cap %d), so it takes the prefill expert-group sweep and forces a "
+                               "VRAM refill before the next decode token. If this is speculative/MTP "
+                               "decoding, lower --draft-max to at most %d (or raise LLAMA_MOE_CACHE_CAP).\n",
+                               (int) n_tokens, (int) n_tokens, (int) n_expert_used, cap,
+                               cap / (int) n_expert_used > 1 ? cap / (int) n_expert_used - 1 : 1);
+            }
+        }
     }
     if (moe_lc && moe_stream_async) {
         const int64_t n_sel = selected_experts->ne[0] * selected_experts->ne[1];
@@ -2066,7 +2091,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (moe_prefill_sweep) {
             // ids are built per expert group further down; leave moe_cache_ids null
         } else if (n_tokens > 1 || decode_cpu_sync) {
-            moe_cache_ids = llama_moe_layer_cache_remap(moe_lc, ctx0, selected_experts, weights, moe_sync_threshold, moe_sync_budget);
+            // A small multi-token batch that skipped the sweep (MTP/speculative verify) must not drop:
+            // for n_tokens>1 the remap sends unresolved positions to the ZERO sentinel, not to a stale
+            // expert, and here that would zero part of the very logits the verify accepts/rejects on.
+            // Threshold 0 makes the miss-fraction test (n_miss > thr * n_unique) fire on any miss, so
+            // every miss is sync-loaded; the union bound above guarantees they all fit the slots.
+            const float thr = moe_union_fits ? 0.0f : moe_sync_threshold;
+            moe_cache_ids = llama_moe_layer_cache_remap(moe_lc, ctx0, selected_experts, weights, thr, moe_sync_budget);
         } else if (ok_shape) {
             // decode: device get_rows over the [1,n_expert] STALE table (no CPU split). Flatten to
             // 1D so get_rows uses the plain (non-batched) form, valid for any token count. Unlike the

@@ -445,6 +445,10 @@ void llama_moe_layer_prefetch(int il, const int32_t * ids, int n_ids);
 // Resident slot count of this layer cache (excludes the zero sentinel slots).
 int llama_moe_layer_cache_capacity(const llama_moe_layer_cache * c);
 
+// Has this cache already served a single-token (decode) step? Used to tell a real prefill/warmup
+// ubatch from a speculative-verify batch, which is a multi-token batch arriving mid-generation.
+bool llama_moe_layer_cache_decoded(const llama_moe_layer_cache * c);
+
 ggml_tensor * llama_moe_layer_cache_remap_group(llama_moe_layer_cache * c,
                                                 ggml_context *          ctx0,
                                                 ggml_tensor *           selected_experts,
@@ -479,7 +483,26 @@ void llama_moe_set_compute_reserve(size_t bytes);
 
 // Publish the MEASURED device-side compute-buffer size and invalidate the expert caches so the next
 // graph build re-sizes them against it instead of LLAMA_MOE_VRAM_RESERVE_MB's flat guess. Returns true
-// if anything was invalidated, i.e. the caller must re-run its graph reserve. No-op when the capacity is
-// pinned by hand (LLAMA_MOE_CACHE_CAP), when the per-tensor compaction pools are in use, or when
-// LLAMA_MOE_AUTOCAP_RECAP=0. Call during startup only, before llama_moe_prefill_once.
-bool llama_moe_recap_from_compute_reserve(size_t compute_bytes);
+// if anything was invalidated, i.e. the caller must re-run its graph reserve. `sched` is the calling
+// context's scheduler and scopes the invalidation to the caches THAT context built - the cache map is
+// process-global, so without it a draft/embedding context created later would free the main model's
+// caches out from under its live graphs. No-op when the capacity is pinned by hand
+// (LLAMA_MOE_CACHE_CAP), when the per-tensor compaction pools are in use, when this context owns no
+// caches, or when LLAMA_MOE_AUTOCAP_RECAP=0. Call during startup only, before llama_moe_prefill_once.
+bool llama_moe_recap_from_compute_reserve(ggml_backend_sched_t sched, size_t compute_bytes);
+
+// True while llama_moe_recap_from_compute_reserve is still going to fire for the next context that
+// reserves a graph: auto capacity (no LLAMA_MOE_CACHE_CAP), recap enabled, nothing measured yet. Lets the
+// caller recognise its first reserve as a MEASUREMENT pass before it runs. Cannot account for the
+// compute-buffer size being 0 or for the context owning no caches, so a "pending" recap can still decline
+// - which is why llama_moe_cache_defer_prewarm repairs rather than assumes.
+bool llama_moe_recap_pending(void);
+
+// While deferred, a newly built layer cache prewarms ONE slot instead of all `capacity` of them. The
+// measurement pass's caches are dropped by the recap, and filling them first copies `capacity` experts per
+// layer into VRAM for a cache nothing ever computes with (measured 14.1 GiB / 2.7s of startup on
+// qwen3.8-flash-next). Slot 0 is still filled so stale_table keeps its "every expert maps to a real
+// settled slot" invariant. Clearing the flag completes the prewarm of any deferred cache that survived, so
+// a recap that declines after all is still correct - just as slow as before.
+// LLAMA_MOE_DEFER_PREWARM=0 turns the deferral off (diagnostic: A/B it against the old behaviour).
+void llama_moe_cache_defer_prewarm(bool defer);

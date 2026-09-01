@@ -18,6 +18,7 @@
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 #include "llama-impl.h"
+#include "llama.h" // fork: llama_moe_verify_gate_* are exported to tools (server)
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -66,10 +67,93 @@ static inline void llama_moe_prefetch(const void * addr, size_t bytes) {
 #endif
 }
 
-// Allocate a host buffer and lock it into physical RAM (never paged out), so reads from it never
-// fault to disk. Returns nullptr on failure (caller falls back to mmap source). Used by the RAM
-// residency tier to hold high-weight experts.
-static void * llama_moe_ram_alloc(size_t bytes) {
+// Bytes the RAM tier asked to pin, split three ways: pinned (the lock succeeded), pageable (the lock
+// failed and we kept the pool anyway) and refused (the lock failed and we handed the bytes straight
+// back rather than keep a pool the OS can page out).
+//
+// Why "refused" is the default outcome: the pool duplicates bytes the model file on disk already holds.
+// Pinned, it is a real memory tier. Unpinned, it is ANONYMOUS committed memory, and anonymous memory has
+// exactly one place to go when the OS wants the frames - the pagefile. So an unpinned pool converts an
+// eviction that would have been FREE (drop a file-backed page, re-read it from the model file later, on
+// the drive the model already lives on) into a pagefile WRITE plus a pagefile read, usually on a
+// different drive. Measured on 64 GB / a 73 GB expert file: a 36.4 GiB unpinned pool, pagefile peak
+// 30.9 GB, system commit charge 41 GiB above physical RAM.
+//
+// Note on WHY the lock fails, because the comment that used to sit here named the wrong privilege:
+// VirtualLock does not need SeLockMemoryPrivilege (that one is for large pages / AWE). Its ceiling is the
+// process MINIMUM WORKING SET - MSDN: the most pages a process can lock is its minimum working set minus
+// a small overhead. The default minimum is a couple of hundred KiB, so a multi-GiB lock fails
+// deterministically, not intermittently. llama_moe_ram_quota_reserve raises that ceiling first.
+static std::atomic<uint64_t> g_moe_ram_lock_ok{0};
+static std::atomic<uint64_t> g_moe_ram_lock_fail{0};
+static std::atomic<uint64_t> g_moe_ram_lock_refused{0};
+
+// Raise the process minimum working set so the pool can be pinned? OFF BY DEFAULT, and it must stay
+// that way until the bugcheck below is understood.
+//
+// Observed on Windows 10 19045 / 64 GiB: asking for a ~38 GiB HARD minimum working set (36 GiB pool +
+// slack) and then locking it took the machine down with 0x0000003B SYSTEM_SERVICE_EXCEPTION, first
+// argument 0xC00000A1 = STATUS_QUOTA_EXCEEDED - i.e. the kernel raised a quota exception while servicing
+// the request. Not deterministic: the same request had been granted, and the pool fully pinned, on
+// several earlier runs of the same build. A knob that can bugcheck the host is not a default no matter
+// what it does for pagefile traffic, and a non-deterministic one cannot be validated by testing it once.
+//
+// Turning it on again (LLAMA_MOE_RAM_QUOTA=1) should be paired with a hard minimum that stays a small
+// fraction of physical RAM; the sizes that provoked this were most of the box.
+static bool llama_moe_ram_quota_enabled(void) {
+    static const bool on = moe_env_on("LLAMA_MOE_RAM_QUOTA", false);
+    return on;
+}
+
+// Keep a pool whose pin failed? Defaults to the quota state above, because the two only make sense
+// together: VirtualLock's ceiling IS the minimum working set, so requiring a pin without raising it
+// refuses every multi-GiB pool and silently deletes the whole RAM tier. So with the quota raise off
+// (the default) this is off too, which is exactly the pre-fix behavior - an unpinned, pageable pool.
+// Set LLAMA_MOE_RAM_REQUIRE_PIN explicitly to override either way.
+static bool llama_moe_ram_require_pin(void) {
+    static const bool on = moe_env_on("LLAMA_MOE_RAM_REQUIRE_PIN", llama_moe_ram_quota_enabled());
+    return on;
+}
+
+// Record one pin attempt we are KEEPING and WARN the first time one failed, so a pageable pool shows up
+// in the log instead of only as throughput.
+static void llama_moe_ram_lock_record(bool ok, size_t bytes) {
+    if (ok) {
+        g_moe_ram_lock_ok.fetch_add(bytes, std::memory_order_relaxed);
+        return;
+    }
+    g_moe_ram_lock_fail.fetch_add(bytes, std::memory_order_relaxed);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        LLAMA_LOG_WARN("MoE stream: keeping an UNPINNED host expert pool (LLAMA_MOE_RAM_REQUIRE_PIN=0). "
+                       "It is pageable anonymous memory, so the OS may write it to the pagefile and read "
+                       "it back - which costs more than reading those experts from the model file, and "
+                       "writes to the pagefile's drive for bytes the model file already holds.\n");
+    }
+}
+
+// Drop `bytes` from whichever side of the gauge still has room for it. The allocation that owned them
+// did not record which side it landed on, and the pin outcome is uniform in practice (it depends on the
+// process working-set quota, not on the individual range), so charging the pinned side first is exact
+// whenever every attempt agreed and off by at most one pool otherwise.
+static void llama_moe_ram_lock_forget(size_t bytes) {
+    uint64_t ok = g_moe_ram_lock_ok.load(std::memory_order_relaxed);
+    const uint64_t take = ok < (uint64_t) bytes ? ok : (uint64_t) bytes;
+    if (take) { g_moe_ram_lock_ok.fetch_sub(take, std::memory_order_relaxed); }
+    const uint64_t rest = (uint64_t) bytes - take;
+    if (rest) {
+        uint64_t bad = g_moe_ram_lock_fail.load(std::memory_order_relaxed);
+        g_moe_ram_lock_fail.fetch_sub(bad < rest ? bad : rest, std::memory_order_relaxed);
+    }
+}
+
+// Allocate a host buffer and lock it into physical RAM, so reads from it never fault to disk AND the OS
+// can never write it to the pagefile. Returns nullptr if the allocation fails, or if the LOCK fails and
+// LLAMA_MOE_RAM_REQUIRE_PIN is on (the default) - the caller then runs without a RAM tier for that
+// projection and reads those experts from the model file instead. *pinned reports the lock outcome, for
+// the caller that decides whether dropping the page-cache copy is still a win.
+static void * llama_moe_ram_alloc(size_t bytes, bool * pinned) {
+    if (pinned) { *pinned = false; }
     if (bytes == 0) {
         return nullptr;
     }
@@ -78,25 +162,48 @@ static void * llama_moe_ram_alloc(size_t bytes) {
     if (!p) {
         return nullptr;
     }
-    // best-effort lock; requires SeLockMemoryPrivilege for large sizes. If it fails the memory is
-    // still committed/usable (just pageable) - reads still avoid the mmap file, only risk is a soft
-    // page fault to the pagefile under pressure, far cheaper than the model-file random read.
-    (void) VirtualLock(p, bytes);
-    return p;
+    const bool ok = VirtualLock(p, bytes) != 0;
 #else
     void * p = nullptr;
     if (posix_memalign(&p, 4096, bytes) != 0 || !p) {
         return nullptr;
     }
-    (void) mlock(p, bytes);
-    return p;
+    const bool ok = mlock(p, bytes) == 0;
 #endif
+    if (!ok && llama_moe_ram_require_pin()) {
+        // Hand the bytes straight back. Keeping them would trade a free file-backed eviction for a
+        // pagefile round trip (see the g_moe_ram_lock_* comment above), and it would also leave tens of
+        // GiB of commit charge behind for a tier that cannot deliver what it promises.
+        g_moe_ram_lock_refused.fetch_add(bytes, std::memory_order_relaxed);
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            LLAMA_LOG_WARN("MoE stream: refusing the host expert pool - a %.0f MiB allocation could not be "
+                           "pinned into physical RAM, so it would be pageable anonymous memory that the OS "
+                           "can only evict to the pagefile, for bytes the model file already holds. Running "
+                           "without the RAM tier: those experts are read from the model file instead, which "
+                           "is a read on the model's own drive and a write nowhere. To fit a pinnable pool "
+                           "lower LLAMA_MOE_RAM_CAP or raise LLAMA_MOE_RAM_RESERVE_MB; to keep an unpinned "
+                           "pool anyway set LLAMA_MOE_RAM_REQUIRE_PIN=0.\n", bytes/(1024.0*1024.0));
+        }
+#ifdef _WIN32
+        VirtualFree(p, 0, MEM_RELEASE);
+#else
+        free(p);
+#endif
+        return nullptr;
+    }
+    llama_moe_ram_lock_record(ok, bytes);
+    if (pinned) { *pinned = ok; }
+    return p;
 }
 
 static void llama_moe_ram_free(void * p, size_t bytes) {
     if (!p) {
         return;
     }
+    // keep the pinned/pageable figures a LIVE gauge, not a running total: the startup auto-capacity
+    // recap frees every pool and rebuilds it, so counting allocations only would report 2x the pool.
+    llama_moe_ram_lock_forget(bytes);
 #ifdef _WIN32
     (void) VirtualUnlock(p, bytes);
     VirtualFree(p, 0, MEM_RELEASE);
@@ -125,6 +232,275 @@ static uint64_t llama_moe_avail_ram(void) {
 #else
     return 0;
 #endif
+}
+
+static void llama_moe_commit_charge(uint64_t * charge, uint64_t * phys_total); // defined just below
+
+// Raise this process's MINIMUM WORKING SET so the RAM tier can actually LOCK `want_bytes` into physical
+// memory, and report how much the OS agreed to.
+//
+// This is the piece that was missing all along. VirtualLock's ceiling is the minimum working set (MSDN:
+// the most pages a process can lock is its minimum working set minus a small overhead), which defaults to
+// a couple of hundred KiB - so every multi-GiB pin attempt failed deterministically and the "locked host
+// RAM" tier had always been ordinary pageable memory. Raising the minimum needs SE_INC_WORKING_SET_NAME,
+// which normal users have held by default since Vista; it just has to be ENABLED in the token, which
+// nothing here used to do. A granted HARD minimum is a commitment that those frames stay resident, and
+// resident frames are never written to the pagefile - which is the whole point.
+//
+// The OS is also the only honest answer to "how much fits". Computing it means guessing at terms we
+// cannot see (other processes, the page-cache working set of a 73 GB model file, the driver's own host
+// allocations), so instead: ask for the whole amount and binary-search down until the OS grants it. No
+// estimation coefficients, and the answer comes from the component that gets to decide.
+//
+// Idempotent - the first caller's request wins and later callers get that answer, because the pools are
+// created one layer at a time and the lock budget is process-wide (see the call site). Returns bytes
+// granted. When there is no answer to be had it returns `want_bytes` unchanged, meaning "no information,
+// do not clamp on my account": on non-Windows mlock is bounded by RLIMIT_MEMLOCK, which a process cannot
+// raise for itself, so there the pin result is the only signal and the caller learns it that way.
+static uint64_t llama_moe_ram_quota_reserve(uint64_t want_bytes) {
+    static uint64_t granted = 0;
+    static bool     done    = false;
+    if (done) { return granted; }
+    done    = true;
+    granted = want_bytes;
+    if (want_bytes == 0) { return 0; }
+    // Baseline for the "host pool" line printed once the pools exist: the commit charge BEFORE any pool is
+    // allocated. Everything in it is anonymous memory that is not ours to shrink, so it is the honest
+    // "everything else" term - and if it already sits near physical RAM then no pool size is safe and the
+    // pagefile traffic is not coming from us. Subtracting the pool from the later figure cannot tell those
+    // two apart, which is why this is sampled here instead of inferred.
+    {
+        uint64_t charge = 0, phys = 0;
+        llama_moe_commit_charge(&charge, &phys);
+        const double gib = 1024.0*1024.0*1024.0;
+        LLAMA_LOG_WARN("MoE stream: before host pools - system commit charge %.1f GiB of %.1f GiB physical, "
+                       "avail phys %.1f GiB; the pool wants %.1f GiB.\n",
+                       charge/gib, phys/gib, llama_moe_avail_ram()/gib, want_bytes/gib);
+    }
+    // Default path: leave the minimum working set alone. See llama_moe_ram_quota_enabled for why this is
+    // opt-in (it bugchecked the host once with STATUS_QUOTA_EXCEEDED). Without it a multi-GiB pool cannot
+    // be pinned, so the pool stays pageable - the pre-fix behavior.
+    if (!llama_moe_ram_quota_enabled()) {
+        LLAMA_LOG_WARN("MoE stream: not raising the process minimum working set (LLAMA_MOE_RAM_QUOTA is "
+                       "off by default), so the host expert pool stays pageable anonymous memory that the "
+                       "OS can write to the pagefile. LLAMA_MOE_RAM_QUOTA=1 pins it instead - EXPERIMENTAL, "
+                       "it has been seen to bugcheck Windows with STATUS_QUOTA_EXCEEDED.\n");
+        return granted; // want_bytes, i.e. no clamp: the pin result is the only signal, as before
+    }
+#ifdef _WIN32
+    // Enable SE_INC_WORKING_SET_NAME in this process's token. advapi32 is resolved on demand so this adds
+    // no link dependency - same reason as the DXGI probe below: fork-local diagnostics and knobs must not
+    // change what upstream links against.
+    {
+        typedef BOOL (WINAPI * open_tok_fn)(HANDLE, DWORD, PHANDLE);
+        typedef BOOL (WINAPI * lookup_fn)(LPCSTR, LPCSTR, PLUID);
+        typedef BOOL (WINAPI * adjust_fn)(HANDLE, BOOL, PTOKEN_PRIVILEGES, DWORD, PTOKEN_PRIVILEGES, PDWORD);
+        if (HMODULE adv = LoadLibraryA("advapi32.dll")) {
+            open_tok_fn open_tok = (open_tok_fn) (void *) GetProcAddress(adv, "OpenProcessToken");
+            lookup_fn   lookup   = (lookup_fn)   (void *) GetProcAddress(adv, "LookupPrivilegeValueA");
+            adjust_fn   adjust   = (adjust_fn)   (void *) GetProcAddress(adv, "AdjustTokenPrivileges");
+            HANDLE tok = nullptr;
+            if (open_tok && lookup && adjust &&
+                open_tok(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &tok) && tok) {
+                LUID luid;
+                if (lookup(nullptr, "SeIncreaseWorkingSetPrivilege", &luid)) {
+                    TOKEN_PRIVILEGES tp;
+                    tp.PrivilegeCount           = 1;
+                    tp.Privileges[0].Luid       = luid;
+                    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                    (void) adjust(tok, FALSE, &tp, 0, nullptr, nullptr); // best effort
+                }
+                CloseHandle(tok);
+            }
+        }
+    }
+    SIZE_T ws_min = 0, ws_max = 0;
+    DWORD  ws_flags = 0;
+    if (!GetProcessWorkingSetSizeEx(GetCurrentProcess(), &ws_min, &ws_max, &ws_flags)) {
+        return granted; // unmeasurable: let the pin result speak instead
+    }
+    // Headroom above the pool for everything else this process must keep resident (non-expert weights,
+    // KV cache, the pinned H2D staging arena, the runtime). Without it the pool's own lock can consume
+    // the whole quota and then the code that has to run against it gets trimmed instead.
+    const uint64_t slack = 2048ull * 1024 * 1024;
+    auto try_set = [&](uint64_t extra) {
+        const SIZE_T req_min = (SIZE_T) ((uint64_t) ws_min + extra + slack);
+        const SIZE_T req_max = (SIZE_T) (req_min + slack); // soft max, so growth above it is still allowed
+        return SetProcessWorkingSetSizeEx(GetCurrentProcess(), req_min, req_max,
+                                          QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) != 0;
+    };
+    // Probe the whole request first. The common case is that the OS just says yes, and a bisection that
+    // starts at want/2 can never come back up to want in a bounded number of steps - 12 halvings of 35 GiB
+    // still leaves it ~9 MiB short, which is harmless for the pool but makes the log claim the OS "granted
+    // only 35.7 GiB of the 35.7 GiB" it asked for.
+    uint64_t best = 0;
+    if (try_set(want_bytes)) {
+        best = want_bytes;
+    } else {
+        uint64_t lo = 0, hi = want_bytes - 1; // lo = known grantable, hi = upper bound still in play
+        for (int it = 0; it < 12 && lo < hi; ++it) {
+            const uint64_t mid = lo + (hi - lo + 1) / 2;
+            if (try_set(mid)) { best = mid; lo = mid; } else { hi = mid - 1; }
+        }
+        // The search may have ended on a REFUSED attempt, which leaves the quota wherever the last accepted
+        // call put it - not necessarily `best`. Re-apply so the granted figure and the live quota agree.
+        if (best > 0) { (void) try_set(best); }
+    }
+    granted = best;
+    const double gib = 1024.0*1024.0*1024.0;
+    if (granted >= want_bytes) {
+        LLAMA_LOG_INFO("MoE stream: raised the process minimum working set to cover a %.1f GiB pinned host "
+                       "expert pool (hard minimum, so the OS cannot trim those frames to the pagefile).\n",
+                       want_bytes/gib);
+    } else {
+        LLAMA_LOG_WARN("MoE stream: the OS granted only %.1f GiB of the %.1f GiB minimum working set the host "
+                       "expert pool asked for, so the pool is capped there. The experts that no longer fit "
+                       "are read from the model file instead - slower per miss, but no pagefile traffic.\n",
+                       granted/gib, want_bytes/gib);
+    }
+#endif
+    return granted;
+}
+
+// System-wide commit charge and physical total, in bytes; both 0 if unmeasurable. A commit charge
+// above physical total means the OS is backing part of the working set with the pagefile - invisible
+// to the VRAM/RAM audits and to available-RAM readings, but it shows up as throughput.
+static void llama_moe_commit_charge(uint64_t * charge, uint64_t * phys_total) {
+    *charge     = 0;
+    *phys_total = 0;
+#ifdef _WIN32
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) {
+        // ullTotalPageFile is the commit LIMIT (RAM + pagefile), ullAvailPageFile what is left of it.
+        *charge     = ms.ullTotalPageFile - ms.ullAvailPageFile;
+        *phys_total = ms.ullTotalPhys;
+    }
+#endif
+}
+
+// WDDM video-memory spill probe (Windows only; all-zero elsewhere).
+//
+// Why this exists: the VRAM AUDIT's "free" figure cannot answer whether the expert cache overflowed -
+// on this platform it reads near zero at any cache size (see the comment on llama_moe_vram_audit). When
+// the driver runs out of real VRAM it does not fail an allocation, it silently starts backing part of
+// this process's video memory with host RAM over PCIe. DXGI reports that split directly, per process:
+//   LOCAL     = real device memory this process is using, against the budget the driver grants it
+//   NON_LOCAL = host memory this process is using AS video memory - non-zero means we spilled
+// So NON_LOCAL usage is the one number that turns "did we overflow VRAM" from a guess into a reading.
+//
+// Confound to keep in mind when reading it: our own pinned H2D staging arena is host memory visible to
+// the GPU, so a small steady NON_LOCAL figure (arena-sized) is expected and is not a cache overflow.
+// What matters is NON_LOCAL growing with the expert cache or growing during decode.
+//
+// dxgi.dll is loaded on demand so nothing links against it: this is a fork-local diagnostic and must
+// not add a build dependency. Adapter selection is by closest DedicatedVideoMemory to `dev_total` (the
+// figure ggml already reports for the compute device), which is unambiguous on a single-GPU box and
+// picks the right one on mixed-size multi-GPU. Returns false if unmeasurable.
+struct llama_moe_vram_seg {
+    uint64_t local_used     = 0;
+    uint64_t local_budget   = 0;
+    uint64_t nonlocal_used  = 0;
+    uint64_t nonlocal_budget = 0;
+};
+
+#if defined(_WIN32) && defined(__has_include)
+#  if __has_include(<dxgi1_4.h>)
+#    define LLAMA_MOE_HAVE_DXGI 1
+#  endif
+#endif
+
+#ifdef LLAMA_MOE_HAVE_DXGI
+#include <dxgi1_4.h>
+
+static bool llama_moe_vram_segments(uint64_t dev_total, llama_moe_vram_seg * out) {
+    // Kill switch. This is diagnostics-only: it brings DXGI/COM into a process that otherwise only talks
+    // to CUDA, so it has to be possible to take back out without a rebuild - both to bisect a crash
+    // against it and because a probe is never worth breaking a run for.
+    if (!moe_env_on("LLAMA_MOE_VRAM_PROBE", true)) {
+        return false;
+    }
+    typedef HRESULT (WINAPI * create_factory_fn)(REFIID, void **);
+    // one-time resolve; both statics stay put for the process lifetime (the DLL is never unloaded)
+    static create_factory_fn create = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        if (HMODULE h = LoadLibraryA("dxgi.dll")) {
+            create = (create_factory_fn) (void *) GetProcAddress(h, "CreateDXGIFactory1");
+        }
+    }
+    if (!create) {
+        return false;
+    }
+    IDXGIFactory1 * factory = nullptr;
+    if (FAILED(create(__uuidof(IDXGIFactory1), (void **) &factory)) || !factory) {
+        return false;
+    }
+    IDXGIAdapter3 * best = nullptr;
+    uint64_t best_delta = UINT64_MAX;
+    for (UINT i = 0;; ++i) {
+        IDXGIAdapter1 * a1 = nullptr;
+        if (FAILED(factory->EnumAdapters1(i, &a1)) || !a1) {
+            break;
+        }
+        DXGI_ADAPTER_DESC1 desc;
+        IDXGIAdapter3 * a3 = nullptr;
+        if (SUCCEEDED(a1->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            SUCCEEDED(a1->QueryInterface(__uuidof(IDXGIAdapter3), (void **) &a3)) && a3) {
+            const uint64_t vram  = (uint64_t) desc.DedicatedVideoMemory;
+            const uint64_t delta = vram > dev_total ? vram - dev_total : dev_total - vram;
+            if (delta < best_delta) {
+                if (best) { best->Release(); }
+                best_delta = delta;
+                best       = a3;
+            } else {
+                a3->Release();
+            }
+        }
+        a1->Release();
+    }
+    factory->Release();
+    if (!best) {
+        return false;
+    }
+    DXGI_QUERY_VIDEO_MEMORY_INFO loc, non;
+    const bool ok = SUCCEEDED(best->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &loc)) &&
+                    SUCCEEDED(best->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &non));
+    best->Release();
+    if (!ok) {
+        return false;
+    }
+    out->local_used       = loc.CurrentUsage;
+    out->local_budget     = loc.Budget;
+    out->nonlocal_used    = non.CurrentUsage;
+    out->nonlocal_budget  = non.Budget;
+    return true;
+}
+#else
+static bool llama_moe_vram_segments(uint64_t dev_total, llama_moe_vram_seg * out) {
+    (void) dev_total; (void) out;
+    return false;
+}
+#endif
+
+// Highest NON_LOCAL usage seen so far, so a spill that only happens mid-decode is still reported after
+// the fact rather than only while it is happening.
+static std::atomic<uint64_t> g_moe_vram_spill_peak{0};
+
+// Sample the probe and fold it into the peak. Returns false if unmeasurable. Cheap enough for the
+// per-token path only at a low duty cycle - callers rate-limit it (a DXGI query is a COM call, not a
+// register read).
+static bool llama_moe_vram_spill_sample(uint64_t dev_total, llama_moe_vram_seg * out) {
+    if (!llama_moe_vram_segments(dev_total, out)) {
+        return false;
+    }
+    uint64_t prev = g_moe_vram_spill_peak.load(std::memory_order_relaxed);
+    while (out->nonlocal_used > prev &&
+           !g_moe_vram_spill_peak.compare_exchange_weak(prev, out->nonlocal_used,
+                                                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+    return true;
 }
 
 // Evict a range of the mmap'd model file from the OS page cache, so caching a high-weight expert
@@ -527,6 +903,9 @@ static std::atomic<int> g_moe_pf_pending{0};
 static std::atomic<uint64_t> g_moe_pf_resident{0};
 static std::atomic<bool>   g_moe_defer_caches{false};
 static std::atomic<size_t> g_moe_compute_reserve{0};
+// Set for the duration of the measurement reserve pass (llama_moe_cache_defer_prewarm). A cache built
+// while this is set fills one slot instead of `capacity`, because the recap is about to drop it.
+static std::atomic<bool>   g_moe_defer_prewarm{false};
 // Cap chosen by llama_moe_auto_capacity, cached across layers. File-scope rather than a function-local
 // static so llama_moe_recap_from_compute_reserve can invalidate it after the real compute-buffer size
 // is measured; the first (max dev_free) result is the one every layer must share, see the note there.
@@ -676,7 +1055,26 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
     // dev_free ~= dev_total here since streaming keeps expert weights off-device, so this is close to
     // the real ceiling; the reserve absorbs the KV + compute buffers that grow afterward.
     const uint64_t usable = dev_free > reserve ? (uint64_t) (frac * (double) (dev_free - reserve)) : 0;
-    if (usable == 0) { return 0; }
+    // Out of VRAM must NOT read as "no opinion". Returning 0 leaves cap=0 at the call site, and
+    // llama_moe_clamp_capacity maps 0 to FULL residency - so "nothing fits" allocated every expert, which
+    // is exactly backwards. Measured on qwen3.8-flash-next + MTP: the draft context reached here with
+    // dev_free already below the reserve and got a full 512-expert cache (1.74 GiB), putting the process
+    // 4138 MiB over the driver's VRAM budget. n_used is the smallest capacity the remap can work with (one
+    // slot per routed expert of a token), so it is the honest answer for "there is no room".
+    if (usable == 0) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            const double gib = 1024.0*1024.0*1024.0;
+            LLAMA_LOG_WARN("MoE stream: only %.2f GiB device memory free, at or below the %.2f GiB reserve "
+                           "- falling back to the MINIMUM expert cache (CACHE_CAP=%d, one slot per routed "
+                           "expert). Expect heavy sync-loading. Lower LLAMA_MOE_VRAM_RESERVE_MB, free VRAM, "
+                           "or set LLAMA_MOE_CACHE_CAP by hand.\n",
+                           dev_free/gib, reserve/gib, n_used);
+        }
+        g_moe_cached_cap = n_used; // keep every layer of this model on the same capacity
+        return n_used;
+    }
     // each layer holds (cap + n_sentinel) slabs; total = n_moe_layers * (cap+n_sentinel) * per_expert <=
     // usable. Subtracting a hardcoded 1 here (as this did) silently overshoots the VRAM budget by
     // (n_sentinel-1) * n_moe_layers * per_expert whenever more than one sentinel is in use - about
@@ -957,6 +1355,26 @@ struct llama_moe_layer_cache {
 
     ggml_context *        ctx    = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
+
+    // Owning context's scheduler, used as an identity tag only (never dereferenced). g_moe_layer_caches is
+    // process-global, so a SECOND llama_context in the same process (a speculative/MTP draft model, an
+    // embedding context, ...) sees the first model's caches too. The startup capacity recap must only drop
+    // the caches it built itself: freeing another context's caches leaves that context's already-built
+    // graphs holding dangling llama_moe_layer_cache pointers and freed device buffers, which segfaults on
+    // its next decode.
+    ggml_backend_sched_t  sched = nullptr;
+
+    // Set by every sweep pass over THIS cache, cleared when llama_moe_refill_vram_caches refills it. The
+    // process-global g_moe_sweep_dirty only says "some cache swept somewhere"; with two models in the
+    // process that made one model's sweep force a full refill of the other model's caches (7+ GiB) on the
+    // next decode token.
+    bool sweep_dirty = false;
+
+    // Built during the recap's measurement reserve, so only slot 0 was prewarmed - slots 1..capacity-1 hold
+    // garbage and no expert but 0 is marked resident. Normally the recap frees this cache before anything
+    // computes with it; llama_moe_cache_defer_prewarm(false) finishes the prewarm of any cache that
+    // survives (a recap that declined after all).
+    bool prewarm_pending = false;
 
     // Device handles for the pinned-staging H2D path (LLAMA_MOE_PINNED_STAGE). The pinned arena itself is
     // a single GLOBAL buffer shared by every layer (see g_moe_stage_* below), not one per layer - all
@@ -1678,6 +2096,26 @@ static void llama_moe_prefill_ram_pools(void) {
                    "with %d io threads (warm-start; skips the serial loader ramp).\n",
                    gb, filled_caches, ms/1000.0, ms > 0 ? gb/(ms/1000.0) : 0.0, n_threads);
 
+    // Host-memory pressure report. The pools are all allocated by now, so this is the final split of
+    // pinned vs pageable vs refused pool bytes, next to the system commit charge - the only figure here
+    // that can show the OS pushing part of the working set into the pagefile. Reading it back from there
+    // costs more than reading the same experts from the model file, and the write itself lands on the
+    // pagefile's drive, so a charge well above physical RAM means LLAMA_MOE_RAM_CAP is too high for this
+    // box no matter what available RAM said at sizing time. "refused" is the healthy outcome for bytes
+    // that could not be pinned: they were handed back instead of becoming pagefile traffic.
+    {
+        uint64_t charge = 0, phys = 0;
+        llama_moe_commit_charge(&charge, &phys);
+        const double gib = 1024.0*1024.0*1024.0;
+        LLAMA_LOG_WARN("MoE stream: host pool %.1f GiB pinned / %.1f GiB pageable / %.1f GiB refused "
+                       "(unpinnable), avail phys %.1f GiB, system commit charge %.1f GiB of %.1f GiB "
+                       "physical.\n",
+                       g_moe_ram_lock_ok.load(std::memory_order_relaxed)      / gib,
+                       g_moe_ram_lock_fail.load(std::memory_order_relaxed)    / gib,
+                       g_moe_ram_lock_refused.load(std::memory_order_relaxed) / gib,
+                       llama_moe_avail_ram() / gib, charge / gib, phys / gib);
+    }
+
     // VRAM slot-cache prefill: the RAM pool is now warm, so fill each layer's VRAM slots (0..capacity-1)
     // with its top-`capacity` experts BEFORE decode, sourcing bytes from the RAM pool (~25 GB/s) instead of
     // letting the first tokens warm VRAM one miss at a time. Same score-based pick as the RAM tier; VRAM is a
@@ -2262,7 +2700,16 @@ static int llama_moe_auto_ram_capacity(const std::vector<llama_moe_proj_store> &
         if (r >= 0) { reserve = (uint64_t) r * 1024 * 1024; }
     }
     const uint64_t by_reserve = avail > reserve ? avail - reserve : 0;
-    const uint64_t usable     = std::min(by_reserve, (uint64_t) (frac * (double) avail));
+    uint64_t       usable     = std::min(by_reserve, (uint64_t) (frac * (double) avail));
+    if (usable == 0) { return 0; }
+
+    // Second bound, and the one that actually enforces "never pageable": ask the OS to raise this
+    // process's minimum working set enough to LOCK the whole pool, and clamp to what it grants. Taking the
+    // min of the two can only ever SHRINK the pool relative to the avail-based rule above, so this cannot
+    // introduce an oversizing regression - it removes exactly the part that would have been pageable, i.e.
+    // the part whose only eviction target is the pagefile.
+    const uint64_t granted = llama_moe_ram_quota_reserve(usable);
+    if (granted < usable) { usable = granted; }
     if (usable == 0) { return 0; }
 
     const uint64_t denom = (uint64_t) n_moe_layers * per_expert;
@@ -2353,11 +2800,25 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
     // actually allocated here.
     const int n_sentinel = llama_moe_sentinel_count(n_used);
 
+    // How many slots the prewarm below actually fills. The recap (llama_moe_recap_from_compute_reserve)
+    // frees every cache built during its measurement reserve pass, so filling all `capacity` slots there
+    // copies `capacity` experts per layer into VRAM for a cache nothing ever computes with - measured
+    // 14.1 GiB / 2.7s of startup on qwen3.8-flash-next (page cache -> VRAM at ~3.2 GiB/s; the bytes are
+    // already resident, so it does not show up as disk reads). During that pass fill slot 0 only; the slot
+    // count, buffer size and graph shape are untouched, so the compute-buffer size the recap is measuring
+    // stays bit-identical. slot 0 is still filled because stale_table requires every expert to map to a
+    // REAL settled slot. If the recap declines after all, llama_moe_cache_defer_prewarm(false) fills the
+    // rest.
+    const int  n_prewarm       = (g_moe_defer_prewarm.load(std::memory_order_acquire) && capacity > 1) ? 1 : capacity;
+    const bool prewarm_pending = n_prewarm < capacity;
+
     llama_moe_layer_cache * c = new llama_moe_layer_cache();
+    c->sched      = sched; // owner tag, see the field comment
     c->n_expert   = n_expert;
     c->capacity   = capacity;
     c->n_used     = n_used;
     c->n_sentinel = n_sentinel;
+    c->prewarm_pending = prewarm_pending;
     // Layer index, parsed from the key tensor's "blk.<il>." prefix. Diagnostics only (LLAMA_MOE_LAYERDBG):
     // the cache is otherwise layer-agnostic, but a per-layer residency profile is the only way to see that
     // some layers are structurally harder than others - e.g. DeepSeek-V4's first dsv4_hash_layer_count
@@ -2386,7 +2847,7 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
     // seed each routing position u with a distinct real prewarm slot (slot u holds expert u after
     // prewarm below), so stale reuse starts from real experts and the n_used positions never collide.
     c->pos_slot.assign((size_t) n_used, 0);
-    for (int u = 0; u < n_used; ++u) { c->pos_slot[(size_t) u] = (u < capacity) ? u : 0; }
+    for (int u = 0; u < n_used; ++u) { c->pos_slot[(size_t) u] = (u < n_prewarm) ? u : 0; }
     c->pos_init = false;
 
     // capacity resident slots + n_sentinel zero sentinel slots [capacity .. capacity+n_sentinel)
@@ -2475,19 +2936,37 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
         }
         if (rc > n_expert) { rc = n_expert; }
         if (rc > 0) {
-            bool ok = true;
+            // Reserve the working-set quota for EVERY layer's pool up front, not just this one: pools are
+            // created a layer at a time but the lock budget is process-wide, so asking per layer would let
+            // the early layers spend it all and leave the late ones unpinnable (and therefore refused).
+            // Idempotent, so this is a no-op when llama_moe_auto_ram_capacity already asked - it matters on
+            // the explicit LLAMA_MOE_RAM_CAP path, which skips the auto sizing entirely.
+            {
+                uint64_t per_expert = 0;
+                for (const auto & pr : c->proj) { per_expert += (uint64_t) pr.stride; }
+                int n_moe_layers = n_proj > 0 ? (int) (g_moe_expert_files.size() / (size_t) n_proj) : 1;
+                if (n_moe_layers < 1) { n_moe_layers = 1; }
+                (void) llama_moe_ram_quota_reserve((uint64_t) rc * per_expert * (uint64_t) n_moe_layers);
+            }
+            bool ok         = true;
+            bool all_pinned = true;
             for (int i = 0; i < n_proj && ok; ++i) {
-                c->proj[(size_t) i].ram = llama_moe_ram_alloc((size_t) rc * (size_t) c->proj[(size_t) i].stride);
+                bool pinned = false;
+                c->proj[(size_t) i].ram = llama_moe_ram_alloc((size_t) rc * (size_t) c->proj[(size_t) i].stride, &pinned);
                 if (!c->proj[(size_t) i].ram) { ok = false; }
+                if (!pinned) { all_pinned = false; }
             }
             if (ok) {
                 c->ram_capacity = rc;
                 c->ram_slot.assign((size_t) n_expert, -1);
                 c->ram_expert.assign((size_t) rc, -1);
                 c->ram_score.assign((size_t) rc, 0.0f);
-                // default on: once an expert is in the locked RAM pool, evict its mmap page-cache
-                // copy so both do not occupy RAM. Disable with LLAMA_MOE_RAM_EVICT=0.
-                c->evict_after_ram = true;
+                // Once an expert is in the RAM pool, drop its mmap page-cache copy so both do not occupy
+                // RAM - but ONLY if that pool is actually PINNED. On an unpinned pool the trade runs
+                // backwards: it destroys a copy the OS could have evicted for free (and re-read from the
+                // model file) in favour of one the OS can only evict to the pagefile. Reachable only with
+                // LLAMA_MOE_RAM_REQUIRE_PIN=0. Force either way with LLAMA_MOE_RAM_EVICT.
+                c->evict_after_ram = all_pinned;
                 if (const char * ev = getenv("LLAMA_MOE_RAM_EVICT")) { c->evict_after_ram = atoi(ev) != 0; }
             } else {
                 // partial alloc failed: free whatever we got, run without the RAM tier
@@ -2497,8 +2976,10 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
                         c->proj[(size_t) i].ram = nullptr;
                     }
                 }
-                LLAMA_LOG_WARN("MoE stream: RAM residency pool alloc failed (wanted %d experts/layer); "
-                               "running without it (misses fault mmap from disk)\n", rc);
+                LLAMA_LOG_WARN("MoE stream: no RAM residency pool for this layer (wanted %d experts/layer); "
+                               "misses read the expert from the model file. If a 'refusing the host expert "
+                               "pool' line appeared above, the allocation succeeded but could not be PINNED - "
+                               "lower LLAMA_MOE_RAM_CAP or raise LLAMA_MOE_RAM_RESERVE_MB.\n", rc);
             }
         }
     }
@@ -2533,7 +3014,7 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
 
     // zero the n_sentinel sentinel slots [capacity, capacity+n_sentinel) so a dropped expert routed to
     // any of them contributes ~nothing (all-zero k-quant blocks dequantize to 0), then prewarm slots
-    // 0..capacity-1 with experts 0..capacity-1; the loader adapts to the real working set from there
+    // 0..n_prewarm-1 with experts 0..n_prewarm-1; the loader adapts to the real working set from there
     {
         std::vector<char> zeros;
         for (auto & pr : c->proj) {
@@ -2545,7 +3026,7 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
     }
     {
         std::vector<char> prewarm;
-        for (int s = 0; s < capacity; ++s) {
+        for (int s = 0; s < n_prewarm; ++s) {
             for (size_t pi = 0; pi < c->proj.size(); ++pi) {
                 const char * sp = llama_moe_layer_src(c, pi, s);
                 if (sp) {
@@ -2563,17 +3044,17 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
     }
     std::vector<int32_t> table((size_t) n_expert);
     for (int e = 0; e < n_expert; ++e) {
-        table[(size_t) e] = (e < capacity) ? e : capacity; // missing -> zero sentinel slot
+        table[(size_t) e] = (e < n_prewarm) ? e : capacity; // missing -> zero sentinel slot
     }
     ggml_backend_tensor_set(c->slot_table, table.data(), 0, (size_t) n_expert * sizeof(int32_t));
 
-    // stale_table: every expert maps to a REAL slot (never the sentinel). Resident experts (e<capacity,
-    // prewarmed into slot e) map to their own slot; the rest borrow slot (e%capacity), which after
+    // stale_table: every expert maps to a REAL slot (never the sentinel). Resident experts (e<n_prewarm,
+    // prewarmed into slot e) map to their own slot; the rest borrow slot (e%n_prewarm), which after
     // prewarm holds a real expert. Decode's get_rows reads this, so a miss reuses a real (stale) expert
     // instead of zeroing the branch. The loader/boundary sync keep it current via moe_stale_on_*.
     c->stale_of_expert.assign((size_t) n_expert, 0);
     for (int e = 0; e < n_expert; ++e) {
-        c->stale_of_expert[(size_t) e] = (e < capacity) ? e : (capacity > 0 ? e % capacity : 0);
+        c->stale_of_expert[(size_t) e] = (e < n_prewarm) ? e : (n_prewarm > 0 ? e % n_prewarm : 0);
     }
     ggml_backend_tensor_set(c->stale_table, c->stale_of_expert.data(), 0, (size_t) n_expert * sizeof(int32_t));
     c->last_settled_slot = 0;
@@ -3655,6 +4136,65 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     // is the background thread's own disk work over the same window: it is NOT part of parallel_load, so
     // it must be read as competition for the device and the disk, never as a component of the callback.
     g_diag_cb_ns += (uint64_t) (ggml_time_us() - diag_t0);
+
+    // Always-on spill watch (NOT gated on LLAMA_MOE_DIAG). The startup audit only sees the state right
+    // after allocation; the driver can start spilling later, once the graph's transients and the KV cache
+    // have grown into whatever headroom was left. So resample from the eval path and WARN the first time
+    // non-local usage crosses the threshold.
+    //
+    // Deliberately NOT gated on n_tokens == 1, unlike the timing print below: this has nothing to do with
+    // the single-token fast path, and with speculative decoding a verify step carries n_tokens > 1 - so
+    // that gate would only ever see the draft step's ONE layer, which is far too few callbacks to reach
+    // any sample period. Prefill samples too, which is wanted: the sweep is when VRAM pressure peaks.
+    // Always sample the FIRST call so the reading exists even on a short generation, then every 8 steps'
+    // worth of callbacks (a DXGI query is a COM call, not a register read).
+    if (c->dev_backend) {
+        static uint64_t spill_calls = 0;
+        const uint64_t  spill_period = (uint64_t) llama_moe_diag_n_layers(c) * 8;
+        const uint64_t  spill_n      = ++spill_calls;
+        if (spill_n == 1 || (spill_period > 0 && spill_n % spill_period == 0)) {
+            size_t sdev_free = 0, sdev_total = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(c->dev_backend), &sdev_free, &sdev_total);
+            llama_moe_vram_seg seg;
+            if (sdev_total > 0 && llama_moe_vram_spill_sample((uint64_t) sdev_total, &seg)) {
+                const double   mib  = 1024.0*1024.0;
+                const uint64_t over = seg.local_used > seg.local_budget
+                                    ? seg.local_used - seg.local_budget : 0;
+                // Report the first sample, then again whenever the over-budget figure grows by another
+                // 512 MiB. Keyed on OVER-BUDGET, not on the non-local figure: measured on a 4090D, a
+                // healthy fast run already sits at 162-310 MiB non-local (that is the pinned H2D staging
+                // arena, which is host memory the GPU can see) while local ran 4.3 GiB over budget. So the
+                // over-budget delta is what tracks the driver's paging pressure; non-local only says how
+                // much of it happens to be parked in host RAM at this instant.
+                // The startup audit cannot see this at all: it runs before the KV cache and the graph's
+                // transients have grown into whatever headroom was left. The first sample normally lands in
+                // prefill (the sweep is when pressure peaks), hence "in eval", not "in decode".
+                static std::atomic<uint64_t> reported{UINT64_MAX}; // UINT64_MAX = nothing reported yet
+                const uint64_t prev = reported.load(std::memory_order_relaxed);
+                const uint64_t step = 512ull * 1024 * 1024;
+                if (prev == UINT64_MAX || over >= prev + step) {
+                    reported.store(over, std::memory_order_relaxed);
+                    LLAMA_LOG_WARN("MoE stream: VRAM SEGMENTS in eval - local %.0f / %.0f MiB budget "
+                                   "(over by %.0f MiB), spilled to host (non-local) %.0f MiB.\n",
+                                   seg.local_used/mib, seg.local_budget/mib, over/mib,
+                                   seg.nonlocal_used/mib);
+                }
+                // 256 MiB over budget: comfortably above driver bookkeeping, comfortably below the 4+ GiB
+                // seen when the cache genuinely does not fit. The threshold is a judgement call - the
+                // printed number is the thing to act on, not the fact that the line appeared. Note that
+                // being over budget is NOT by itself a throughput collapse: measured 8.4 tok/s decode at
+                // 4.3 GiB over. It means the driver is paging, not that paging is dominating.
+                static std::atomic<bool> warned{false};
+                if (over > 256ull * 1024 * 1024 && !warned.exchange(true)) {
+                    LLAMA_LOG_WARN("MoE stream: VRAM SPILL - this process has committed %.0f MiB more "
+                                   "video memory than the driver's budget (%.0f MiB), so the driver is "
+                                   "paging the excess over PCIe; %.0f MiB is in host RAM right now. Lower "
+                                   "LLAMA_MOE_CACHE_CAP or raise LLAMA_MOE_VRAM_RESERVE_MB.\n",
+                                   over/mib, seg.local_budget/mib, seg.nonlocal_used/mib);
+                }
+            }
+        }
+    }
     if (getenv("LLAMA_MOE_DIAG") && n_tokens == 1) {
         const uint64_t period = (uint64_t) llama_moe_diag_n_layers(c) * (uint64_t) g_diag_steps;
         static uint64_t calls = 0;
@@ -3677,7 +4217,7 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
                            "LOCK-WAIT %.0fms; publish %llu device-syncs; read-phase moved %.0f MiB = %.2f GiB/s "
                            "| [thread-sums, not subtractable] read %.0fms, H2D-staged %.0fms | sync-loaded %llu "
                            "(RAM-hit %.0f%%, DISK %llu) | LOADER (separate thread, not in callback): "
-                           "read %.0fms, H2D %.0fms, %llu expert-proj\n",
+                           "read %.0fms, H2D %.0fms, %llu expert-proj | VRAM spill peak %.0f MiB\n",
                            g_diag_steps, cb_ms, pl_ms, pub_ms, cb_ms - pl_ms - pub_ms,
                            pl_ms, pl_ms - rp_ms - h2dw_ms, rp_ms, h2dw_ms,
                            lw_ms, (unsigned long long) g_diag_pub_cnt.load(), rb_mib, rbw,
@@ -3685,7 +4225,8 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
                            (unsigned long long) g_diag_sync_cnt,
                            100.0 * (double) g_diag_ram_hit / (double) sc,
                            (unsigned long long) (g_diag_sync_cnt - g_diag_ram_hit),
-                           lrd_ms, lh2_ms, (unsigned long long) g_diag_ldr_cnt.load());
+                           lrd_ms, lh2_ms, (unsigned long long) g_diag_ldr_cnt.load(),
+                           g_moe_vram_spill_peak.load(std::memory_order_relaxed)/(1024.0*1024.0));
             g_diag_cb_ns = g_diag_pl_ns = g_diag_sync_cnt = g_diag_ram_hit = g_diag_lockwait_ns = g_diag_publish_ns = 0;
             g_diag_read_ns = 0; g_diag_h2d_ns = 0; g_diag_h2d_wall_ns = 0;
             g_diag_ldr_read_ns = 0; g_diag_ldr_h2d_ns = 0; g_diag_ldr_cnt = 0;
@@ -4097,8 +4638,10 @@ static void llama_moe_layer_remap_group_cb(ggml_tensor * dst, const ggml_tensor 
         }
     }
 
-    // This layer's cache now holds this group's index range. Flag the whole cache set as needing a
-    // refill before decode (consumed once, at the first single-token step).
+    // This layer's cache now holds this group's index range. Flag it (and the global fast-path gate) as
+    // needing a refill before decode (consumed once, at the first single-token step). Per-cache and not
+    // just global, so a second model's sweep does not force a full refill of this model's caches.
+    c->sweep_dirty = true;
     g_moe_sweep_dirty.store(true, std::memory_order_relaxed);
 
     // Prefill breakdown (LLAMA_MOE_DIAG). The single-pass callback's timing print is gated to n_tokens==1,
@@ -4172,6 +4715,10 @@ bool llama_moe_prefill_sweep_enabled(void) {
 
 int llama_moe_layer_cache_capacity(const llama_moe_layer_cache * c) {
     return c ? c->capacity : 0;
+}
+
+bool llama_moe_layer_cache_decoded(const llama_moe_layer_cache * c) {
+    return c && c->pos_init; // set by the first single-token remap step for this cache
 }
 
 ggml_tensor * llama_moe_layer_cache_remap_group(llama_moe_layer_cache * c,
@@ -4265,6 +4812,25 @@ void llama_moe_vram_audit(void) {
                        ac_free/gib, ac_planned/gib, ((double) ac_free - (double) ac_planned)/gib,
                        free_gib, ((double) ac_free - (double) ac_planned - (double) dev_free)/gib);
     }
+    // The figure the two lines above cannot give: whether the driver is backing part of this process's
+    // video memory with host RAM. Printed unconditionally, including when it is zero - "no spill" is the
+    // result worth confirming, and it is the only thing here that answers it.
+    llama_moe_vram_seg seg;
+    if (llama_moe_vram_spill_sample(dev_total, &seg)) {
+        const double mib = 1024.0*1024.0;
+        // local_used can exceed local_budget (and even the card's physical size): DXGI counts what this
+        // process has COMMITTED to the segment, and WDDM lets a process over-commit and then pages the
+        // excess out. So the over-budget delta is the actionable figure - it is how much the driver has
+        // to keep shuffling - while nonlocal_used is only the part parked in host RAM at this instant.
+        const double over = seg.local_used > seg.local_budget
+                          ? (double) (seg.local_used - seg.local_budget) / mib : 0.0;
+        LLAMA_LOG_WARN("MoE stream: VRAM SEGMENTS - local %.0f / %.0f MiB budget (over by %.0f MiB), "
+                       "spilled to host (non-local) %.0f MiB of %.0f MiB budget. Over-budget or non-zero "
+                       "spill means the working set does not fit and the driver is paging it over PCIe; a "
+                       "small steady non-local figure is the pinned H2D staging arena, not the cache.\n",
+                       seg.local_used/mib, seg.local_budget/mib, over, seg.nonlocal_used/mib,
+                       seg.nonlocal_budget/mib);
+    }
 }
 
 bool llama_moe_sweep_refill_pending(void) {
@@ -4326,6 +4892,10 @@ void llama_moe_refill_vram_caches(void) {
         if (!c || c->capacity <= 0 || c->proj.empty() || !c->proj[0].dev) {
             continue;
         }
+        if (!c->sweep_dirty) {
+            continue; // never swept, or already refilled - do not re-pay another model's refill
+        }
+        c->sweep_dirty = false;
         const int cap = c->capacity;
         const int ne  = c->n_expert;
 
@@ -4652,15 +5222,45 @@ int llama_moe_boundary_sync(int budget) {
 //
 // Returns true if the caps were invalidated and the caller must re-reserve. The RAM residency pools are
 // dropped with the caches, but llama_moe_prefill_once has not run yet at this point in startup, so no
-// prefill work is thrown away - only the VRAM prewarm is paid twice.
-bool llama_moe_recap_from_compute_reserve(size_t compute_bytes) {
+// prefill work is thrown away. The measurement pass's VRAM prewarm is skipped entirely when the caller
+// wraps its reserve in llama_moe_cache_defer_prewarm (llama_context does), so the dropped caches cost
+// allocation but no disk traffic.
+bool llama_moe_recap_from_compute_reserve(ggml_backend_sched_t sched, size_t compute_bytes) {
     if (compute_bytes == 0) { return false; }
     if (getenv("LLAMA_MOE_CACHE_CAP"))          { return false; } // capacity pinned by hand
     if (!moe_env_on("LLAMA_MOE_AUTOCAP_RECAP", true)) { return false; }
 
+    // One shot per PROCESS, not per context. The point of the recap is to replace the flat
+    // pre-measurement guess with a measured compute-buffer size, and that only has to happen once.
+    // g_moe_compute_reserve and g_moe_cached_cap are process-global, so letting a second context (a
+    // draft/MTP or embedding context, created after the main one) recap here does two wrong things:
+    //   - it overwrites the measured reserve of the context that actually sets the VRAM ceiling with its
+    //     own, much smaller, compute buffer;
+    //   - it clears g_moe_cached_cap and re-runs llama_moe_auto_capacity at a point where dev_free is
+    //     already spoken for by the first context's caches, so it lands in the out-of-VRAM fallback
+    //     instead of reusing the capacity that was just fitted to this device.
+    // Measured on qwen3.8-flash-next + MTP: the draft context built a cap-100 cache, recapped, freed it,
+    // and rebuilt at the fallback capacity. Reusing the first context's cap is both cheaper and correct.
+    if (g_moe_compute_reserve.load(std::memory_order_acquire) != 0) { return false; }
+
     // Only the per-layer (async) caches are rebuilt here. If the per-tensor compaction pools are in use
     // the graph holds their device tensors too, and dropping them is not worth a second code path.
     if (!g_moe_cache_pools.empty()) { return false; }
+
+    // Drop only the caches THIS context built (llama_moe_layer_cache::sched). g_moe_layer_caches is
+    // process-global: a draft/embedding context constructed after the main one used to free the main
+    // model's caches here and then re-reserve only its own graph, leaving the main context's graphs
+    // pointing at deleted caches and freed device buffers - an instant segfault on its next decode.
+    // Checked before the loader stop below, which is process-wide: a context that owns nothing must
+    // leave the loader running for the one that does.
+    {
+        std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
+        bool owned = false;
+        for (auto & kv : g_moe_layer_caches) {
+            if (kv.second && kv.second->sched == sched) { owned = true; break; }
+        }
+        if (!owned) { return false; }
+    }
 
     if (g_moe_loader_run.exchange(false)) {
         if (g_moe_loader_thread.joinable()) {
@@ -4670,11 +5270,9 @@ bool llama_moe_recap_from_compute_reserve(size_t compute_bytes) {
 
     std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
 
-    if (g_moe_layer_caches.empty()) { return false; }
-
-    for (auto & kv : g_moe_layer_caches) {
-        llama_moe_layer_cache * c = kv.second;
-        if (!c) { continue; }
+    for (auto it = g_moe_layer_caches.begin(); it != g_moe_layer_caches.end(); ) {
+        llama_moe_layer_cache * c = it->second;
+        if (!c || c->sched != sched) { ++it; continue; }
         for (auto & pr : c->proj) {
             if (pr.ram) {
                 llama_moe_ram_free(pr.ram, (size_t) c->ram_capacity * (size_t) pr.stride);
@@ -4683,21 +5281,63 @@ bool llama_moe_recap_from_compute_reserve(size_t compute_bytes) {
             if (pr.fp)    { fclose(pr.fp);    pr.fp    = nullptr; }
             if (pr.fp_ld) { fclose(pr.fp_ld); pr.fp_ld = nullptr; }
         }
-        if (c->buffer) { ggml_backend_buffer_free(c->buffer); c->buffer = nullptr; }
+        if (c->buffer) {
+            // each freed buffer was counted into g_moe_layer_vram_bytes when the cache was built, so take
+            // it back out. Without this the second pass adds on top of the first and the VRAM AUDIT line
+            // plus the "approaching device capacity" warning both report roughly double.
+            const uint64_t sz = (uint64_t) ggml_backend_buffer_get_size(c->buffer);
+            g_moe_layer_vram_bytes = g_moe_layer_vram_bytes > sz ? g_moe_layer_vram_bytes - sz : 0;
+            ggml_backend_buffer_free(c->buffer);
+            c->buffer = nullptr;
+        }
         if (c->ctx)    { ggml_free(c->ctx);                   c->ctx    = nullptr; }
         delete c;
+        it = g_moe_layer_caches.erase(it);
     }
-    g_moe_layer_caches.clear();
-    // every freed buffer above was counted into g_moe_layer_vram_bytes, and the map is now empty, so the
-    // running total must go back to zero. Without this the second pass adds on top of the first and the
-    // VRAM AUDIT line plus the "approaching device capacity" warning both report roughly double.
-    g_moe_layer_vram_bytes = 0;
 
     g_moe_compute_reserve.store(compute_bytes, std::memory_order_release);
     g_moe_cached_cap = 0;
     g_moe_autocap_logged = false;
 
     return true;
+}
+
+// Same gates as llama_moe_recap_from_compute_reserve, minus the two it cannot know before the reserve
+// (a zero compute buffer, and whether this context ends up owning any cache). So "pending" means "the
+// recap will fire unless one of those two declines it" - which is why llama_moe_cache_defer_prewarm(false)
+// repairs the caches instead of assuming they are gone.
+bool llama_moe_recap_pending(void) {
+    if (getenv("LLAMA_MOE_CACHE_CAP"))                { return false; }
+    if (!moe_env_on("LLAMA_MOE_AUTOCAP_RECAP", true)) { return false; }
+    if (g_moe_compute_reserve.load(std::memory_order_acquire) != 0) { return false; }
+    return g_moe_cache_pools.empty();
+}
+
+void llama_moe_cache_defer_prewarm(bool defer) {
+    // LLAMA_MOE_DEFER_PREWARM=0 restores the old behaviour (the measurement pass fills all `capacity`
+    // slots and the recap throws them away), so what deferring is worth - and that it costs nothing
+    // downstream - can be A/B'd inside ONE session with one binary instead of across two builds.
+    static const bool on = moe_env_on("LLAMA_MOE_DEFER_PREWARM", true);
+    g_moe_defer_prewarm.store(defer && on, std::memory_order_release);
+    if (defer) {
+        return;
+    }
+    // Clearing the flag: finish the prewarm of any deferred cache that is still alive. Normally the recap
+    // has already deleted all of them and this loop finds nothing; it matters only when the recap declined
+    // after the caller had already deferred, where the alternative is a cache holding one real expert.
+    std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
+    std::vector<char> ldbuf;
+    for (auto & kv : g_moe_layer_caches) {
+        llama_moe_layer_cache * c = kv.second;
+        if (!c || !c->prewarm_pending) { continue; }
+        c->prewarm_pending = false;
+        for (int s = 0; s < c->capacity && s < c->n_expert; ++s) {
+            // leave anything the loader already settled alone: loading expert s into slot s while s (or
+            // slot s) is occupied elsewhere would leave a duplicate slot_expert entry behind.
+            if (c->slot_expert[(size_t) s] >= 0 || c->expert_slot[(size_t) s] >= 0) { continue; }
+            moe_layer_load_into_slot(c, s, s, ldbuf);
+        }
+    }
 }
 
 void llama_moe_cache_shutdown(void) {

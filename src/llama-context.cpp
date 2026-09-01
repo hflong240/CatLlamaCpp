@@ -474,6 +474,23 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
+    // fork: every graph_reserve below BUILDS the graph, so the first one creates the MoE expert caches -
+    // and if the capacity recap is still going to fire, those caches are throwaway: it frees them and
+    // rebuilds at the measured capacity. Tell them to skip their VRAM prewarm until the recap has run, so
+    // the measurement passes do not copy `capacity` experts per layer into VRAM for a cache nothing ever
+    // computes with (measured 14.1 GiB / 2.7s of startup on qwen3.8-flash-next). Slot count, buffer sizes
+    // and graph shape are untouched, so the compute buffer the recap measures is unchanged. The guard
+    // clears the flag on any early throw below; the normal clear happens right after the recap.
+    struct moe_prewarm_defer {
+        bool active = false;
+        ~moe_prewarm_defer() { if (active) { llama_moe_cache_defer_prewarm(false); } }
+        void done() { if (active) { active = false; llama_moe_cache_defer_prewarm(false); } }
+    } moe_defer;
+    if (!model.hparams.no_alloc && llama_moe_recap_pending()) {
+        moe_defer.active = true;
+        llama_moe_cache_defer_prewarm(true);
+    }
+
     // resolve automatic Flash Attention use
     if (cparams.auto_fa) {
         auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
@@ -638,7 +655,13 @@ void llama_context::sched_reserve() {
             }
         }
 
-        if (llama_moe_recap_from_compute_reserve(compute_dev)) {
+        const bool recapped = llama_moe_recap_from_compute_reserve(sched.get(), compute_dev);
+
+        // Cleared before the re-reserve, so the rebuilt caches prewarm normally. If the recap declined
+        // after all, this finishes the prewarm of the caches it left behind.
+        moe_defer.done();
+
+        if (recapped) {
             auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers after MoE capacity recap");
@@ -648,6 +671,7 @@ void llama_context::sched_reserve() {
             n_nodes_pp  = ggml_graph_n_nodes(gf);
         }
     }
+    moe_defer.done();
 
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
