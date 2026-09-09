@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -46,6 +47,32 @@ static inline bool llama_moe_pread(FILE * fp, uint64_t off, void * dst, size_t b
     if (!fp) { return false; }
     if (llama_moe_fseek64(fp, (int64_t) off, SEEK_SET) != 0) { return false; }
     return fread(dst, 1, bytes, fp) == bytes;
+}
+
+// The Windows CRT caps the number of concurrently open FILE streams at 512 by default. Each layer cache
+// keeps TWO private handles per projection - one for the compute thread and one for the background
+// loader's fill_ram, deliberately not shared so fill_ram cannot move the file position out from under
+// read_expert - so a 48-layer, 3-projection model needs 288, and the two-tier expert mode
+// (--moe-expert-gguf-low) doubles that to 576. Past the limit fopen fails: an ordinary cache quietly
+// falls back to reading the mmap, but a LOW-TIER cache has no mmap to fall back to and has to give up,
+// silently costing the tier on whichever layers happened to overflow. Raise the limit once instead.
+// No-op elsewhere, where the ceiling is the process fd rlimit and already far higher.
+static void llama_moe_raise_stdio_limit(void) {
+#ifdef _WIN32
+    static std::once_flag once;
+    std::call_once(once, []() {
+        const int want = 8192; // the CRT's documented maximum
+        const int have = _getmaxstdio();
+        if (have >= want) {
+            return;
+        }
+        if (_setmaxstdio(want) < 0) {
+            LLAMA_LOG_WARN("MoE stream: could not raise the CRT open-stream limit above %d; on a model with "
+                           "many MoE layers the later layers will fall back to mmap reads, and a "
+                           "low-precision expert tier will be lost on those layers.\n", have);
+        }
+    });
+#endif
 }
 
 // Hint the OS to read a byte range of the mmap'd model file in one large asynchronous
@@ -910,6 +937,10 @@ static std::atomic<bool>   g_moe_defer_prewarm{false};
 // static so llama_moe_recap_from_compute_reserve can invalidate it after the real compute-buffer size
 // is measured; the first (max dev_free) result is the one every layer must share, see the note there.
 static int g_moe_cached_cap = 0;
+// fork: the low tier's slot count from the same decision (two-tier mode only). Cached and invalidated
+// together with g_moe_cached_cap - a recap that re-ran the split for one tier and not the other would
+// leave the two caches sized against different budgets.
+static int g_moe_cached_cap_lo = 0;
 static bool g_moe_autocap_logged = false;
 // dev_free as llama_moe_auto_capacity saw it, plus the cache size it then budgeted. The audit subtracts both
 // from the free VRAM measured after everything is allocated: whatever is left is VRAM that got consumed AFTER
@@ -929,9 +960,15 @@ int llama_moe_sentinel_count(int n_used) {
     return n;
 }
 
+// Defined with the low-tier registry further down; needed here to tell a low-precision twin descriptor
+// apart from a real model tensor when splitting the byte budget between the tiers.
+static bool llama_moe_is_low_tier(const ggml_tensor * t);
+
 int llama_moe_auto_capacity(ggml_backend_sched_t sched,
                             ggml_tensor * const * exps_list, int n_proj,
-                            int n_expert, int n_used, int n_moe_layers) {
+                            int n_expert, int n_used, int n_moe_layers,
+                            int cap_hi_fixed, int * cap_lo_out) {
+    if (cap_lo_out) { *cap_lo_out = 0; }
     if (n_moe_layers <= 0 || n_proj <= 0) { return 0; }
     // Compute ONCE (at the first MoE layer) and reuse for every layer. build_moe_ffn calls this per
     // layer, but dev_free shrinks as each layer's cache allocates - so recomputing would give later
@@ -939,7 +976,10 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
     // a uniform cap fills ~21.5 GB on a 24 GB card). A single model runs one geometry, so caching the
     // first (max-free) result is correct and reproduces the hand-tuned uniform-cap behaviour.
     // Reset by llama_moe_recap_from_compute_reserve once the real compute-buffer size is known.
-    if (g_moe_cached_cap > 0) { return g_moe_cached_cap; }
+    if (g_moe_cached_cap > 0) {
+        if (cap_lo_out) { *cap_lo_out = g_moe_cached_cap_lo; }
+        return g_moe_cached_cap;
+    }
 
     ggml_backend_t backend = llama_moe_pick_device_backend(sched);
     if (!backend) { return 0; }
@@ -947,13 +987,19 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
     ggml_backend_dev_memory(ggml_backend_get_device(backend), &dev_free, &dev_total);
     if (dev_free == 0) { return 0; }
 
-    // bytes one resident expert costs across all projections of a layer
-    uint64_t per_expert = 0;
+    // bytes one resident expert costs across all projections of a layer. In two-tier mode `exps_list`
+    // holds both tiers, so keep the halves apart: the budget is split by BYTES and the slot counts
+    // derived, not the other way round (a low slab is about half a high one, so one shared slot count
+    // spends ~2/3 of the budget on the high tier by accident rather than by decision).
+    uint64_t hi_expert = 0, lo_expert = 0;
     for (int i = 0; i < n_proj; ++i) {
         if (!exps_list[i]) { return 0; }
-        per_expert += (uint64_t) exps_list[i]->nb[2];
+        const uint64_t b = (uint64_t) exps_list[i]->nb[2];
+        if (llama_moe_is_low_tier(exps_list[i])) { lo_expert += b; } else { hi_expert += b; }
     }
+    const uint64_t per_expert = hi_expert + lo_expert;
     if (per_expert == 0) { return 0; }
+    const bool two_tier = cap_lo_out && hi_expert > 0 && lo_expert > 0;
 
     // Byte budget (LLAMA_MOE_CACHE_BYTES, set by --moe-stream-cache N[MB|GB]): a total-VRAM budget for the
     // expert cache across all MoE layers, converted here because this is the first point that knows both
@@ -968,6 +1014,10 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
             long long cap = denom ? (long long) ((uint64_t) want / denom) : 0;
             if (cap < 1)        { cap = 1; }
             if (cap > n_expert) { cap = n_expert; }
+            // Explicit byte budget: keep the shared-slot-count meaning (denom already covers both tiers),
+            // no group-boundary alignment. --moe-stream-cache implies the compaction mode, which the low
+            // tier does not run on, so this is only reachable by setting LLAMA_MOE_CACHE_BYTES by hand.
+            if (two_tier) { *cap_lo_out = (int) cap; }
             static bool logged = false;
             if (!logged) {
                 logged = true;
@@ -1073,6 +1123,7 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
                            dev_free/gib, reserve/gib, n_used);
         }
         g_moe_cached_cap = n_used; // keep every layer of this model on the same capacity
+        if (two_tier) { g_moe_cached_cap_lo = n_used; *cap_lo_out = n_used; }
         return n_used;
     }
     // each layer holds (cap + n_sentinel) slabs; total = n_moe_layers * (cap+n_sentinel) * per_expert <=
@@ -1080,28 +1131,138 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
     // (n_sentinel-1) * n_moe_layers * per_expert whenever more than one sentinel is in use - about
     // 1.5 GiB at 43 layers / 6 sentinels / 7.2 MiB per expert, which is enough to spill the cache into
     // Windows shared GPU memory and cost several times the throughput.
-    const uint64_t denom = (uint64_t) n_moe_layers * per_expert;
-    const int      n_sen = llama_moe_sentinel_count(n_used);
-    long long cap = (long long) (usable / denom) - n_sen;
+    const int n_sen = llama_moe_sentinel_count(n_used);
+    // Per-layer budget, then what is left for the slabs after the sentinel slots (each tier allocates
+    // n_sen of them, which is exactly what per_expert covering hi+lo accounts for). Spelled out per layer
+    // so the two-tier split below can spend BYTES instead of a slot count; for a single tier this is the
+    // same number the old (usable/(n_moe_layers*per_expert) - n_sen) produced - with usable = denom*q + r
+    // and r < denom, floor(r/n_moe_layers) < per_expert, so the remainder cannot carry into the quotient.
+    const uint64_t per_layer   = usable / (uint64_t) n_moe_layers;
+    const uint64_t sen_bytes   = (uint64_t) n_sen * per_expert;
+    const uint64_t slab_budget = per_layer > sen_bytes ? per_layer - sen_bytes : 0;
+
+    long long cap    = (long long) (slab_budget / per_expert); // equal-slot-count anchor
+    long long cap_lo = 0;
+    char snapnote[96] = "";
+
+    if (two_tier) {
+        // A low slab is about half a high one, so one slot count shared by both tiers is a ~2:1 byte split
+        // in the high tier's favour - reached by accident rather than by decision. Split the same budget
+        // explicitly: choose cap_hi, then hand every remaining byte to the low tier.
+        //
+        // Prefill runs a STEP number of full-width FFN passes per layer per ubatch step, and WHICH capacity
+        // sets that step count depends on the sweep mode (both read the same env as llama-graph.cpp):
+        //   - single-tier sweep (LLAMA_MOE_TIER_SWEEP off): ceil(n_expert / cap_hi), so cap_hi is the axis.
+        //   - fused two-tier sweep (on): ceil(n_expert / (cap_hi + cap_lo)), so grp_cap is the axis.
+        // A capacity strictly between two boundaries ceil(n_expert/g) runs the same passes as the boundary
+        // below it, so snapping UP to the next boundary buys a pass; snapping DOWN cannot. Both moves are
+        // paid VRAM-neutrally (the total byte budget, hence the reserve this function is built around, is
+        // unchanged) and both are guarded by LLAMA_MOE_TIER_SNAP (fraction of the anchor the move may cost,
+        // 0 disables). The two axes move bytes in OPPOSITE directions: a cap_hi-up move takes bytes FROM the
+        // low tier (a high slab costs ~2 low slabs, so grp_cap would DROP), while a grp_cap-up move converts
+        // high slots INTO low ones (grp_cap RISES). So the sweep-off snap would actively hurt the fused pass
+        // count - the axis is switched by mode, not shared.
+        double snap = 0.10;
+        if (const char * se = getenv("LLAMA_MOE_TIER_SNAP")) {
+            const double s = atof(se);
+            if (s >= 0.0 && s < 1.0) { snap = s; }
+        }
+        // Interpret the sweep switch EXACTLY as llama-graph.cpp's sweep_two_tier does (moe_env_on + CUDA +
+        // not fp4), or the sizer would size for one geometry while the graph runs the other, desyncing cap.
+        // The device slabs do not exist yet, so fp4 is probed on the source tensor type (usually the slab type).
+        const char * bname = ggml_backend_name(backend);
+        bool sweep_on = moe_env_on("LLAMA_MOE_TIER_SWEEP", true) && bname && strstr(bname, "CUDA") != nullptr;
+        for (int i = 0; sweep_on && i < n_proj; ++i) {
+            if (exps_list[i]->type == GGML_TYPE_MXFP4 || exps_list[i]->type == GGML_TYPE_NVFP4) { sweep_on = false; }
+        }
+        if (cap_hi_fixed > 0) {
+            cap = cap_hi_fixed; // caller pinned it (LLAMA_MOE_CACHE_CAP); only the low tier is ours to size
+        } else if (sweep_on && snap > 0.0 && cap > n_used && cap < n_expert) {
+            // Fused axis: snap grp_cap = cap_hi + cap_lo up one boundary by converting high slots to low
+            // ones at constant bytes (removing one high slab frees ~hi_expert/lo_expert low slots, so
+            // grp_cap rises). Integer search, not a closed form: the floor in cap_lo's derivation can miss a
+            // boundary by one. The while-condition doubles as the cap_hi >= n_used floor (decode still works).
+            const long long cl0  = (long long) ((slab_budget - (uint64_t) cap * hi_expert) / lo_expert);
+            const long long grp0 = cap + cl0;
+            if (grp0 > n_used && grp0 < n_expert) {
+                const long long groups = (n_expert + grp0 - 1) / grp0;
+                const long long up_grp = groups > 1 ? (n_expert + groups - 2) / (groups - 1) : grp0;
+                if (groups > 1 && (double) (up_grp - grp0) <= snap * (double) grp0) {
+                    long long ch = cap, cl = cl0;
+                    while (ch > n_used) {
+                        const long long ch2 = ch - 1;
+                        const long long cl2 = (long long) ((slab_budget - (uint64_t) ch2 * hi_expert) / lo_expert);
+                        ch = ch2; cl = cl2;
+                        if (ch + cl >= up_grp) { break; }
+                    }
+                    if (ch + cl >= up_grp) { // commit only if the boundary was actually reached
+                        snprintf(snapnote, sizeof(snapnote),
+                                 ", snapped grp_cap %lld->%lld (cap_hi %lld->%lld) to reach %lld fused passes",
+                                 grp0, ch + cl, cap, ch, groups - 1);
+                        cap = ch; // cap_lo re-derived by the walk-down below
+                    }
+                }
+            }
+        } else if (snap > 0.0 && cap > n_used && cap < n_expert) {
+            // Single-tier axis (sweep off): unchanged from before M5 - snap cap_hi to run ceil(n_expert/cap_hi)
+            // one lower, paid out of the low tier. Byte-identical to the pre-M5 sizer on this path.
+            const long long groups = (n_expert + cap - 1) / cap;
+            const long long up     = groups > 1 ? (n_expert + groups - 2) / (groups - 1) : n_expert;
+            const uint64_t  hi_up  = (uint64_t) up * hi_expert;
+            const long long lo_up  = slab_budget > hi_up ? (long long) ((slab_budget - hi_up) / lo_expert) : 0;
+            if ((double) (up - cap) <= snap * (double) cap && lo_up >= n_used) {
+                snprintf(snapnote, sizeof(snapnote), ", snapped up from %lld to reach %lld prefill groups",
+                         cap, groups - 1);
+                cap = up;
+            }
+        }
+        if (cap < n_used)   { cap = n_used; }
+        if (cap > n_expert) { cap = n_expert; }
+        // Whatever the high tier does not take goes to the low tier. Walk cap_hi back down if that leaves
+        // the low tier under one slot per routed expert - its remap cannot work with less. Never against a
+        // pinned cap_hi: the caller owns the budget then, and quietly shrinking their cache would make the
+        // returned cap_lo describe a high tier that is not the one being built.
+        for (;;) {
+            const uint64_t hi_bytes = (uint64_t) cap * hi_expert;
+            cap_lo = slab_budget > hi_bytes ? (long long) ((slab_budget - hi_bytes) / lo_expert) : 0;
+            if (cap_lo >= n_used || cap <= n_used || cap_hi_fixed > 0) { break; }
+            --cap;
+            snapnote[0] = '\0'; // no longer on the boundary that note describes
+        }
+        if (cap_lo < n_used)   { cap_lo = n_used; }
+        if (cap_lo > n_expert) { cap_lo = n_expert; }
+    }
 
     if (cap < n_used)   { cap = n_used; }     // below the per-token activation is unusable; clamp up
     if (cap > n_expert) { cap = n_expert; }   // no point exceeding the whole layer
+    const uint64_t planned = (uint64_t) n_moe_layers *
+                             ((uint64_t) (cap + n_sen) * hi_expert + (uint64_t) (cap_lo + n_sen) * lo_expert);
     if (!g_moe_autocap_logged) {
         g_moe_autocap_logged = true;
         const double gib = 1024.0*1024.0*1024.0;
-        const double cache_gib = (double) ((uint64_t)(cap + n_sen) * denom) / gib;
+        const double cache_gib = (double) planned / gib;
         const bool   measured  = g_moe_compute_reserve.load(std::memory_order_acquire) != 0;
         // WARN level so it is visible before llama-completion pauses the log for generation.
-        LLAMA_LOG_WARN("MoE stream: auto CACHE_CAP=%lld -> ~%.1f GiB expert cache across %d MoE layers "
-                       "(free %.1f GiB, reserve %.1f GiB for KV/compute [%s], frac %.2f, %.1f MiB/expert). "
-                       "Override with LLAMA_MOE_CACHE_CAP; tune LLAMA_MOE_VRAM_FRAC / LLAMA_MOE_VRAM_RESERVE_MB.\n",
-                       cap, cache_gib, n_moe_layers, dev_free/gib, reserve/gib,
-                       measured ? "margin only; compute buffer already in free" : "flat guess, pre-measurement",
-                       frac, per_expert/(1024.0*1024.0));
+        if (cap_hi_fixed <= 0) {
+            LLAMA_LOG_WARN("MoE stream: auto CACHE_CAP=%lld -> ~%.1f GiB expert cache across %d MoE layers "
+                           "(free %.1f GiB, reserve %.1f GiB for KV/compute [%s], frac %.2f, %.1f MiB/expert). "
+                           "Override with LLAMA_MOE_CACHE_CAP; tune LLAMA_MOE_VRAM_FRAC / LLAMA_MOE_VRAM_RESERVE_MB.\n",
+                           cap, cache_gib, n_moe_layers, dev_free/gib, reserve/gib,
+                           measured ? "margin only; compute buffer already in free" : "flat guess, pre-measurement",
+                           frac, per_expert/(1024.0*1024.0));
+        }
+        if (two_tier) {
+            LLAMA_LOG_WARN("MoE stream: two-tier split -> %lld high slots/layer at %.2f MiB + %lld low slots "
+                           "at %.2f MiB, ~%.1f GiB total%s%s. Override with LLAMA_MOE_CACHE_CAP_LOW.\n",
+                           cap, hi_expert/(1024.0*1024.0), cap_lo, lo_expert/(1024.0*1024.0), cache_gib,
+                           cap_hi_fixed > 0 ? " (high tier pinned)" : "", snapnote);
+        }
     }
     g_moe_autocap_free.store(dev_free, std::memory_order_release);
-    g_moe_autocap_planned.store((size_t) ((uint64_t) (cap + n_sen) * denom), std::memory_order_release);
-    g_moe_cached_cap = (int) cap; // reuse for all remaining layers (see note at function top)
+    g_moe_autocap_planned.store((size_t) planned, std::memory_order_release);
+    g_moe_cached_cap    = (int) cap; // reuse for all remaining layers (see note at function top)
+    g_moe_cached_cap_lo = (int) cap_lo;
+    if (cap_lo_out) { *cap_lo_out = (int) cap_lo; }
     return (int) cap;
 }
 
@@ -1321,12 +1482,50 @@ struct llama_moe_group_ud {
     int                     e_hi = 0;
 };
 
+// fork: userdata for one pass of the TWO-TIER prefill sweep (LLAMA_MOE_TIER_SWEEP). Same lifetime rules as
+// llama_moe_group_ud, but a group spans cap_hi + cap_lo experts split across the HIGH and LOW caches, and
+// the callback emits a unified-id + tier pack for ggml_mul_mat_id_2t. cap_hi/cap_lo are cached so the
+// callback need not re-read the caches under the lock.
+struct llama_moe_group_tiered_ud {
+    llama_moe_layer_cache * c_hi   = nullptr;
+    llama_moe_layer_cache * c_lo   = nullptr;
+    int                     e_lo   = 0;
+    int                     e_hi   = 0;
+    int                     cap_hi = 0;
+    int                     cap_lo = 0;
+};
+
 struct llama_moe_layer_cache {
     int n_expert  = 0;
     int capacity  = 0;
     int n_used    = 0;   // per-token expert activation
     int n_sentinel = 0;  // zero "sentinel" slots for dropped experts (<= n_used); see below
     int il        = -1;  // layer index parsed from the key tensor name; diagnostics only (LLAMA_MOE_LAYERDBG)
+
+    // fork: LOW-PRECISION EXPERT TIER (--moe-expert-gguf-low).
+    //   tier_low - THIS cache is the low tier. Its proj[].src are meta-only descriptors whose ->data is
+    //              null by design, so every expert read must go through the per-projection file handle;
+    //              the no-mmap takeover is therefore forced on for such a cache regardless of the env.
+    //   tier_lo  - the high tier's link to its low twin, re-set on every build_moe_ffn so it cannot
+    //              dangle across a capacity recap (which frees and rebuilds caches).
+    //   tier_w   - tiny constant device table {0.0f, 1.0f}. The tiered remap emits a per-position 0/1
+    //              tier selector; a get_rows over this turns it into the F32 gate mask that splits
+    //              `weights` between the two passes, so each routed position is applied exactly once.
+    bool                    tier_low = false;
+    llama_moe_layer_cache * tier_lo  = nullptr;
+    ggml_tensor *           tier_w   = nullptr; // [1,2] f32, high tier only
+
+    // Per-position "the high tier really served this one" flags of the most recent remap, laid out
+    // [n_used * n_tokens]. Written by llama_moe_layer_remap_cb (inside its lock, so it is exactly the
+    // residency the emitted slots were resolved against) only while tier_hit_want is set, and read by
+    // the tiered pack callback still on the compute thread. Never touched by the background loader.
+    bool                    tier_hit_want = false;
+    std::vector<char>       tier_hit;
+
+    // fork: when set, llama_moe_tiered_pack_cb emits the FUSED layout for ggml_mul_mat_id_2t (unified
+    // ids + tier, 2 rows) instead of the masked two-pass layout (hi ids + lo ids + tier, 3 rows). Set by
+    // llama_moe_layer_cache_remap_tiered from its `fused` argument; run-constant (LLAMA_MOE_TIER_FUSED).
+    bool                    tier_fused_emit = false;
 
     // fork: opportunistic prefetch queue (LLAMA_MOE_HASH_PREFETCH). Experts this layer is KNOWN to need on
     // the token now entering decode, queued before the graph is built so the background loader can land them
@@ -1344,6 +1543,10 @@ struct llama_moe_layer_cache {
 
     // prefill expert-group sweep: one descriptor per group, built once on first use
     std::vector<llama_moe_group_ud> group_ud;
+
+    // two-tier prefill sweep (LLAMA_MOE_TIER_SWEEP): one descriptor per combined-capacity group, built
+    // once on first use. Stored on the HIGH cache (which owns the sweep entry point).
+    std::vector<llama_moe_group_tiered_ud> group_tiered_ud;
 
     // Top-`capacity` experts of the most recent prefill ubatch, ranked by SELECTION FREQUENCY with the
     // exact comparator llama_moe_plan_remap uses (descending freq, ties by lower index). This is the
@@ -1502,6 +1705,141 @@ void llama_moe_register_expert_file(const ggml_tensor * exps, const char * path,
     g_moe_expert_files[exps] = llama_moe_expert_file{ std::string(path), file_offset };
 }
 
+//
+// fork: LOW-PRECISION EXPERT TIER (--moe-expert-gguf-low).
+//
+// A second GGUF of the same model, quantized lower, supplies a TWIN of every routed-expert tensor.
+// The twin is never loaded into a ggml buffer. All that is kept here is a meta-only DESCRIPTOR tensor
+// (allocated in a no_alloc context, so it owns no bytes and its ->data stays null) recording the twin's
+// type and shape, plus the file+offset the streaming layer freads its experts from. Because
+// ggml_new_tensor_3d lays out nb[2] exactly as a GGUF expert tensor does, that descriptor is a valid
+// `src` everywhere the per-layer cache already accepts one, so a parallel LOW cache can be built for the
+// same layer with no change to the cache machinery itself.
+//
+// Why a twin rather than swapping the experts outright (override_expert_tensors / --moe-expert-gguf):
+// with both tiers live, the budgeted experts stay at the main model's precision and every OTHER routed
+// position is served from the low-precision copy of the CORRECT expert, instead of falling back to a
+// wrong (stale) one. Expert identity is preserved everywhere; only precision degrades, and only
+// off-budget. Cost then scales with the LOW tier's bytes, which is what makes bigger models reachable.
+//
+// The three maps below are written once during model load (before any graph is built) and are read-only
+// afterwards, so the readers do not lock. `g_moe_low_files` is deliberately SEPARATE from
+// g_moe_expert_files: several places derive the MoE layer count as g_moe_expert_files.size()/n_proj, and
+// folding the twins in would double it.
+static const size_t LLAMA_MOE_LOW_MAX_TENSORS = 8192; // 4 projections x 2048 layers, ~3 MiB of descriptors
+
+static ggml_context * g_moe_low_ctx = nullptr;                                          // no_alloc, owns the descriptors
+static std::unordered_map<const ggml_tensor *, ggml_tensor *> g_moe_low_of_hi;          // main tensor -> descriptor
+static std::unordered_map<const ggml_tensor *, ggml_tensor *> g_moe_hi_of_low;          // descriptor  -> main tensor
+static std::unordered_map<const ggml_tensor *, llama_moe_expert_file> g_moe_low_files;  // descriptor  -> (path, offset0)
+
+void llama_moe_register_low_tier(const ggml_tensor * hi, int type, const int64_t * ne,
+                                 const char * path, uint64_t file_offset) {
+    if (!hi || !ne || !path || !*path) {
+        return;
+    }
+    // routed-expert tensors are strictly 3D [n_ff, n_embd, n_expert]; anything else is not ours to model
+    if (ne[0] <= 0 || ne[1] <= 0 || ne[2] <= 0 || ne[3] != 1) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
+    if (g_moe_low_of_hi.count(hi)) {
+        return;
+    }
+    if (!g_moe_low_ctx) {
+        ggml_init_params ip = {};
+        ip.mem_size   = ggml_tensor_overhead() * LLAMA_MOE_LOW_MAX_TENSORS;
+        ip.mem_buffer = nullptr;
+        ip.no_alloc   = true;
+        g_moe_low_ctx = ggml_init(ip);
+        if (!g_moe_low_ctx) {
+            LLAMA_LOG_ERROR("MoE low tier: failed to create the descriptor context; tier disabled\n");
+            return;
+        }
+    }
+    ggml_tensor * lo = ggml_new_tensor_3d(g_moe_low_ctx, (ggml_type) type, ne[0], ne[1], ne[2]);
+    if (!lo) {
+        LLAMA_LOG_ERROR("MoE low tier: descriptor pool exhausted at '%s'; tier disabled\n", ggml_get_name(hi));
+        return;
+    }
+    // same name as the main tensor: the cache parses "blk.<il>." out of it for the layer index and the
+    // per-expert score seeding keys off it too.
+    ggml_set_name(lo, ggml_get_name(hi));
+    g_moe_low_of_hi[hi] = lo;
+    g_moe_hi_of_low[lo] = const_cast<ggml_tensor *>(hi);
+    g_moe_low_files[lo] = llama_moe_expert_file{ std::string(path), file_offset };
+}
+
+// Descriptor for `hi`'s low-precision twin (null when the tier is off or this tensor has none).
+static ggml_tensor * llama_moe_low_tier(const ggml_tensor * hi) {
+    if (g_moe_low_of_hi.empty()) {
+        return nullptr;
+    }
+    auto it = g_moe_low_of_hi.find(hi);
+    return it == g_moe_low_of_hi.end() ? nullptr : it->second;
+}
+
+// True if `t` is a low-tier descriptor rather than a real model tensor (so ->data is null by design).
+static bool llama_moe_is_low_tier(const ggml_tensor * t) {
+    return !g_moe_hi_of_low.empty() && g_moe_hi_of_low.count(t) != 0;
+}
+
+bool llama_moe_low_tier_enabled(void) {
+    return !g_moe_low_of_hi.empty();
+}
+
+int llama_moe_low_tier_list(ggml_tensor * const * exps_list, int n_proj, ggml_tensor ** out_lo) {
+    if (!exps_list || !out_lo || n_proj <= 0 || g_moe_low_of_hi.empty()) {
+        return 0;
+    }
+    for (int i = 0; i < n_proj; ++i) {
+        ggml_tensor * lo = exps_list[i] ? llama_moe_low_tier(exps_list[i]) : nullptr;
+        if (!lo) {
+            return 0; // all-or-nothing: a partially twinned layer would mix tiers inside one FFN
+        }
+        out_lo[i] = lo;
+    }
+    return n_proj;
+}
+
+// Twin lookups in the other direction (low descriptor -> the main model tensor it shadows).
+static ggml_tensor * llama_moe_hi_tier(const ggml_tensor * lo) {
+    if (g_moe_hi_of_low.empty()) {
+        return nullptr;
+    }
+    auto it = g_moe_hi_of_low.find(lo);
+    return it == g_moe_hi_of_low.end() ? nullptr : it->second;
+}
+
+// Bytes one resident expert of this layer costs across all projections, counting BOTH tiers when the
+// low-precision twin tier is live. Both tiers' RAM pools are sized from a single experts-per-layer cap,
+// so any budget computed from one tier alone would be overrun by the other. Symmetric in which tier
+// `proj` belongs to.
+static uint64_t llama_moe_per_expert_bytes(const std::vector<llama_moe_proj_store> & proj) {
+    uint64_t per_expert = 0;
+    for (const auto & pr : proj) {
+        per_expert += (uint64_t) pr.stride;
+        if (!pr.src) { continue; }
+        const ggml_tensor * twin = llama_moe_low_tier(pr.src);
+        if (!twin) { twin = llama_moe_hi_tier(pr.src); }
+        if (twin)  { per_expert += (uint64_t) twin->nb[2]; }
+    }
+    return per_expert;
+}
+
+// On-disk location of an expert tensor, whether it is a main-model tensor or a low-tier descriptor.
+static const llama_moe_expert_file * llama_moe_expert_file_find(const ggml_tensor * t) {
+    auto it = g_moe_expert_files.find(t);
+    if (it != g_moe_expert_files.end()) {
+        return &it->second;
+    }
+    auto il = g_moe_low_files.find(t);
+    if (il != g_moe_low_files.end()) {
+        return &il->second;
+    }
+    return nullptr;
+}
+
 // Best source pointer for expert `e` of projection `pi`: the locked RAM pool if resident there
 // (fast, never faults to disk), else the mmap-backed weights (may page from disk on first touch).
 // Returns nullptr if the expert is not directly addressable (no-mmap mode with the expert only on
@@ -1517,6 +1855,9 @@ static inline const char * llama_moe_layer_src(const llama_moe_layer_cache * c, 
     }
     if (pr.fp) {
         return nullptr; // no-mmap: not directly addressable unless RAM-resident; use read_expert
+    }
+    if (!pr.src->data) {
+        return nullptr; // low-tier descriptor: meta only, the bytes live in the file (pr.fp)
     }
     return (const char *) pr.src->data + (size_t) e * pr.stride;
 }
@@ -1542,6 +1883,9 @@ static bool llama_moe_read_expert(const llama_moe_layer_cache * c, size_t pi, in
             return false;
         }
         return fread(dst, 1, (size_t) pr.stride, pr.fp) == (size_t) pr.stride;
+    }
+    if (!pr.src->data) {
+        return false; // low-tier descriptor without a file handle: unreadable, treat as a miss
     }
     memcpy(dst, (const char *) pr.src->data + (size_t) e * pr.stride, (size_t) pr.stride);
     return true;
@@ -1709,6 +2053,13 @@ static uint64_t g_diag_cb_ns    = 0; // total time inside the remap callback
 static uint64_t g_diag_pl_ns    = 0; // of which, in parallel_load (disk fread + H2D of synced experts)
 static uint64_t g_diag_sync_cnt = 0; // experts sync-loaded (per layer, summed)
 static uint64_t g_diag_ram_hit  = 0; // of those, how many were served from the RAM pool (no disk)
+// Same two counters restricted to the LOW tier (--moe-expert-gguf-low). The totals above are tier-blind,
+// which makes a two-tier run unreadable: "RAM-hit 53%" cannot say whether the high tier is faulting its
+// expensive slabs from disk or the low tier is faulting its cheap ones, and those two call for opposite
+// fixes. Kept as a subset of the totals (never subtracted from a wall figure) so the old lines still mean
+// what they meant.
+static uint64_t g_diag_sync_cnt_lo = 0;
+static uint64_t g_diag_ram_hit_lo  = 0;
 static uint64_t g_diag_lockwait_ns = 0; // time the remap callback waited to ACQUIRE g_moe_layer_mutex
 static uint64_t g_diag_publish_ns = 0; // time in the slot_table/stale_table publish sync sets (batching target)
 // read/h2d are summed across the io threads, so they are THREAD-SUMS: with N threads they can exceed
@@ -1722,6 +2073,16 @@ static std::atomic<uint64_t> g_diag_h2d_wall_ns{0}; // parallel_load: async H2D 
 static std::atomic<uint64_t> g_diag_ldr_read_ns{0}; // background loader: disk fread, thread-sum
 static std::atomic<uint64_t> g_diag_ldr_h2d_ns{0};  // background loader: staged H2D, thread-sum
 static std::atomic<uint64_t> g_diag_ldr_cnt{0};     // background loader: expert-projections it moved
+// The three counters above only cover the loader's parallel_load path (they are bumped under
+// `if (from_loader)` there). llama_moe_loader_fill_ram does its OWN serial fseek+fread into the host RAM
+// pool and so is invisible to them - a "LOADER ... 0 expert-proj" line therefore does NOT mean the loader
+// was idle, which reads as exactly the opposite of what it means. Count the RAM-pool promotions separately.
+static std::atomic<uint64_t> g_diag_fillram_cnt{0}; // experts promoted into the host RAM pool by fill_ram
+static std::atomic<uint64_t> g_diag_fillram_ns{0};  // fill_ram: unlocked disk read / page-cache memcpy
+// The loader's real VRAM promotion path (the inline claim/write/publish loop in llama_moe_loader_main's
+// Phase C), split by tier. Not covered by g_diag_ldr_cnt either - see the comment at the bump site.
+static std::atomic<uint64_t> g_diag_ldr_vram_hi{0};
+static std::atomic<uint64_t> g_diag_ldr_vram_lo{0};
 // WALL time of the whole read phase (spawn -> join, or the inline call at n_threads==1) plus the bytes
 // actually freaded in it. These two are what a "did the io get faster" question needs: the wall figure is
 // comparable across runs and the byte count normalises it, so read-phase bandwidth does not depend on
@@ -1740,7 +2101,13 @@ static const int g_diag_steps = 16; // decode steps covered by one timing print
 static int llama_moe_diag_n_layers(const llama_moe_layer_cache * c) {
     const size_t np = (c && !c->proj.empty()) ? c->proj.size() : 0;
     if (np == 0 || g_moe_expert_files.size() < np) { return 1; }
-    const int n = (int) (g_moe_expert_files.size() / np);
+    int n = (int) (g_moe_expert_files.size() / np);
+    // Two-tier mode puts TWO caches on every MoE layer and remap_cb runs once for each, so the callback
+    // count per decode step is 2*n_layers, not n_layers. g_moe_low_files is deliberately kept out of
+    // g_moe_expert_files (see the registry comment there) precisely so this division still yields the
+    // real layer count - which means the doubling has to be applied here instead. Without it the "/N
+    // steps" label is off by 2x in exactly the mode whose numbers are hardest to read.
+    if (llama_moe_low_tier_enabled()) { n *= 2; }
     return n > 0 ? n : 1;
 }
 
@@ -1802,6 +2169,9 @@ static std::atomic<uint64_t> g_covss_tokens{0};       // token-layers where the 
 static std::atomic<uint64_t> g_covss_have_x1000{0};   // sum of initial cov_have (top-2 cached weight) x1000
 static std::atomic<uint64_t> g_covss_earlystop{0};    // misses skipped by the early-stop rule (sum)
 static std::atomic<uint64_t> g_covss_cover_x1000{0};  // sum of the active step_cover x1000 (for mean)
+// cross-tier yield diagnostic (LLAMA_MOE_TIER_YIELD): high-tier sync loads handed down to the low twin
+// because it could already serve that position without disk I/O.
+static std::atomic<uint64_t> g_tier_yield_cnt{0};
 
 static std::thread       g_moe_loader_thread;
 static std::atomic<bool> g_moe_loader_run{false};
@@ -1860,6 +2230,82 @@ static bool llama_moe_scores_seed(const ggml_tensor * exps, std::vector<float> &
     return true;
 }
 
+// fork: cross-tier residency de-duplication (two-tier mode only). LLAMA_MOE_TIER_DEDUP=0 restores the
+// old fully-overlapping behaviour for A/B.
+static bool llama_moe_tier_dedup_on(void) {
+    static const bool on = moe_env_on("LLAMA_MOE_TIER_DEDUP", true);
+    return on;
+}
+
+// fork: the HIGH-tier cache that shares this low-tier cache's layer, or null.
+//
+// Resolved through the tensor twin maps (written once at model load) and NOT through the c_hi->tier_lo
+// link: that link is set while BUILDING the tiered remap, which only happens for n_tokens<=1, so during
+// the one-shot startup prefill - and during any prompt-eval graph - it is still null. The maps are
+// read-only after load, so this is safe from any thread. Caller must hold g_moe_layer_mutex (it reads
+// g_moe_layer_caches).
+static llama_moe_layer_cache * llama_moe_twin_high(const llama_moe_layer_cache * c_lo) {
+    if (!c_lo || !c_lo->tier_low || c_lo->proj.empty() || !c_lo->proj[0].src) {
+        return nullptr;
+    }
+    const ggml_tensor * hi_key = llama_moe_hi_tier(c_lo->proj[0].src);
+    if (!hi_key) {
+        return nullptr;
+    }
+    auto it = g_moe_layer_caches.find(hi_key);
+    if (it == g_moe_layer_caches.end() || !it->second) {
+        return nullptr;
+    }
+    // both tiers describe the same layer, so a mismatched expert count means we resolved the wrong cache
+    return it->second->n_expert == c_lo->n_expert ? it->second : nullptr;
+}
+
+// fork: rank a cache's experts hottest-first (expert_score descending, lowest index on a tie or when no
+// scores exist yet). Shared by the RAM-pool and VRAM-cache picks so the two cannot disagree on what
+// "hottest" means, and so the low tier's rank offset below means the same thing in both.
+static void llama_moe_rank_experts(const llama_moe_layer_cache * c, std::vector<int> & idx) {
+    const int ne = c->n_expert;
+    idx.resize((size_t) ne);
+    for (int e = 0; e < ne; ++e) { idx[(size_t) e] = e; }
+    const std::vector<float> & sc = c->expert_score;
+    const bool have_scores = ((int) sc.size() == ne);
+    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) {
+        const float sa = have_scores ? sc[(size_t) a] : 0.0f;
+        const float sb = have_scores ? sc[(size_t) b] : 0.0f;
+        if (sa != sb) { return sa > sb; } // highest score first
+        return a < b;                      // tie / cold: lowest index
+    });
+}
+
+// fork: how many of the hottest ranks the LOW tier skips when choosing residency. 0 for a high-tier
+// cache, for single-tier runs, and whenever the twin cannot be resolved.
+//
+// A routed position only ever reaches the low tier when the HIGH tier's VRAM cache missed it: the high
+// tier serves every VRAM hit itself and hands down only what it neither holds nor spends a sync load on
+// (llama_moe_layer_cache_remap_tiered). So the experts sitting in the high tier's VRAM slots are exactly
+// the ones the low tier is never asked for, and holding their low-precision copies is not a small
+// inefficiency - it is residency spent on demand that cannot arrive. Both tiers used to run the same
+// "top-rc by expert_score" pick with no awareness of the twin, so on equal scores (every cold start) the
+// two picks were the SAME set: the low tier's whole pool duplicated the high tier's holdings while the
+// low tier's real demand - the cold tail - faulted from disk every single time. That is why no static
+// (RAM_CAP, RAM_CAP_LOW) pair could win: the two pools were not additive, so feeding one starved the
+// other for identity coverage neither gained.
+//
+// The offset is the twin's `capacity` (VRAM slots) and deliberately NOT its ram_capacity: the high
+// tier's RAM-pool ranks below its VRAM set ARE reachable by the low tier, because the high tier only
+// spends sync_budget loads per layer per token and hands the rest of its misses down. Skipping those
+// would remove from the low tier's window precisely the ranks it is most likely to be asked for.
+static int llama_moe_low_tier_rank_offset(const llama_moe_layer_cache * c_lo) {
+    if (!llama_moe_tier_dedup_on()) {
+        return 0;
+    }
+    const llama_moe_layer_cache * c_hi = llama_moe_twin_high(c_lo);
+    if (!c_hi || c_hi->capacity <= 0) {
+        return 0;
+    }
+    return c_hi->capacity < c_lo->n_expert ? c_hi->capacity : 0;
+}
+
 // Fill each layer cache's locked RAM residency pool toward its highest-score experts, so VRAM
 // misses read from RAM (~25 GB/s) instead of faulting the model file from disk. Runs as a separate
 // loader phase so the slow part - reading an expert's bytes from disk - happens WITHOUT holding
@@ -1907,13 +2353,28 @@ static int llama_moe_loader_fill_ram(std::vector<char> & scratch) {
             {
                 std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
                 if ((int) c->expert_score.size() != c->n_expert) { break; }
+                // Low tier: the experts the high tier currently holds in VRAM never reach this tier
+                // (see llama_moe_low_tier_rank_offset), so pass over them first. This is the runtime
+                // form of the same rule the startup prefill applies by rank offset - without it the
+                // loader would steadily re-converge both pools onto the identical top-score set.
+                const llama_moe_layer_cache * c_hi = llama_moe_tier_dedup_on() ? llama_moe_twin_high(c) : nullptr;
+                const bool hi_slots_ok = c_hi && (int) c_hi->expert_slot.size() == c->n_expert;
                 // best-scoring expert not currently in the RAM pool. Prefer score, but if all scores
                 // are ~0 (early, or weighted_evict off) still promote by index so the pool fills to
                 // capacity - an empty RAM slot is always better than a disk fault.
                 float best = -1.0f;
                 for (int e = 0; e < c->n_expert; ++e) {
                     if (c->ram_slot[(size_t) e] >= 0) { continue; }
+                    if (hi_slots_ok && c_hi->expert_slot[(size_t) e] >= 0) { continue; }
                     if (c->expert_score[(size_t) e] > best) { best = c->expert_score[(size_t) e]; target_e = e; }
+                }
+                if (target_e < 0 && hi_slots_ok) {
+                    // nothing left outside the high tier's VRAM set: fall through to it rather than
+                    // leave pool slots empty (a duplicate still beats a disk fault if routing shifts)
+                    for (int e = 0; e < c->n_expert; ++e) {
+                        if (c->ram_slot[(size_t) e] >= 0) { continue; }
+                        if (c->expert_score[(size_t) e] > best) { best = c->expert_score[(size_t) e]; target_e = e; }
+                    }
                 }
                 if (target_e < 0) { break; } // every expert already RAM-resident
                 target_sc = best;
@@ -1948,6 +2409,7 @@ static int llama_moe_loader_fill_ram(std::vector<char> & scratch) {
             // to this slot cannot race ours. Otherwise the prefill's spin on g_moe_loader_reading waits for
             // this read to finish before it touches any slot.
             bool ok = true;
+            const int64_t t_rd0 = ggml_time_us();
             g_moe_loader_reading.fetch_add(1, std::memory_order_seq_cst);
             if (g_moe_prefill_running.load(std::memory_order_seq_cst)) {
                 ok = false; // prefill owns the pool now; abandon this fill cleanly
@@ -1964,6 +2426,9 @@ static int llama_moe_loader_fill_ram(std::vector<char> & scratch) {
                             ok = false; break;
                         }
                     } else {
+                        if (!pr.src->data) {
+                            ok = false; break; // low-tier descriptor with no loader file handle
+                        }
                         memcpy(ramdst, (const char *) pr.src->data + (size_t) target_e * pr.stride, (size_t) pr.stride);
                         if (c->evict_after_ram) {
                             llama_moe_evict_pagecache((const char *) pr.src->data + (size_t) target_e * pr.stride, (size_t) pr.stride);
@@ -1972,6 +2437,7 @@ static int llama_moe_loader_fill_ram(std::vector<char> & scratch) {
                 }
             }
             g_moe_loader_reading.fetch_sub(1, std::memory_order_seq_cst);
+            g_diag_fillram_ns.fetch_add((uint64_t) (ggml_time_us() - t_rd0), std::memory_order_relaxed);
 
             // publish under the lock: the slot's bytes are in place, make it readable as `target_e`
             {
@@ -1986,6 +2452,7 @@ static int llama_moe_loader_fill_ram(std::vector<char> & scratch) {
             }
             fill_budget--;
             promoted++;
+            if (ok) { g_diag_fillram_cnt.fetch_add(1, std::memory_order_relaxed); }
         }
     }
     return promoted;
@@ -2023,28 +2490,27 @@ static void llama_moe_prefill_ram_pools(void) {
 
     uint64_t total_bytes = 0;
     int filled_caches = 0;
+    int dedup_caches = 0, dedup_off = 0;
     for (llama_moe_layer_cache * c : caches) {
         if (!c || c->ram_capacity <= 0 || c->proj.empty() || !c->proj[0].ram) { continue; }
         // need per-thread file handles (no-mmap path); skip if not registered
         if (c->proj[0].fpath.empty()) { continue; }
         const int rc = c->ram_capacity;
         const int ne = c->n_expert;
+        // Low tier: start `off` ranks down so the two tiers' pools are ADDITIVE in expert identities
+        // instead of holding the same set twice (llama_moe_low_tier_rank_offset). 0 for the high tier.
+        const int off = llama_moe_low_tier_rank_offset(c);
+        if (off > 0) { dedup_caches++; dedup_off = off; }
 
         // choose the rc experts to resident: highest expert_score first, else lowest index. This is the
-        // same target set fill_ram would converge to, computed once here.
+        // same target set fill_ram would converge to, computed once here. Wrapping past the end is
+        // deliberate: when rc is large enough to run out of tail, a duplicate of a hot expert still
+        // beats leaving the slot empty.
+        std::vector<int> idx;
+        llama_moe_rank_experts(c, idx);
         std::vector<int> pick; pick.reserve((size_t) rc);
-        {
-            std::vector<int> idx(ne);
-            for (int e = 0; e < ne; ++e) { idx[e] = e; }
-            const std::vector<float> & sc = c->expert_score;
-            const bool have_scores = ((int) sc.size() == ne);
-            std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) {
-                const float sa = have_scores ? sc[(size_t) a] : 0.0f;
-                const float sb = have_scores ? sc[(size_t) b] : 0.0f;
-                if (sa != sb) { return sa > sb; } // highest score first
-                return a < b;                      // tie / cold: lowest index
-            });
-            for (int i = 0; i < rc && i < ne; ++i) { pick.push_back(idx[(size_t) i]); }
+        for (int i = 0; i < rc && i < ne; ++i) {
+            pick.push_back(idx[(size_t) ((off + i) % ne)]);
         }
 
         // assign RAM slots 0..rc-1 to the picked experts, publish the maps (no decode running yet)
@@ -2095,6 +2561,11 @@ static void llama_moe_prefill_ram_pools(void) {
     LLAMA_LOG_WARN("MoE stream: prefilled RAM pools - %.1f GiB across %d layers in %.1fs (%.2f GiB/s) "
                    "with %d io threads (warm-start; skips the serial loader ramp).\n",
                    gb, filled_caches, ms/1000.0, ms > 0 ? gb/(ms/1000.0) : 0.0, n_threads);
+    if (dedup_caches > 0) {
+        LLAMA_LOG_WARN("MoE stream: two-tier residency de-dup active on %d low-tier caches - their pools "
+                       "start %d ranks below the high tier's VRAM set, so the two tiers cover distinct "
+                       "experts (LLAMA_MOE_TIER_DEDUP=0 to disable).\n", dedup_caches, dedup_off);
+    }
 
     // Host-memory pressure report. The pools are all allocated by now, so this is the final split of
     // pinned vs pageable vs refused pool bytes, next to the system commit charge - the only figure here
@@ -2132,19 +2603,15 @@ static void llama_moe_prefill_ram_pools(void) {
             if (!c || c->capacity <= 0 || c->proj.empty() || !c->proj[0].dev) { continue; }
             const int cap = c->capacity;
             const int ne  = c->n_expert;
+            // same rank offset as the RAM pool above: a low tier's VRAM slots must not be filled with
+            // the experts its high twin already serves from ITS VRAM, or the whole low cache is
+            // residency aimed at demand that never arrives (llama_moe_low_tier_rank_offset)
+            const int off = llama_moe_low_tier_rank_offset(c);
             // pick the top-cap experts (highest expert_score, else lowest index) - same ranking as RAM
-            std::vector<int> idx(ne);
-            for (int e = 0; e < ne; ++e) { idx[e] = e; }
-            const std::vector<float> & sc = c->expert_score;
-            const bool have_scores = ((int) sc.size() == ne);
-            std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) {
-                const float sa = have_scores ? sc[(size_t) a] : 0.0f;
-                const float sb = have_scores ? sc[(size_t) b] : 0.0f;
-                if (sa != sb) { return sa > sb; }
-                return a < b;
-            });
+            std::vector<int> idx;
+            llama_moe_rank_experts(c, idx);
             for (int s = 0; s < cap && s < ne; ++s) {
-                const int e = idx[(size_t) s];
+                const int e = idx[(size_t) ((off + s) % ne)];
                 if (c->expert_slot[(size_t) e] >= 0) { continue; } // already resident (shouldn't happen pre-decode)
                 moe_layer_load_into_slot(c, e, s, ldbuf); // sources from warm RAM pool; publishes slot/stale tables
                 for (auto & pr : c->proj) { vram_bytes += (uint64_t) pr.stride; }
@@ -2219,7 +2686,10 @@ void llama_moe_layer_prefetch(int il, const int32_t * ids, int n_ids) {
                 g_moe_pf_pending.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        break; // one cache per layer index
+        // Two-tier mode (--moe-expert-gguf-low) puts TWO caches on the same layer index, so this cannot
+        // stop at the first match. Queuing on both is right: each tier serves the positions the other
+        // does not, and the queue is a hint - servicing it twice costs at most two loads that would
+        // otherwise have happened on demand.
     }
 }
 
@@ -2533,6 +3003,16 @@ static void llama_moe_loader_main() {
                     lock.lock();
                     moe_layer_publish_slot(c, e, slot);
                     pass_promoted++;
+                    // Instrumentation gap this closes: g_diag_ldr_cnt (the "N expert-proj" in the wall
+                    // line) is bumped only inside llama_moe_layer_parallel_load under `from_loader`, and
+                    // the ONLY caller passing from_loader=true is moe_drain_prefetch - the dsv4 hash
+                    // prefetch, off unless LLAMA_MOE_HASH_PREFETCH is set. THIS loop is the loader's real
+                    // VRAM promotion path and it was invisible, so "0 expert-proj" read as "the loader
+                    // never promotes to VRAM" when it only ever meant "the prefetch queue was empty".
+                    // Split by tier: in two-tier mode the two caches compete for one loader thread, and
+                    // whether the high tier gets promoted at all is the question this answers.
+                    if (c->tier_low) { g_diag_ldr_vram_lo.fetch_add(1, std::memory_order_relaxed); }
+                    else             { g_diag_ldr_vram_hi.fetch_add(1, std::memory_order_relaxed); }
                 }
             }
         }
@@ -2663,21 +3143,38 @@ ggml_tensor * llama_moe_cache_build_async(ggml_context *       ctx0,
 //   LLAMA_MOE_RAM_FRAC=F         -> hard ceiling as a fraction of avail; only binds when the reserve is
 //                                   set too low to be safe on its own (default 0.97)
 //   LLAMA_MOE_RAM_RESERVE_MB=N   -> MiB of available RAM left free; exact (default 5120 = 5 GiB)
-static int llama_moe_auto_ram_capacity(const std::vector<llama_moe_proj_store> & proj, int n_expert) {
+//   LLAMA_MOE_RAM_SPLIT_HI=F     -> two-tier only: fraction of the byte budget the HIGH tier gets (0.15)
+// `tier_low` says which tier the caller is sizing. In two-tier mode both caps come out of one budget on
+// the first call and are cached, so the two pools can never be sized against different avail readings.
+static int llama_moe_auto_ram_capacity(const std::vector<llama_moe_proj_store> & proj, int n_expert,
+                                       bool tier_low) {
     if (proj.empty() || n_expert <= 0) { return 0; }
     // Compute ONCE and reuse for every layer (same reason as llama_moe_auto_capacity): this is called
     // per layer as caches are created, and avail RAM shrinks as each layer's pool allocates - so
     // recomputing would shrink the cap for later layers and under-fill RAM. Cache the first (max-avail)
     // result so all layers get a uniform pool size.
-    static int cached_rc = 0;
-    if (cached_rc > 0) { return cached_rc; }
+    static int cached_rc    = 0; // high tier, or the only tier
+    static int cached_rc_lo = 0;
+    if (tier_low ? cached_rc_lo > 0 : cached_rc > 0) { return tier_low ? cached_rc_lo : cached_rc; }
 
     const uint64_t avail = llama_moe_avail_ram();
     if (avail == 0) { return 0; }
 
-    uint64_t per_expert = 0; // bytes one resident expert costs across all projections of a layer
-    for (const auto & pr : proj) { per_expert += (uint64_t) pr.stride; }
+    uint64_t per_expert = llama_moe_per_expert_bytes(proj); // both tiers when the low twin tier is live
     if (per_expert == 0) { return 0; }
+    // Split the combined figure back into its halves so the budget can be divided by BYTES. `proj` is
+    // whichever tier the caller is sizing, so the twin contributes the other half.
+    uint64_t own_expert = 0, twin_expert = 0;
+    for (const auto & pr : proj) {
+        own_expert += (uint64_t) pr.stride;
+        if (!pr.src) { continue; }
+        const ggml_tensor * twin = llama_moe_low_tier(pr.src);
+        if (!twin) { twin = llama_moe_hi_tier(pr.src); }
+        if (twin)  { twin_expert += (uint64_t) twin->nb[2]; }
+    }
+    const uint64_t hi_expert = tier_low ? twin_expert : own_expert;
+    const uint64_t lo_expert = tier_low ? own_expert  : twin_expert;
+    const bool     two_tier  = hi_expert > 0 && lo_expert > 0;
 
     // Derive the MoE-layer count from the registered expert files (one entry per exps tensor, n_proj per
     // layer). At the first layer's cache creation only this cache exists, but all expert files are
@@ -2713,21 +3210,52 @@ static int llama_moe_auto_ram_capacity(const std::vector<llama_moe_proj_store> &
     if (usable == 0) { return 0; }
 
     const uint64_t denom = (uint64_t) n_moe_layers * per_expert;
-    long long cap = (long long) (usable / denom);
+    long long cap    = (long long) (usable / denom); // equal-slot-count anchor / single-tier answer
+    long long cap_lo = 0;
+    double    hi_share = 0.15;
+    if (two_tier) {
+        // One slot count shared by both tiers spends ~2/3 of the pool on the high tier (a high slab is
+        // about twice a low one) - and that is the wrong way round for DECODE. With LLAMA_MOE_TIER_YIELD
+        // on, the high tier issues no synchronous decode loads: its pool only feeds the background loader's
+        // promotions, which have their own backoff, while the low tier is read on every off-budget position
+        // of every layer, one expert at a time, on the token's critical path.
+        // The high tier is not idle overall - the prefill expert-group sweep runs entirely on it and does
+        // load synchronously - but those loads go through llama_moe_layer_parallel_load, i.e. the whole
+        // ubatch's misses issued at once across the io threads, where bandwidth and not latency decides.
+        // A RAM slot is therefore worth more to the low tier per byte. Raise LLAMA_MOE_RAM_SPLIT_HI to
+        // trade decode back for prefill; the total budget is unchanged either way, this only divides it.
+        if (const char * se = getenv("LLAMA_MOE_RAM_SPLIT_HI")) {
+            const double s = atof(se);
+            if (s >= 0.0 && s <= 1.0) { hi_share = s; }
+        }
+        const uint64_t per_layer = usable / (uint64_t) n_moe_layers;
+        cap    = (long long) ((uint64_t) (hi_share * (double) per_layer) / hi_expert);
+        cap_lo = (long long) ((uint64_t) ((1.0 - hi_share) * (double) per_layer) / lo_expert);
+        if (cap_lo > n_expert) { cap_lo = n_expert; }
+    }
     if (cap < 0)        { cap = 0; }
     if (cap > n_expert) { cap = n_expert; }
     static bool logged = false;
-    if (!logged && cap > 0) {
+    if (!logged && (cap > 0 || cap_lo > 0)) {
         logged = true;
         const double gib = 1024.0*1024.0*1024.0;
-        const double pool_gib = (double) ((uint64_t) cap * denom) / gib;
+        const double pool_gib = two_tier
+            ? (double) ((uint64_t) n_moe_layers * ((uint64_t) cap * hi_expert + (uint64_t) cap_lo * lo_expert)) / gib
+            : (double) ((uint64_t) cap * denom) / gib;
         LLAMA_LOG_WARN("MoE stream: auto RAM_CAP=%lld -> ~%.1f GiB host pool across %d MoE layers "
                        "(avail %.1f GiB, reserve %.1f GiB for OS/mmap, frac %.2f, %.1f MiB/expert). "
                        "Override with LLAMA_MOE_RAM_CAP; tune LLAMA_MOE_RAM_FRAC / LLAMA_MOE_RAM_RESERVE_MB.\n",
                        cap, pool_gib, n_moe_layers, avail/gib, reserve/gib, frac, per_expert/(1024.0*1024.0));
+        if (two_tier) {
+            LLAMA_LOG_WARN("MoE stream: two-tier host pool -> %lld high experts/layer at %.2f MiB (%.0f%% of "
+                           "the budget) + %lld low at %.2f MiB. Override with LLAMA_MOE_RAM_CAP_LOW; tune "
+                           "LLAMA_MOE_RAM_SPLIT_HI.\n",
+                           cap, hi_expert/(1024.0*1024.0), 100.0*hi_share, cap_lo, lo_expert/(1024.0*1024.0));
+        }
     }
-    if (cap > 0) { cached_rc = (int) cap; } // reuse for all remaining layers
-    return (int) cap;
+    if (cap > 0)    { cached_rc    = (int) cap; }    // reuse for all remaining layers
+    if (cap_lo > 0) { cached_rc_lo = (int) cap_lo; }
+    return (int) (tier_low ? cap_lo : cap);
 }
 
 // Look up an EXISTING per-layer cache by its first projection tensor (the map key), without creating
@@ -2758,17 +3286,27 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
     }    if (n_proj <= 0 || !exps_list || !exps_list[0]) {
         return nullptr;
     }
+    std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
+
     // The graph is built once during the sched_reserve/graph_reserve measurement pass, before
     // the model's expert weights are populated (with mmap=false the host buffers are filled by
     // load_tensors only after reserve). Creating the cache now would prewarm-copy from an
     // unbacked source pointer (CUDA "invalid argument" in ggml_backend_tensor_set). Defer until
     // the source data is resident; the caller falls back to the compaction gather for the pass.
+    //
+    // A LOW-TIER cache is the exception: its sources are meta-only descriptors that never get a
+    // ->data at all, so readiness is instead "we know which file and offset to fread from".
+    const bool tier_low = llama_moe_is_low_tier(exps_list[0]);
     for (int i = 0; i < n_proj; ++i) {
-        if (!exps_list[i] || !exps_list[i]->data) {
+        if (!exps_list[i]) {
+            return nullptr;
+        }
+        if (tier_low) {
+            if (!llama_moe_expert_file_find(exps_list[i])) { return nullptr; }
+        } else if (!exps_list[i]->data) {
             return nullptr;
         }
     }
-    std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
 
     const ggml_tensor * key = exps_list[0];
     auto it = g_moe_layer_caches.find(key);
@@ -2783,6 +3321,22 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
 
     const int n_expert = (int) exps_list[0]->ne[2];
     const int n_used   = (int) selected_experts->ne[0];
+    // fork: the low tier gets its OWN VRAM slot count, mirroring LLAMA_MOE_RAM_CAP_LOW on the host side.
+    // Without a second count the two tiers would be bound 1:1 BY SLOT, which spends ~66% of the VRAM
+    // budget on the high tier (a high slab is ~2x a low one); the split that matters is by BYTES, with the
+    // slot counts derived: cap_lo = (budget - cap_hi*hi_bytes) / lo_bytes. That division is what
+    // llama_moe_auto_capacity now does, and `capacity` already carries its answer when it ran; this env
+    // var overrides it. cap_hi is the knob to reach for first - it decides how many routed experts are
+    // served at high precision AND the prefill sweep's pass count; the low tier absorbs whatever is left.
+    // Pinning cap_hi alone is fine (the sizer then fits cap_lo to the remainder), but pinning BOTH means
+    // you own the budget: keep cap_hi*hi_bytes + cap_lo*lo_bytes inside what the auto path would have
+    // taken, or the caches overcommit VRAM and the driver starts paging the working set over PCIe.
+    if (tier_low) {
+        if (const char * cl = getenv("LLAMA_MOE_CACHE_CAP_LOW")) {
+            const int v = atoi(cl);
+            if (v > 0) { capacity = v; }
+        }
+    }
     capacity = llama_moe_clamp_capacity(capacity, n_expert, n_used);
 
     // Number of physical zero sentinel slots for dropped experts. Each costs one full expert slab of
@@ -2818,6 +3372,7 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
     c->capacity   = capacity;
     c->n_used     = n_used;
     c->n_sentinel = n_sentinel;
+    c->tier_low   = tier_low;
     c->prewarm_pending = prewarm_pending;
     // Layer index, parsed from the key tensor's "blk.<il>." prefix. Diagnostics only (LLAMA_MOE_LAYERDBG):
     // the cache is otherwise layer-agnostic, but a per-layer residency profile is the only way to see that
@@ -2853,13 +3408,21 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
     // capacity resident slots + n_sentinel zero sentinel slots [capacity .. capacity+n_sentinel)
     const int n_slots = capacity + n_sentinel;
 
-    const size_t n_tensors = 3 + (size_t) n_proj;
+    // The high tier of a two-tier layer also owns tier_w, the constant {0,1} gate-mask table. Allocate it
+    // only when the tier is actually in use, so a plain (single-tier) run keeps byte-identical VRAM
+    // accounting.
+    const bool want_tier_w = llama_moe_low_tier_enabled() && !tier_low;
+
+    const size_t n_tensors = 3 + (want_tier_w ? 1 : 0) + (size_t) n_proj;
     struct ggml_init_params ip = { n_tensors * ggml_tensor_overhead(), nullptr, /*.no_alloc =*/ true };
     c->ctx           = ggml_init(ip);
     c->slot_table    = ggml_new_tensor_2d(c->ctx, GGML_TYPE_I32, 1, n_expert);
     c->stale_table   = ggml_new_tensor_2d(c->ctx, GGML_TYPE_I32, 1, n_expert);
     // sel_buf holds one decode step's selection [n_used,1]; prefill warming loads directly
     c->sel_buf       = ggml_new_tensor_2d(c->ctx, GGML_TYPE_I32, selected_experts->ne[0], 1);
+    if (want_tier_w) {
+        c->tier_w    = ggml_new_tensor_2d(c->ctx, GGML_TYPE_F32, 1, 2);
+    }
     c->proj.resize((size_t) n_proj);
     for (int i = 0; i < n_proj; ++i) {
         c->proj[(size_t) i].src    = exps_list[i];
@@ -2879,23 +3442,33 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
     c->stage_dev = ggml_backend_get_device(backend);
     c->dev_backend = backend; // for async H2D on the device stream + a single synchronize per load batch
 
+    if (want_tier_w) {
+        const float tw[2] = { 0.0f, 1.0f };
+        ggml_backend_tensor_set(c->tier_w, tw, 0, sizeof(tw));
+    }
+
     // no-mmap takeover: if enabled and every projection has a registered file location, open a
     // private FILE* per projection and read experts by offset (fread) instead of from the mmap
     // `src->data`. This keeps the OS page cache out of the expert path entirely - the only expert
     // bytes in RAM are the ones we deliberately hold in the locked pool. Falls back to mmap if any
     // projection lacks registration.
-    if (moe_env_on("LLAMA_MOE_NOMMAP", true)) {
+    //
+    // For a LOW-TIER cache there is nothing to fall back TO - its sources are meta-only descriptors
+    // with a null ->data - so the takeover is mandatory and a failed open must abort the build.
+    if (tier_low || moe_env_on("LLAMA_MOE_NOMMAP", true)) {
+        llama_moe_raise_stdio_limit();
         bool all_registered = true;
         for (int i = 0; i < n_proj; ++i) {
-            auto fit = g_moe_expert_files.find(exps_list[i]);
-            if (fit == g_moe_expert_files.end()) { all_registered = false; break; }
+            if (!llama_moe_expert_file_find(exps_list[i])) { all_registered = false; break; }
         }
         if (all_registered) {
             bool ok = true;
+            int  open_errno = 0;
+            std::string open_path;
             for (int i = 0; i < n_proj && ok; ++i) {
-                const llama_moe_expert_file & ef = g_moe_expert_files[exps_list[i]];
+                const llama_moe_expert_file & ef = *llama_moe_expert_file_find(exps_list[i]);
                 FILE * fp = fopen(ef.path.c_str(), "rb");
-                if (!fp) { ok = false; break; }
+                if (!fp) { ok = false; open_errno = errno; open_path = ef.path; break; }
                 // separate handle for the background loader's fill_ram (it reads outside the mutex,
                 // so it must not share a file position with the compute-thread fp). Optional: if the
                 // second open fails, fill_ram simply won't run for this layer (no correctness issue).
@@ -2916,8 +3489,25 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
                     if (c->proj[(size_t) i].fp)    { fclose(c->proj[(size_t) i].fp);    c->proj[(size_t) i].fp    = nullptr; }
                     if (c->proj[(size_t) i].fp_ld) { fclose(c->proj[(size_t) i].fp_ld); c->proj[(size_t) i].fp_ld = nullptr; }
                 }
-                LLAMA_LOG_WARN("MoE stream: no-mmap takeover requested but file open failed; using mmap.\n");
+                if (tier_low) {
+                    LLAMA_LOG_ERROR("MoE low tier: cannot open '%s' for reading (errno %d: %s); "
+                                    "the tier is unusable for this layer.\n",
+                                    open_path.c_str(), open_errno, strerror(open_errno));
+                    ggml_backend_buffer_free(c->buffer);
+                    ggml_free(c->ctx);
+                    delete c;
+                    return nullptr;
+                }
+                LLAMA_LOG_WARN("MoE stream: no-mmap takeover requested but opening '%s' failed "
+                               "(errno %d: %s); using mmap.\n",
+                               open_path.c_str(), open_errno, strerror(open_errno));
             }
+        } else if (tier_low) {
+            LLAMA_LOG_ERROR("MoE low tier: expert file offsets not registered for this layer.\n");
+            ggml_backend_buffer_free(c->buffer);
+            ggml_free(c->ctx);
+            delete c;
+            return nullptr;
         } else {
             LLAMA_LOG_WARN("MoE stream: LLAMA_MOE_NOMMAP set but expert file offsets not registered; "
                            "using mmap. (Is the model loaded with expert-file registration?)\n");
@@ -2928,11 +3518,19 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
     // disk. LLAMA_MOE_RAM_CAP = experts/layer to hold in RAM. Unset/0 => auto-sized from available
     // system RAM (see llama_moe_auto_ram_capacity); a disk-streamed model always benefits from as large
     // a RAM tier as fits, so auto is the sensible default rather than "off". Clamp to n_expert.
+    //
+    // fork: the low tier has its OWN knob, LLAMA_MOE_RAM_CAP_LOW, so the two pools can be sized
+    // independently (the natural setting is a fully resident low tier plus a hot-core high tier - the
+    // low tier is read on every off-budget position of every layer, so it is the one that benefits most
+    // from RAM). An explicit LLAMA_MOE_RAM_CAP deliberately does NOT propagate to the low tier: it was
+    // tuned to fill RAM with one pool, and silently adding a second would push the machine into the
+    // pagefile. When neither is set, both tiers go through the auto sizer, which divides ONE budget
+    // between them (see llama_moe_auto_ram_capacity / LLAMA_MOE_RAM_SPLIT_HI).
     {
-        const char * rc_env = getenv("LLAMA_MOE_RAM_CAP");
+        const char * rc_env = getenv(tier_low ? "LLAMA_MOE_RAM_CAP_LOW" : "LLAMA_MOE_RAM_CAP");
         int rc = rc_env ? atoi(rc_env) : 0;
         if (!rc_env || rc <= 0) {
-            rc = llama_moe_auto_ram_capacity(c->proj, n_expert); // 0 if unmeasurable => tier stays off
+            rc = llama_moe_auto_ram_capacity(c->proj, n_expert, tier_low); // 0 if unmeasurable => tier off
         }
         if (rc > n_expert) { rc = n_expert; }
         if (rc > 0) {
@@ -2942,8 +3540,7 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
             // Idempotent, so this is a no-op when llama_moe_auto_ram_capacity already asked - it matters on
             // the explicit LLAMA_MOE_RAM_CAP path, which skips the auto sizing entirely.
             {
-                uint64_t per_expert = 0;
-                for (const auto & pr : c->proj) { per_expert += (uint64_t) pr.stride; }
+                const uint64_t per_expert = llama_moe_per_expert_bytes(c->proj);
                 int n_moe_layers = n_proj > 0 ? (int) (g_moe_expert_files.size() / (size_t) n_proj) : 1;
                 if (n_moe_layers < 1) { n_moe_layers = 1; }
                 (void) llama_moe_ram_quota_reserve((uint64_t) rc * per_expert * (uint64_t) n_moe_layers);
@@ -3091,6 +3688,19 @@ ggml_tensor * llama_moe_layer_cache_dev(llama_moe_layer_cache * c, const ggml_te
     for (auto & pr : c->proj) {
         if (pr.src == exps) {
             return pr.dev;
+        }
+    }
+    // fork: the graph keeps passing the MAIN model's expert tensor even while building the low-tier
+    // pass (build_experts is shared between the two passes and reads model->layers[il].ffn_*_exps), so
+    // a low-tier cache resolves it through the twin map instead of failing.
+    if (c->tier_low) {
+        const ggml_tensor * lo = llama_moe_low_tier(exps);
+        if (lo) {
+            for (auto & pr : c->proj) {
+                if (pr.src == lo) {
+                    return pr.dev;
+                }
+            }
         }
     }
     return nullptr;
@@ -3600,6 +4210,133 @@ bool llama_moe_stride_freefly(void) {
     return g_stride_freefly.load(std::memory_order_relaxed);
 }
 
+// fork: RAM-aware verify-batch residency gate (LLAMA_MOE_VERIFY_GATE=1, off by default).
+//
+// An MTP/speculative verify batch is [1 sampled token + k drafts]. Its columns are INDEPENDENT routing
+// steps, so the ordinary multi-token remap sync-loads the UNION of their experts: k+1 columns cost k+1
+// columns' worth of expert loads while producing at most k+1 tokens. There is no amortization, which is
+// the structural reason MTP does not pay for itself on the streaming path.
+//
+// The gate makes the load decision source-aware instead of loading the whole union:
+//   - column 0 (the committed token): load every miss, exactly as a decode step would;
+//   - columns 1..k (the drafts): load a miss only if the expert is in the host RAM pool (a fast H2D),
+//     and SKIP it if it would need a disk read.
+// A draft column that had an expert skipped computes its FFN with a stale substitute, so its logits are
+// wrong and it must not be accepted. The gate therefore reports how many LEADING draft columns are
+// exact (every routed expert VRAM-resident after this step's loads), minimised over all layers, and the
+// caller clamps the accepted run to that many. Every committed token then ran on its real experts.
+// (That is NOT the same as byte-identical text vs the ungated run: the gate changes the batch WIDTH, and
+// a 2-column matmul does not produce bit-identical logits to a 3-column one. Measured: the gate is
+// self-consistent run to run - 3/3 identical - but its md5 differs from gate-off, which itself differs
+// from no-MTP.)
+//
+// LLAMA_MOE_VERIFY_GATE_RAM=0 drops the "RAM counts" relaxation back to the column-0-only rule, which
+// measured ~0 allowed drafts (essentially every batch truncated), so both rules live in one build.
+// LLAMA_MOE_VERIFY_GATE_LOSSY=1 keeps the cheaper load set but does NOT clamp - the upper bound on what
+// this whole family can be worth, paid for by accepting drafts computed on stale experts.
+//
+// Arming is explicit so a prefill ubatch that happens to have the same n_tokens can never take this
+// path: prefill must keep loading its full working set (see llama_moe_verify_gate_arm).
+static const int MOE_VGATE_MAX_COLS = 64;
+
+static std::atomic<int32_t>  g_vgate_cols{0};    // columns armed for the batch in flight (0 = not armed)
+static std::atomic<int32_t>  g_vgate_depth{0};   // min over layers: leading exact draft columns AFTER loads
+static std::atomic<int32_t>  g_vgate_depth_v{0}; // same, counterfactual: VRAM-only residency at entry
+static std::atomic<int32_t>  g_vgate_depth_r{0}; // same, counterfactual: VRAM-or-RAM residency at entry
+static std::atomic<uint64_t> g_vgate_batches{0};
+static std::atomic<uint64_t> g_vgate_lay{0};     // layer-callbacks that actually reported (0 => not engaged)
+static std::atomic<uint64_t> g_vgate_full{0};    // batches allowed the full draft count
+static std::atomic<uint64_t> g_vgate_sum{0};     // sum of the allowed depth
+static std::atomic<uint64_t> g_vgate_sum_v{0};   // sum of the VRAM-only counterfactual depth
+static std::atomic<uint64_t> g_vgate_sum_r{0};   // sum of the VRAM-or-RAM counterfactual depth
+static std::atomic<uint64_t> g_vgate_skip{0};    // draft-column misses skipped (would have been disk reads)
+static std::atomic<uint64_t> g_vgate_ram{0};     // draft-column misses loaded from the RAM pool
+static std::atomic<uint64_t> g_vgate_c0{0};      // column-0 misses loaded (the unavoidable set)
+
+static bool llama_moe_verify_gate_enabled(void) {
+    static const bool on = []() {
+        const char * e = getenv("LLAMA_MOE_VERIFY_GATE");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+// default ON: treating a RAM-pool hit as loadable-and-therefore-present is the whole relaxation
+static bool llama_moe_verify_gate_ram(void) {
+    static const bool on = []() {
+        const char * e = getenv("LLAMA_MOE_VERIFY_GATE_RAM");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static bool llama_moe_verify_gate_lossy(void) {
+    static const bool on = []() {
+        const char * e = getenv("LLAMA_MOE_VERIFY_GATE_LOSSY");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+// layers report concurrently only in principle (the remap callbacks are serialized by the graph), but
+// keep this a CAS loop so the accumulator never depends on that.
+static inline void moe_vgate_min(std::atomic<int32_t> & a, int32_t v) {
+    int32_t cur = a.load(std::memory_order_relaxed);
+    while (v < cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) { }
+}
+
+void llama_moe_verify_gate_arm(int32_t n_cols) {
+    if (!llama_moe_verify_gate_enabled()) {
+        return;
+    }
+    if (n_cols < 2 || n_cols > MOE_VGATE_MAX_COLS) {
+        g_vgate_cols.store(0, std::memory_order_release); // nothing to gate, or out of range
+        return;
+    }
+    // fail-open: a layer that never reports leaves the depth at "allow every draft"
+    g_vgate_depth.store(n_cols - 1, std::memory_order_relaxed);
+    g_vgate_depth_v.store(n_cols - 1, std::memory_order_relaxed);
+    g_vgate_depth_r.store(n_cols - 1, std::memory_order_relaxed);
+    g_vgate_cols.store(n_cols, std::memory_order_release);
+}
+
+int32_t llama_moe_verify_gate_max_accept(void) {
+    const int32_t cols = g_vgate_cols.exchange(0, std::memory_order_acq_rel); // disarm
+    if (cols < 2) {
+        return -1; // gate off or not armed: no limit
+    }
+    const int32_t  d  = g_vgate_depth.load(std::memory_order_relaxed);
+    const int32_t  dv = g_vgate_depth_v.load(std::memory_order_relaxed);
+    const int32_t  dr = g_vgate_depth_r.load(std::memory_order_relaxed);
+    const uint64_t nb = g_vgate_batches.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_vgate_sum.fetch_add((uint64_t) (d  > 0 ? d  : 0), std::memory_order_relaxed);
+    g_vgate_sum_v.fetch_add((uint64_t) (dv > 0 ? dv : 0), std::memory_order_relaxed);
+    g_vgate_sum_r.fetch_add((uint64_t) (dr > 0 ? dr : 0), std::memory_order_relaxed);
+    if (d == cols - 1) {
+        g_vgate_full.fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((nb % 16) == 0) {
+        const double n = (double) nb;
+        // layers/batch is the sanity check: 0 means the per-layer CPU remap is not on this graph (the
+        // gate needs it), so every other figure here is the fail-open default and means nothing.
+        LLAMA_LOG_WARN("MoE verify gate: %llu batches x %d cols, %.1f layers/batch | allowed drafts "
+                       "mean=%.2f/%d (full-depth %.0f%% of batches) | counterfactual mean: VRAM-only "
+                       "%.2f, VRAM-or-RAM %.2f | per batch: col0 loads %.1f, draft RAM loads %.1f, "
+                       "draft disk reads SKIPPED %.1f%s\n",
+                       (unsigned long long) nb, (int) cols,
+                       (double) g_vgate_lay.load() / n,
+                       (double) g_vgate_sum.load() / n, (int) cols - 1,
+                       100.0 * (double) g_vgate_full.load() / n,
+                       (double) g_vgate_sum_v.load() / n,
+                       (double) g_vgate_sum_r.load() / n,
+                       (double) g_vgate_c0.load() / n,
+                       (double) g_vgate_ram.load() / n,
+                       (double) g_vgate_skip.load() / n,
+                       llama_moe_verify_gate_lossy() ? " | LOSSY: not clamping" : "");
+    }
+    return llama_moe_verify_gate_lossy() ? -1 : d;
+}
+
 // pattern on the per-tensor cache.
 //
 // Concurrency vs the background loader (shares g_moe_layer_mutex): this callback does NOT advance
@@ -3768,7 +4505,9 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     // load MORE. Layers below keep_il stay fresh (hash-routed front layers have no donor locality), and
     // a layer with fewer sentinels than routed positions refuses: there an unusable donor falls through
     // to next_spare, i.e. a live WRONG expert applied at the intended expert's full gate weight.
-    if (!first_decode && order_n > 0 && llama_moe_stride_freefly() &&
+    // The LOW tier never free-flies either: it exists precisely to serve the CORRECT expert identity for
+    // the positions the high tier could not, so letting it fall back to a donor defeats the whole mode.
+    if (!first_decode && !c->tier_low && order_n > 0 && llama_moe_stride_freefly() &&
         c->il >= g_stride_keep_il.load(std::memory_order_relaxed)) {
         if (c->n_sentinel >= (int) n_used) {
             order_n = 0;
@@ -3813,6 +4552,50 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     }
 
     static const bool evictdbg = getenv("LLAMA_MOE_EVICTDBG") != nullptr; // forced-eviction census (read-only)
+    // cross-tier yield mode, see the block in the sync loop below. Defaults to mode 3 whenever the low tier
+    // is live (the low twin, not a stale slot, serves every high-tier miss) and to off without it. The low
+    // tier is registered at model load, well before the first remap initialises this, so the query is safe
+    // here; the yield block is additionally gated on this cache actually having a twin.
+    static const int tier_yield = getenv("LLAMA_MOE_TIER_YIELD") ? atoi(getenv("LLAMA_MOE_TIER_YIELD"))
+                                                                 : (llama_moe_low_tier_enabled() ? 3 : 0);
+
+    // fork verify gate (LLAMA_MOE_VERIFY_GATE): armed only around a speculative verify llama_decode, so a
+    // prefill ubatch of the same width can never reach this. vg_col0 marks the experts the committed
+    // column needs - those are loaded unconditionally, exactly as a decode step would load them.
+    const bool vgate = llama_moe_verify_gate_enabled() && n_tokens > 1 &&
+                       g_vgate_cols.load(std::memory_order_acquire) == (int32_t) n_tokens;
+    const bool vgate_ram = vgate && llama_moe_verify_gate_ram();
+    std::vector<char> vg_col0;
+    if (vgate) {
+        vg_col0.assign((size_t) c->n_expert, 0);
+        for (int64_t u = 0; u < n_used; ++u) {
+            const int32_t e = flat[(size_t) u];
+            if (e >= 0 && e < c->n_expert) { vg_col0[(size_t) e] = 1; }
+        }
+        // Entry snapshot (measurement only, before this step's loads move expert_slot): how many leading
+        // draft columns WOULD be exact under each residency predicate. VRAM-only is what the earlier
+        // strict rule allowed; VRAM-or-RAM is the ceiling this gate can reach, since every RAM hit does
+        // get loaded. okv implies okr, so one loop with okr as the exit condition covers both.
+        int  dv = 0, dr = 0;
+        bool okv = true, okr = true;
+        for (int64_t t = 1; t < n_tokens; ++t) {
+            for (int64_t u = 0; u < n_used && okr; ++u) {
+                const int32_t e    = flat[(size_t) (t * n_used + u)];
+                const bool    ok_e = e >= 0 && e < c->n_expert;
+                const bool    vram = ok_e && c->expert_slot[(size_t) e] >= 0;
+                const bool    ram  = ok_e && !c->ram_slot.empty() && c->ram_slot[(size_t) e] >= 0;
+                if (!vram) {
+                    okv = false;
+                    if (!ram) { okr = false; }
+                }
+            }
+            if (!okr) { break; }
+            if (okv) { dv = (int) t; }
+            dr = (int) t;
+        }
+        moe_vgate_min(g_vgate_depth_v, dv);
+        moe_vgate_min(g_vgate_depth_r, dr);
+    }
 
     // Resolve residency. Hits pin their slot; misses among the inspected positions are loaded into an
     // unpinned victim slot (bytes loaded in parallel below), then pinned too. Any expert not inspected
@@ -3832,6 +4615,18 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         if (c->sync_budget <= 0 && !do_sync) {
             continue; // below threshold: leave dropped, loader will warm it
         }
+        // fork verify gate: this miss belongs to a draft column only. A RAM-pool hit is a cheap H2D and
+        // is still worth loading (it keeps the column exact, so it can be accepted); a disk-only miss is
+        // not, so skip it and let the post-load verdict below refuse the columns that needed it.
+        if (vgate && !vg_col0[(size_t) e]) {
+            if (!vgate_ram || c->ram_slot.empty() || c->ram_slot[(size_t) e] < 0) {
+                g_vgate_skip.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            g_vgate_ram.fetch_add(1, std::memory_order_relaxed);
+        } else if (vgate) {
+            g_vgate_c0.fetch_add(1, std::memory_order_relaxed);
+        }
         // coverage early-stop: if the already-cached experts (plus misses synced so far this step) already
         // cover >= step_cover of the routed weight, skip syncing this (lower-weight) miss - leave it stale.
         // This is what lets a well-covered step load fewer than the budget. The budget cap (order_n) still
@@ -3839,6 +4634,39 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         if (cov_active && cov_have >= (double) c->step_cover) {
             if (covdbg) { covdbg_earlystop++; }
             continue;
+        }
+        // fork: cross-tier yield (LLAMA_MOE_TIER_YIELD, two-tier mode, mode 3 by default there). The
+        // coverage rule above is tier-BLIND: cov_have counts only experts resident in THIS cache's VRAM,
+        // so a high-tier miss is synced at full high-precision byte cost even when the low twin can already
+        // serve that exact position for free. Both tiers then compete for the same RAM/IO budget for one
+        // position. When armed, hand the position down instead of spending a high-tier load on it:
+        //   1 - yield only if the low twin has the expert in VRAM (zero I/O for it)
+        //   2 - also yield if the low twin has it in its host RAM pool (one small H2D, no disk)
+        //   3 - yield ALWAYS: the high tier never spends a synchronous load, it only serves what it
+        //       already happens to hold. Every sync load in the model then goes to the low tier.
+        // This costs quality by construction - the position drops to low precision even though it won
+        // the weight ordering and the budget was available - which is why it is opt-in and not the
+        // default. What makes it defensible at all is that the fallback is the CORRECT expert at low
+        // precision, not a stale/wrong one; that is the whole premise of the two-tier mode and it is
+        // also why the high tier's budget buys less quality per byte here than in single-tier mode.
+        //
+        // Mode 3 leaves the high tier's VRAM entirely to the background loader: llama_moe_loader_main's
+        // Phase C promotes this cache's current misses (measured at ~100-220 experts per 16 decode steps
+        // in two-tier mode, reported as "VRAM-promote hi" in the wall line), and the startup prewarm sets
+        // the initial content. So the tier is asynchronously maintained, not frozen. Do NOT read the wall
+        // line's "N expert-proj" as evidence about this - that counter covers only moe_drain_prefetch, the
+        // dsv4 hash-prefetch queue, which is off unless LLAMA_MOE_HASH_PREFETCH is set and reads 0 in every
+        // ordinary run. What mode 3 removes is the tier's ability to pull an expert in on demand, so its
+        // hit rate is bounded by how well the loader keeps up rather than by the sync budget.
+        if (tier_yield > 0 && c->tier_lo && !c->tier_low) {
+            const llama_moe_layer_cache * cl = c->tier_lo;
+            const bool lo_vram = (int) cl->expert_slot.size() == c->n_expert && cl->expert_slot[(size_t) e] >= 0;
+            const bool lo_ram  = tier_yield >= 2 && (int) cl->ram_slot.size() == c->n_expert &&
+                                 cl->ram_slot[(size_t) e] >= 0;
+            if (lo_vram || lo_ram || tier_yield >= 3) {
+                g_tier_yield_cnt.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
         }
         // pick an eviction victim among slots not pinned this step: empty first; then, in weighted
         // mode, the LOWEST-score slot (protect the high-weight core), else the oldest (age-LRU).
@@ -3924,13 +4752,33 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         for (int le : load_e) {
             if (le >= 0 && le < c->n_expert && !c->ram_slot.empty() && c->ram_slot[(size_t) le] >= 0) {
                 g_diag_ram_hit++;
+                if (c->tier_low) { g_diag_ram_hit_lo++; }
             }
         }
+        if (c->tier_low) { g_diag_sync_cnt_lo += (uint64_t) load_e.size(); }
     }
     llama_moe_layer_parallel_load(c, load_e, load_slot);
     c->step_cover = 0.0f; // consumed for this step; cov_cb re-sets it next step if coverage mode is on
     g_diag_pl_ns    += (uint64_t) (ggml_time_us() - diag_pl0);
     g_diag_sync_cnt += (uint64_t) load_e.size();
+    // fork verify gate: per-column verdict AFTER this step's loads. expert_slot was already claimed for
+    // every expert the loop decided to load, and left at -1 for every one it skipped (and for everything
+    // past a capacity-exhaustion break), so this is exactly "did this column end up exact". The allowed
+    // run is the leading exact prefix; g_vgate_depth keeps the minimum over layers.
+    if (vgate) {
+        int d = 0;
+        for (int64_t t = 1; t < n_tokens; ++t) {
+            bool ok = true;
+            for (int64_t u = 0; u < n_used && ok; ++u) {
+                const int32_t e = flat[(size_t) (t * n_used + u)];
+                ok = e >= 0 && e < c->n_expert && c->expert_slot[(size_t) e] >= 0;
+            }
+            if (!ok) { break; }
+            d = (int) t;
+        }
+        moe_vgate_min(g_vgate_depth, d);
+        g_vgate_lay.fetch_add(1, std::memory_order_relaxed);
+    }
     // publish the freshly loaded slots into the device slot_table only after their data is in
     // place (keeps slot_table consistent for the background loader's bookkeeping)
     const int64_t diag_pub0 = ggml_time_us();
@@ -3972,6 +4820,11 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     const bool slotdbg = getenv("LLAMA_MOE_SLOTDBG") != nullptr;
     const bool laydbg  = getenv("LLAMA_MOE_LAYERDBG") != nullptr;
     const int  sdb_i   = stale_reuse ? 1 : 0; // 0 = prefill, 1 = decode
+    // fork (two-tier): record which positions the HIGH tier actually served, so the caller can hand the
+    // rest to the low-precision tier. Recorded here rather than recomputed afterwards because
+    // expert_slot can change the moment this callback drops the mutex.
+    const bool want_hit = c->tier_hit_want;
+    if (want_hit) { c->tier_hit.assign((size_t) n, 0); }
     std::vector<char> used_slot((size_t) n_slots);
     for (int64_t t = 0; t < n_tokens; ++t) {
         std::fill(used_slot.begin(), used_slot.end(), 0);
@@ -3988,6 +4841,7 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         for (int64_t u = 0; u < n_used; ++u) {
             const int32_t e    = flat[(size_t) (t * n_used + u)];
             int32_t slot = (e >= 0 && e < c->n_expert) ? c->expert_slot[(size_t) e] : -1;
+            if (want_hit) { c->tier_hit[(size_t) (t * n_used + u)] = slot >= 0 ? 1 : 0; }
             if (slot >= 0) {
                 // hit: record this position's current real slot for future stale reuse
                 sdb_hit++;
@@ -4217,7 +5071,9 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
                            "LOCK-WAIT %.0fms; publish %llu device-syncs; read-phase moved %.0f MiB = %.2f GiB/s "
                            "| [thread-sums, not subtractable] read %.0fms, H2D-staged %.0fms | sync-loaded %llu "
                            "(RAM-hit %.0f%%, DISK %llu) | LOADER (separate thread, not in callback): "
-                           "read %.0fms, H2D %.0fms, %llu expert-proj | VRAM spill peak %.0f MiB\n",
+                           "read %.0fms, H2D %.0fms, %llu expert-proj (prefetch-drain only); "
+                           "VRAM-promote hi %llu lo %llu; fill_ram %llu experts in %.0fms "
+                           "| VRAM spill peak %.0f MiB\n",
                            g_diag_steps, cb_ms, pl_ms, pub_ms, cb_ms - pl_ms - pub_ms,
                            pl_ms, pl_ms - rp_ms - h2dw_ms, rp_ms, h2dw_ms,
                            lw_ms, (unsigned long long) g_diag_pub_cnt.load(), rb_mib, rbw,
@@ -4226,10 +5082,34 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
                            100.0 * (double) g_diag_ram_hit / (double) sc,
                            (unsigned long long) (g_diag_sync_cnt - g_diag_ram_hit),
                            lrd_ms, lh2_ms, (unsigned long long) g_diag_ldr_cnt.load(),
+                           (unsigned long long) g_diag_ldr_vram_hi.load(),
+                           (unsigned long long) g_diag_ldr_vram_lo.load(),
+                           (unsigned long long) g_diag_fillram_cnt.load(), g_diag_fillram_ns.load() / 1000.0,
                            g_moe_vram_spill_peak.load(std::memory_order_relaxed)/(1024.0*1024.0));
+            // Two-tier split of the two counters above. Needed because the totals are tier-blind and the
+            // two tiers want opposite fixes: high-tier disk trips cost 2.9 MiB each and are what a bigger
+            // high RAM pool buys down, low-tier ones cost 1.5 MiB and are what a bigger low pool buys
+            // down. Printed only when the low tier actually loaded something, so single-tier runs are
+            // byte-identical in output.
+            if (g_diag_sync_cnt_lo > 0) {
+                const uint64_t hi_cnt = g_diag_sync_cnt >= g_diag_sync_cnt_lo ? g_diag_sync_cnt - g_diag_sync_cnt_lo : 0;
+                const uint64_t hi_ram = g_diag_ram_hit  >= g_diag_ram_hit_lo  ? g_diag_ram_hit  - g_diag_ram_hit_lo  : 0;
+                LLAMA_LOG_WARN("MoE timing/%d steps [two-tier]: HIGH sync-loaded %llu (RAM-hit %.0f%%, "
+                               "DISK %llu) | LOW sync-loaded %llu (RAM-hit %.0f%%, DISK %llu)\n",
+                               g_diag_steps,
+                               (unsigned long long) hi_cnt,
+                               hi_cnt ? 100.0 * (double) hi_ram / (double) hi_cnt : 0.0,
+                               (unsigned long long) (hi_cnt - hi_ram),
+                               (unsigned long long) g_diag_sync_cnt_lo,
+                               100.0 * (double) g_diag_ram_hit_lo / (double) g_diag_sync_cnt_lo,
+                               (unsigned long long) (g_diag_sync_cnt_lo - g_diag_ram_hit_lo));
+            }
             g_diag_cb_ns = g_diag_pl_ns = g_diag_sync_cnt = g_diag_ram_hit = g_diag_lockwait_ns = g_diag_publish_ns = 0;
+            g_diag_sync_cnt_lo = g_diag_ram_hit_lo = 0;
             g_diag_read_ns = 0; g_diag_h2d_ns = 0; g_diag_h2d_wall_ns = 0;
             g_diag_ldr_read_ns = 0; g_diag_ldr_h2d_ns = 0; g_diag_ldr_cnt = 0;
+            g_diag_fillram_cnt = 0; g_diag_fillram_ns = 0;
+            g_diag_ldr_vram_hi = 0; g_diag_ldr_vram_lo = 0;
             g_diag_rdphase_ns = 0; g_diag_read_bytes = 0;
             g_diag_ldr_rdphase_ns = 0; g_diag_ldr_bytes = 0; g_diag_pub_cnt = 0;
         }
@@ -4764,6 +5644,305 @@ ggml_tensor * llama_moe_layer_cache_remap_group(llama_moe_layer_cache * c,
     return ggml_map_custom1(ctx0, selected_experts, llama_moe_layer_remap_group_cb1, 1, ud);
 }
 
+// fork: TWO-TIER prefill sweep callback (LLAMA_MOE_TIER_SWEEP). A dedicated copy of the single-tier sweep
+// residency logic above - deliberately NOT a refactor of it, so the shipped single-tier path stays
+// byte-identical. It resolves each group's selected experts across BOTH caches (hottest cap_hi into the
+// high cache, the rest into the low cache) and writes a unified-id + tier pack for ggml_mul_mat_id_2t:
+// dst rows [0,nt) = unified ids (a low-owned slot biased by the high cache's slot count), rows [nt,2nt) =
+// the 0/1 tier selector. Out-of-group and unresolved positions route to a distinct HIGH sentinel (tier 1),
+// which the op multiplies by the zeroed sentinel slab so they contribute exactly 0 to the per-group sum.
+static void llama_moe_tiered_sweep_group_cb(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    (void) nth;
+    if (ith != 0) {
+        return; // single-threaded, like every other remap callback
+    }
+    const llama_moe_group_tiered_ud * ud   = (const llama_moe_group_tiered_ud *) userdata;
+    llama_moe_layer_cache *           c_hi = ud->c_hi;
+    llama_moe_layer_cache *           c_lo = ud->c_lo;
+    const ggml_tensor *               a    = dst->src[0]; // selected_experts [n_used, n_tokens] i32
+
+    const int64_t n_used   = a->ne[0];
+    const int64_t n_tokens = a->ne[1];
+    const int64_t n        = n_used * n_tokens;
+
+    llama_moe_prefill_once();
+
+    std::vector<int32_t> flat;
+    llama_moe_flatten_ids(a, flat);
+
+    const int64_t diag_lock0 = ggml_time_us();
+    std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
+    if (getenv("LLAMA_MOE_DIAG")) { g_diag_sweep_lockwait_ns += (uint64_t) (ggml_time_us() - diag_lock0); }
+
+    // New pin generation on BOTH caches - the `dep` edge (see the entry function) ordered the previous
+    // group's FFN output into this callback, so both caches' slabs are recyclable (the 2t op reads both).
+    const uint64_t gen_hi = ++c_hi->pin_gen;
+    const uint64_t gen_lo = ++c_lo->pin_gen;
+
+    // First group only: mirror the single-tier bookkeeping that drives decode warmth and the post-sweep
+    // VRAM refill. BOTH caches must be flagged dirty and get a freq_ranked target, or the first decode's
+    // refill restores only the high tier and the low tier stays cold. expert_score warms the HIGH cache
+    // only (it seeds high-tier eviction for decode; the low tier loads on demand every step).
+    if (ud->e_lo == 0) {
+        if (c_hi->weighted_evict) {
+            if ((int) c_hi->expert_score.size() != c_hi->n_expert) { c_hi->expert_score.assign((size_t) c_hi->n_expert, 0.0f); }
+            const float d = 0.97f;
+            float dn = 1.0f;
+            for (int64_t t = 0; t < n_tokens; ++t) { dn *= d; }
+            for (float & s : c_hi->expert_score) { s *= dn; }
+            float w = 1.0f;
+            for (int64_t t = n_tokens - 1; t >= 0; --t) {
+                for (int64_t u = 0; u < n_used; ++u) {
+                    const int32_t e = flat[(size_t) (t * n_used + u)];
+                    if (e >= 0 && e < c_hi->n_expert) { c_hi->expert_score[(size_t) e] += w / (float) (u + 1); }
+                }
+                w *= d;
+            }
+        }
+        std::vector<int> freq((size_t) c_hi->n_expert, 0);
+        for (int64_t p = 0; p < n; ++p) {
+            const int32_t e = flat[(size_t) p];
+            if (e >= 0 && e < c_hi->n_expert) { freq[(size_t) e]++; }
+        }
+        auto rank_into = [&](llama_moe_layer_cache * c) {
+            std::vector<int32_t> ranked;
+            ranked.reserve((size_t) c->n_expert);
+            for (int e = 0; e < c->n_expert; ++e) { if (freq[(size_t) e] > 0) { ranked.push_back(e); } }
+            std::sort(ranked.begin(), ranked.end(), [&](int32_t x, int32_t y) {
+                return freq[(size_t) x] != freq[(size_t) y] ? freq[(size_t) x] > freq[(size_t) y] : x < y;
+            });
+            if ((int) ranked.size() > c->capacity) { ranked.resize((size_t) c->capacity); }
+            c->freq_ranked = std::move(ranked);
+        };
+        rank_into(c_hi);
+        rank_into(c_lo);
+        c_hi->diag_steps += (uint64_t) n_tokens;
+    }
+
+    // This group's selected experts, plus per-group selection frequency for the tier split.
+    const int span = ud->e_hi - ud->e_lo;
+    std::vector<int>  need;
+    std::vector<int>  freq_span((size_t) (span > 0 ? span : 1), 0);
+    {
+        need.reserve((size_t) span);
+        std::vector<char> seen((size_t) (span > 0 ? span : 1), 0);
+        for (int64_t p = 0; p < n; ++p) {
+            const int32_t e = flat[(size_t) p];
+            if (e >= ud->e_lo && e < ud->e_hi) {
+                freq_span[(size_t) (e - ud->e_lo)]++;
+                if (!seen[(size_t) (e - ud->e_lo)]) {
+                    seen[(size_t) (e - ud->e_lo)] = 1;
+                    need.push_back(e);
+                }
+            }
+        }
+    }
+    // Tier split by score: sort `need` hot->cold (per-group frequency desc, ties by lower index, matching
+    // the freq_ranked comparator), then the top cap_hi go to the HIGH cache and the rest (guaranteed
+    // <= cap_lo, since |need| <= span <= cap_hi + cap_lo) to the LOW cache.
+    std::sort(need.begin(), need.end(), [&](int x, int y) {
+        const int fx = freq_span[(size_t) (x - ud->e_lo)];
+        const int fy = freq_span[(size_t) (y - ud->e_lo)];
+        return fx != fy ? fx > fy : x < y;
+    });
+    const int        n_hi = (int) std::min((size_t) ud->cap_hi, need.size());
+    std::vector<int> hi_set(need.begin(), need.begin() + n_hi);
+    std::vector<int> lo_set(need.begin() + n_hi, need.end());
+
+    // is_low[e - e_lo] tells the dst writer which cache owns each in-group expert.
+    std::vector<char> is_low((size_t) (span > 0 ? span : 1), 0);
+    for (const int e : lo_set) { is_low[(size_t) (e - ud->e_lo)] = 1; }
+
+    // Resolve residency for one cache: age-LRU victim choice, pinned by that cache's generation, then a
+    // parallel load of the misses. Identical to the single-tier callback's resolution, applied per cache.
+    auto resolve = [&](llama_moe_layer_cache * c, uint64_t gen, const std::vector<int> & experts) -> uint64_t {
+        std::vector<int> load_e;
+        std::vector<int> load_slot;
+        for (const int e : experts) {
+            int slot = c->expert_slot[(size_t) e];
+            if (slot >= 0) {
+                c->slot_pin[(size_t) slot] = gen;
+                c->slot_age[(size_t) slot] = ++c->tick;
+                continue;
+            }
+            int      victim = -1;
+            uint64_t oldest = UINT64_MAX;
+            for (int s = 0; s < c->capacity; ++s) {
+                if (c->slot_pin[(size_t) s] == gen)     { continue; } // pinned by an earlier expert of THIS group
+                if (c->slot_loading[(size_t) s])        { continue; } // loader is writing this slot
+                if (c->slot_expert[(size_t) s] < 0)     { victim = s; break; }
+                if (c->slot_age[(size_t) s] < oldest)   { oldest = c->slot_age[(size_t) s]; victim = s; }
+            }
+            if (victim < 0) {
+                break; // benign loader race: let the remaining experts fall through to a sentinel below
+            }
+            const int old_e = c->slot_expert[(size_t) victim];
+            if (old_e >= 0 && old_e < c->n_expert) {
+                ggml_backend_tensor_set(c->slot_table, &c->capacity, (size_t) old_e * sizeof(int32_t), sizeof(int32_t));
+                c->expert_slot[(size_t) old_e] = -1;
+                moe_stale_on_evict(c, old_e, victim);
+            }
+            c->slot_expert[(size_t) victim] = e;
+            c->expert_slot[(size_t) e]      = victim;
+            c->slot_age[(size_t) victim]    = ++c->tick;
+            c->slot_pin[(size_t) victim]    = gen;
+            load_e.push_back(e);
+            load_slot.push_back(victim);
+        }
+        const int64_t diag_pl0 = ggml_time_us();
+        llama_moe_layer_parallel_load(c, load_e, load_slot);
+        g_diag_pl_ns    += (uint64_t) (ggml_time_us() - diag_pl0);
+        g_diag_sync_cnt += (uint64_t) load_e.size();
+        if (getenv("LLAMA_MOE_DIAG") && (int) c->ram_slot.size() == c->n_expert) {
+            for (const int e : load_e) {
+                if (e >= 0 && e < c->n_expert && c->ram_slot[(size_t) e] >= 0) { g_diag_ram_hit++; }
+            }
+        }
+        for (size_t i = 0; i < load_e.size(); ++i) {
+            ggml_backend_tensor_set(c->slot_table, &load_slot[i], (size_t) load_e[i] * sizeof(int32_t), sizeof(int32_t));
+            moe_stale_on_load(c, load_e[i], load_slot[i]);
+            c->last_settled_slot = load_slot[i];
+        }
+        return (uint64_t) load_e.size();
+    };
+    const uint64_t loads = resolve(c_hi, gen_hi, hi_set) + resolve(c_lo, gen_lo, lo_set);
+
+    // Write the unified-id + tier pack. A HIGH-owned resident position -> its high slot (< n_slots_hi),
+    // tier 1. A LOW-owned resident position -> n_slots_hi + low slot, tier 0. Out-of-group or unresolved
+    // -> a distinct HIGH sentinel (>= cap_hi, < n_slots_hi), tier 1. Distinctness within a token over the
+    // HIGH slot space is the MMQ requirement; n_sentinel == n_used guarantees enough sentinels. Low real
+    // ids are disjoint (biased past n_slots_hi) and per-token distinct by construction, so no dedup there.
+    const int32_t n_slots_hi = (!c_hi->proj.empty() && c_hi->proj[0].dev)
+                             ? (int32_t) c_hi->proj[0].dev->ne[2] : 0;
+    std::vector<char> used_slot((size_t) (n_slots_hi > 0 ? n_slots_hi : 1));
+    static const bool sweepdbg = getenv("LLAMA_MOE_SWEEPDBG") != nullptr;
+    uint64_t dbg_hit = 0, dbg_sen = 0;
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        std::fill(used_slot.begin(), used_slot.end(), 0);
+        for (int64_t u = 0; u < n_used; ++u) {
+            const int32_t e = flat[(size_t) (t * n_used + u)];
+            if (e < ud->e_lo || e >= ud->e_hi || is_low[(size_t) (e - ud->e_lo)]) { continue; }
+            const int32_t slot = c_hi->expert_slot[(size_t) e];
+            if (slot >= 0) { used_slot[(size_t) slot] = 1; }
+        }
+        int next_sentinel = ud->cap_hi;
+        for (int64_t u = 0; u < n_used; ++u) {
+            const int32_t e       = flat[(size_t) (t * n_used + u)];
+            const bool    in_grp  = (e >= ud->e_lo && e < ud->e_hi);
+            const bool    low_own = in_grp && is_low[(size_t) (e - ud->e_lo)];
+            int32_t       unified;
+            int32_t       tier;
+            const int32_t lo_slot = low_own ? c_lo->expert_slot[(size_t) e] : -1;
+            const int32_t hi_slot = (in_grp && !low_own) ? c_hi->expert_slot[(size_t) e] : -1;
+            if (low_own && lo_slot >= 0) {
+                unified = n_slots_hi + lo_slot;
+                tier    = 0;
+                c_lo->slot_pin[(size_t) lo_slot] = gen_lo;
+                dbg_hit++;
+            } else if (hi_slot >= 0) {
+                unified = hi_slot;
+                tier    = 1;
+                c_hi->slot_pin[(size_t) hi_slot] = gen_hi;
+                dbg_hit++;
+            } else {
+                while (next_sentinel < n_slots_hi && used_slot[(size_t) next_sentinel]) { next_sentinel++; }
+                GGML_ASSERT(next_sentinel < n_slots_hi); // guaranteed by n_sentinel == n_used
+                unified = next_sentinel;
+                tier    = 1;
+                used_slot[(size_t) unified] = 1;
+                dbg_sen++;
+            }
+            *(int32_t *) ((char *) dst->data + t * dst->nb[1] + u * dst->nb[0])                = unified;
+            *(int32_t *) ((char *) dst->data + (n_tokens + t) * dst->nb[1] + u * dst->nb[0])   = tier;
+        }
+    }
+
+    // Both caches now hold this group's split - flag both (and the global gate) for the post-sweep refill.
+    c_hi->sweep_dirty = true;
+    c_lo->sweep_dirty = true;
+    g_moe_sweep_dirty.store(true, std::memory_order_relaxed);
+
+    if (sweepdbg) {
+        g_sweep_hit      += dbg_hit;
+        g_sweep_sentinel += dbg_sen;
+        g_sweep_loads    += loads;
+        const uint64_t p  = ++g_sweep_passes;
+        if (p == 1 || p % 128 == 0) {
+            const uint64_t h = g_sweep_hit.load(), s = g_sweep_sentinel.load();
+            const double   tot = (double) (h + s ? h + s : 1);
+            const int grp_cap  = ud->cap_hi + ud->cap_lo;
+            const int n_groups = (c_hi->n_expert + grp_cap - 1) / grp_cap;
+            LLAMA_LOG_WARN("MoE SWEEPDBG(2-tier): %llu passes | HIT %.2f%% SENTINEL %.2f%% "
+                           "(HIT must be 1/n_groups) | loads %llu (%.1f/pass) | cap_hi=%d cap_lo=%d "
+                           "grp_cap=%d n_groups=%d n_expert=%d group=[%d,%d)\n",
+                           (unsigned long long) p, 100.0 * (double) h / tot, 100.0 * (double) s / tot,
+                           (unsigned long long) g_sweep_loads.load(),
+                           (double) g_sweep_loads.load() / (double) p,
+                           ud->cap_hi, ud->cap_lo, grp_cap, n_groups, c_hi->n_expert, ud->e_lo, ud->e_hi);
+        }
+    }
+}
+
+ggml_tensor * llama_moe_layer_cache_remap_group_tiered(llama_moe_layer_cache * c_hi,
+                                                       llama_moe_layer_cache * c_lo,
+                                                       ggml_context *          ctx0,
+                                                       ggml_tensor *           selected_experts,
+                                                       int                     group,
+                                                       ggml_tensor *           dep) {
+    if (!c_hi || !c_lo || c_hi->capacity <= 0 || c_lo->capacity <= 0 || c_hi->n_expert <= 0) {
+        return nullptr;
+    }
+    const int64_t n_used   = selected_experts->ne[0];
+    const int64_t n_tokens = selected_experts->ne[1];
+    if (n_used <= 0 || n_tokens <= 0 || selected_experts->ne[2] != 1 || selected_experts->ne[3] != 1) {
+        return nullptr;
+    }
+    if (c_lo->n_expert != c_hi->n_expert) {
+        return nullptr;
+    }
+    // Out-of-group and unresolved positions route to a HIGH sentinel, so losslessness of the sentinel
+    // skip needs one high sentinel per routing position. Refuse rather than inject a wrong expert.
+    if (c_hi->n_sentinel < c_hi->n_used) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("MoE two-tier prefill sweep unavailable: n_sentinel=%d < n_used=%d "
+                           "(unset LLAMA_MOE_SENTINELS so the sweep can pick n_used)\n",
+                           c_hi->n_sentinel, c_hi->n_used);
+        }
+        return nullptr;
+    }
+    const int grp_cap  = c_hi->capacity + c_lo->capacity;
+    const int n_groups = (c_hi->n_expert + grp_cap - 1) / grp_cap;
+    if (group < 0 || group >= n_groups) {
+        return nullptr;
+    }
+    if ((int) c_hi->group_tiered_ud.size() != n_groups) {
+        c_hi->group_tiered_ud.assign((size_t) n_groups, llama_moe_group_tiered_ud());
+        for (int g = 0; g < n_groups; ++g) {
+            c_hi->group_tiered_ud[(size_t) g].c_hi   = c_hi;
+            c_hi->group_tiered_ud[(size_t) g].c_lo   = c_lo;
+            c_hi->group_tiered_ud[(size_t) g].e_lo   = g * grp_cap;
+            c_hi->group_tiered_ud[(size_t) g].e_hi   = std::min((g + 1) * grp_cap, c_hi->n_expert);
+            c_hi->group_tiered_ud[(size_t) g].cap_hi = c_hi->capacity;
+            c_hi->group_tiered_ud[(size_t) g].cap_lo = c_lo->capacity;
+        }
+    }
+    void * ud = (void *) &c_hi->group_tiered_ud[(size_t) group];
+    // 2*n_tokens rows: block 0 = unified ids, block 1 = tier selector. `dep` (when present) is a second
+    // custom-op input purely for the scheduling edge (its value is never read), so group g+1's callback
+    // cannot recycle slots before group g's matmuls have retired - the same ordering the single-tier
+    // sweep gets from its map_custom2 dep. The first group has no predecessor.
+    if (dep) {
+        ggml_tensor * args[2] = { selected_experts, dep };
+        return ggml_custom_4d(ctx0, GGML_TYPE_I32, n_used, 2 * n_tokens, 1, 1,
+                              args, 2, llama_moe_tiered_sweep_group_cb, 1, ud);
+    }
+    ggml_tensor * args[1] = { selected_experts };
+    return ggml_custom_4d(ctx0, GGML_TYPE_I32, n_used, 2 * n_tokens, 1, 1,
+                          args, 1, llama_moe_tiered_sweep_group_cb, 1, ud);
+}
+
 // fork: one-shot VRAM audit (always on, WARN level). llama_moe_auto_capacity has to size the expert cache
 // from dev_free measured at the FIRST MoE layer's cache creation - i.e. during graph BUILD, before the
 // scheduler's compute buffer exists - so it can only hold back a flat reserve (default 512 MiB) for
@@ -4872,8 +6051,11 @@ void llama_moe_dump_residency(const char * tag) {
             snprintf(buf, sizeof(buf), "%s%d", i ? "," : "", res[i]);
             ids += buf;
         }
-        LLAMA_LOG_WARN("MoE RESDBG %s %s cap=%d n=%d ids=%s\n",
-                       tag, pr.first.c_str(), c->capacity, (int) res.size(), ids.c_str());
+        // The low-precision twin carries the SAME tensor name as its high tier (the cache parses the layer
+        // index out of it), so the tier has to be printed or the two lines are indistinguishable.
+        LLAMA_LOG_WARN("MoE RESDBG %s %s%s cap=%d n=%d ids=%s\n",
+                       tag, pr.first.c_str(), c->tier_low ? " tier=lo" : "",
+                       c->capacity, (int) res.size(), ids.c_str());
     }
 }
 
@@ -5063,6 +6245,221 @@ ggml_tensor * llama_moe_layer_cache_remap(llama_moe_layer_cache * c,
         }
     }
     return ggml_map_custom1(ctx0, selected_experts, llama_moe_layer_remap_cb, 1, c);
+}
+
+//
+// fork: TWO-TIER DECODE REMAP (--moe-expert-gguf-low).
+//
+// Single-tier decode resolves a routed position that is not resident in VRAM to a STALE slot: a real,
+// but WRONG, expert, applied at the intended expert's full gate weight. That is the quality cost of a
+// small budget. With a low-precision twin of the whole expert set available, there is a strictly better
+// answer for those positions - the CORRECT expert, just quantized lower. Identity is preserved
+// everywhere and only precision degrades, and only where the budget ran out.
+//
+// A ggml tensor has exactly one type and one expert stride, so two precisions cannot live in one
+// mul_mat_id. The mode therefore runs the expert FFN TWICE - once against the high-tier cache, once
+// against the low-tier cache - and sums. The two passes are made disjoint by splitting the gate weights
+// with a 0/1 mask instead of by shrinking the id lists, so every routed position is applied exactly once
+// and the sum is exact (w * 1 + w * 0 for a high-served position, w * 0 + w * 1 for a low-served one).
+// The pass that does not own a position still computes something there, but it is multiplied by a hard
+// zero, so it only has to be FINITE - which it is, since every slot holds either real weights or zeros.
+//
+// This callback produces all three of those things in ONE CPU op, so the two-tier path costs the same
+// number of ggml splits as the single-tier one. Output is i32 [n_used, 3*n_tokens]:
+//   rows [0*nt, 1*nt) - high-tier cache slot ids
+//   rows [1*nt, 2*nt) - low-tier cache slot ids
+//   rows [2*nt, 3*nt) - 1 where the high tier served the position, 0 where the low tier must
+// The caller views the first two blocks as the two mul_mat_id id tensors and turns the third into the
+// f32 gate mask with a get_rows over the constant {0,1} table (c->tier_w).
+//
+// The high half is resolved first, by the ORDINARY remap callback with the ordinary budget/coverage
+// rules, so the high tier behaves exactly as it does without this mode. Its per-position hit flags come
+// back in c->tier_hit. The low half then runs the same callback against the low cache with a MASKED
+// selection: every position the high tier served is set to -1, which the callback skips everywhere
+// (frequency, scoring, ranking) and resolves to a throwaway slot in pass 2 - the mask zeroes it anyway.
+// So the low cache only ever loads, scores and keeps the experts it is actually being asked to serve.
+static void llama_moe_tiered_pack_cb(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    if (ith != 0) {
+        return; // single-threaded, like every other remap callback
+    }
+    llama_moe_layer_cache * c    = (llama_moe_layer_cache *) userdata;
+    const ggml_tensor *     a    = dst->src[0]; // selected_experts [n_used, n_tokens] i32
+    const ggml_tensor *     b    = dst->src[1]; // weights [1, n_used, n_tokens] f32 (coverage input)
+    llama_moe_layer_cache * c_lo = c ? c->tier_lo : nullptr;
+
+    const int64_t n_used   = a->ne[0];
+    const int64_t n_tokens = a->ne[1];
+    const int64_t n        = n_used * n_tokens;
+
+    // rows [0,nt) of dst, addressed as a plain [n_used, n_tokens] i32 tensor. The remap callback only
+    // ever reads ->ne/->nb and writes through ->data, so a stack descriptor over a slice is enough and
+    // avoids materializing the two halves as separate graph tensors (which would cost two CPU splits).
+    ggml_tensor sub = *dst;
+    sub.ne[1] = n_tokens;
+
+    // high tier: the ordinary rules, plus the hit flags we need to split the weights
+    c->tier_hit_want = true;
+    if (c->sync_cover > 0.0f && b && b->type == GGML_TYPE_F32 && b->data && n_tokens == 1) {
+        llama_moe_layer_remap_cov_cb(&sub, a, b, ith, nth, c);
+    } else {
+        llama_moe_layer_remap_cb(&sub, a, ith, nth, c);
+    }
+
+    const bool have_hit = ((int64_t) c->tier_hit.size() == n);
+
+    // low tier: same callback, low cache, selection masked down to the positions still unserved
+    if (c_lo) {
+        std::vector<int32_t> sel_lo((size_t) n);
+        for (int64_t p = 0; p < n; ++p) {
+            const char * s = (const char *) a->data + (p / n_used) * a->nb[1] + (p % n_used) * a->nb[0];
+            const int32_t e = *(const int32_t *) s;
+            sel_lo[(size_t) p] = (have_hit && c->tier_hit[(size_t) p]) ? -1 : e;
+        }
+        ggml_tensor a_lo = *a;
+        a_lo.data  = sel_lo.data();
+        a_lo.nb[0] = sizeof(int32_t);
+        a_lo.nb[1] = a_lo.nb[0] * (size_t) n_used;
+        a_lo.nb[2] = a_lo.nb[1] * (size_t) n_tokens;
+        a_lo.nb[3] = a_lo.nb[2];
+
+        ggml_tensor sub_lo = *dst;
+        sub_lo.ne[1] = n_tokens;
+        sub_lo.data  = (char *) dst->data + (size_t) n_tokens * dst->nb[1];
+
+        llama_moe_layer_remap_cb(&sub_lo, &a_lo, ith, nth, c_lo);
+    } else {
+        // no low cache: leave the low ids pointing at slot 0 and let the mask below zero them out
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            for (int64_t u = 0; u < n_used; ++u) {
+                *(int32_t *) ((char *) dst->data + (n_tokens + t) * dst->nb[1] + u * dst->nb[0]) = 0;
+            }
+        }
+    }
+
+    // tier selector: 1 => the high pass owns this position, 0 => the low pass does. With no hit flags
+    // and no low cache, everything falls back to the high tier, i.e. exactly the single-tier behaviour.
+    if (c->tier_fused_emit) {
+        // FUSED layout for ggml_mul_mat_id_2t: collapse to unified ids (row block 0) + tier (row block
+        // 1). rows[0,nt) currently hold the high slots, rows[nt,2nt) the low slots (both written above).
+        // Bias a low-owned position's slot into the op's unified channel space by the high cache's slot
+        // count, so one id tensor addresses both tiers: id < n_slots_hi selects a high slot, id >=
+        // selects low slot (id - n_slots_hi). Read both cells before overwriting - the low cell becomes
+        // the tier bit. n_slots_hi is the high dev slab's ne[2] (capacity + sentinels) == as_hi->ne[2].
+        const int32_t n_slots_hi = (!c->proj.empty() && c->proj[0].dev)
+                                 ? (int32_t) c->proj[0].dev->ne[2] : 0;
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            for (int64_t u = 0; u < n_used; ++u) {
+                const int64_t p       = t * n_used + u;
+                int32_t *     hi_cell  = (int32_t *) ((char *) dst->data + t * dst->nb[1] + u * dst->nb[0]);
+                int32_t *     lo_cell  = (int32_t *) ((char *) dst->data + (n_tokens + t) * dst->nb[1] + u * dst->nb[0]);
+                const int32_t hi_slot = *hi_cell;
+                const int32_t lo_slot = *lo_cell;
+                const int32_t hi      = (!c_lo || !have_hit || c->tier_hit[(size_t) p]) ? 1 : 0;
+                *hi_cell = hi ? hi_slot : (n_slots_hi + lo_slot); // row block 0 = unified id
+                *lo_cell = hi;                                    // row block 1 = tier selector
+            }
+        }
+    } else {
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            for (int64_t u = 0; u < n_used; ++u) {
+                const int64_t p  = t * n_used + u;
+                const int32_t hi = (!c_lo || !have_hit || c->tier_hit[(size_t) p]) ? 1 : 0;
+                *(int32_t *) ((char *) dst->data + (2 * n_tokens + t) * dst->nb[1] + u * dst->nb[0]) = hi;
+            }
+        }
+    }
+
+    if (getenv("LLAMA_MOE_TIERDBG")) {
+        static std::atomic<uint64_t> pos{0}, hi_pos{0}, toks{0}, last{0};
+        uint64_t nhi = 0;
+        // must mirror the selector written above EXACTLY, including its fallbacks: with no low cache or
+        // no hit flags every position goes to the high tier, and counting only tier_hit here would
+        // report the inverse of what the graph actually computed.
+        for (int64_t p = 0; p < n; ++p) { nhi += (!c_lo || !have_hit || c->tier_hit[(size_t) p]) ? 1u : 0u; }
+        pos.fetch_add((uint64_t) n, std::memory_order_relaxed);
+        hi_pos.fetch_add(nhi, std::memory_order_relaxed);
+        const uint64_t tk = toks.fetch_add((uint64_t) n_tokens, std::memory_order_relaxed) + (uint64_t) n_tokens;
+        uint64_t lp = last.load(std::memory_order_relaxed);
+        if (tk - lp >= 5120 && last.compare_exchange_strong(lp, tk)) {
+            const double tot = (double) (pos.load() ? pos.load() : 1);
+            LLAMA_LOG_WARN("MoE TIERDBG: %llu token-layers | high tier served %.1f%% of routed positions, "
+                           "low tier %.1f%% (all at the CORRECT expert id) | high loads yielded to low %llu\n",
+                           (unsigned long long) tk, 100.0 * (double) hi_pos.load() / tot,
+                           100.0 * (1.0 - (double) hi_pos.load() / tot),
+                           (unsigned long long) g_tier_yield_cnt.load(std::memory_order_relaxed));
+        }
+    }
+}
+
+ggml_tensor * llama_moe_layer_cache_remap_tiered(llama_moe_layer_cache * c_hi,
+                                                 llama_moe_layer_cache * c_lo,
+                                                 ggml_context *          ctx0,
+                                                 ggml_tensor *           selected_experts,
+                                                 ggml_tensor *           weights,
+                                                 float                   threshold,
+                                                 int                     sync_budget,
+                                                 bool                    fused) {
+    if (!c_hi || !c_lo || !selected_experts || !weights) {
+        return nullptr;
+    }
+    const int64_t n_used   = selected_experts->ne[0];
+    const int64_t n_tokens = selected_experts->ne[1];
+    if (n_used <= 0 || n_tokens <= 0 || selected_experts->ne[2] != 1 || selected_experts->ne[3] != 1) {
+        return nullptr;
+    }
+    // the mask is built by get_rows over c_hi->tier_w, so both must exist and agree with `weights`
+    if (!c_hi->tier_w || weights->type != GGML_TYPE_F32 ||
+        weights->ne[0] != 1 || weights->ne[1] != n_used || weights->ne[2] != n_tokens) {
+        return nullptr;
+    }
+    if (c_lo->n_expert != c_hi->n_expert || c_lo->n_used != c_hi->n_used) {
+        return nullptr;
+    }
+
+    // high tier: exactly the single-tier configuration (see llama_moe_layer_cache_remap)
+    c_hi->sync_threshold = threshold;
+    c_hi->sync_budget    = 0;
+    if (n_tokens <= 1) {
+        if (sync_budget > 0) {
+            c_hi->sync_budget = sync_budget;
+        } else if (const char * hb = getenv("LLAMA_MOE_HYBRID_BUDGET")) {
+            c_hi->sync_budget = atoi(hb);
+            if (c_hi->sync_budget < 0) { c_hi->sync_budget = 0; }
+        }
+    }
+    c_hi->sync_cover = 0.0f;
+    if (n_tokens == 1) {
+        if (const char * cv = getenv("LLAMA_MOE_SYNC_COVER")) {
+            const float f = (float) atof(cv);
+            if (f > 0.0f) { c_hi->sync_cover = f > 1.0f ? 1.0f : f; }
+        }
+    }
+
+    // Low tier: load whatever it is asked for, every step. Neither the budget nor the coverage
+    // early-stop applies - those exist to ration expensive high-precision bytes, and rationing the low
+    // tier too would just put the stale expert back, which is the thing this mode removes. Its
+    // synchronous loads are what the mode trades for quality, and they are cheap by construction
+    // (low-quant slabs, usually already in the host RAM pool). LLAMA_MOE_SYNC_BUDGET_LOW caps it if the
+    // trade turns out to need tuning.
+    c_lo->sync_threshold = 0.0f;
+    c_lo->sync_cover     = 0.0f;
+    c_lo->sync_budget    = (int) n_used;
+    if (const char * bl = getenv("LLAMA_MOE_SYNC_BUDGET_LOW")) {
+        const int v = atoi(bl);
+        if (v >= 0) { c_lo->sync_budget = v; }
+    }
+    c_lo->tier_hit_want = false;
+    c_hi->tier_lo       = c_lo;
+    c_hi->tier_fused_emit = fused;
+
+    // Fused emits unified ids + tier (2 rows); the masked two-pass emits hi ids + lo ids + tier (3).
+    ggml_tensor * args[2] = { selected_experts, weights };
+    return ggml_custom_4d(ctx0, GGML_TYPE_I32, n_used, (fused ? 2 : 3) * n_tokens, 1, 1,
+                          args, 2, llama_moe_tiered_pack_cb, 1, c_hi);
+}
+
+ggml_tensor * llama_moe_layer_cache_tier_weights(llama_moe_layer_cache * c) {
+    return c ? c->tier_w : nullptr;
 }
 
 // Token-boundary backpressure sync (LLAMA_MOE_SYNC_BOUNDARY). Called once per decode token AFTER the
@@ -5270,6 +6667,7 @@ bool llama_moe_recap_from_compute_reserve(ggml_backend_sched_t sched, size_t com
 
     std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
 
+    std::vector<const llama_moe_layer_cache *> dropped;
     for (auto it = g_moe_layer_caches.begin(); it != g_moe_layer_caches.end(); ) {
         llama_moe_layer_cache * c = it->second;
         if (!c || c->sched != sched) { ++it; continue; }
@@ -5291,12 +6689,24 @@ bool llama_moe_recap_from_compute_reserve(ggml_backend_sched_t sched, size_t com
             c->buffer = nullptr;
         }
         if (c->ctx)    { ggml_free(c->ctx);                   c->ctx    = nullptr; }
+        dropped.push_back(c);
         delete c;
         it = g_moe_layer_caches.erase(it);
+    }
+    // A two-tier high cache holds a raw pointer to its low twin. Both tiers share a sched so they are
+    // always dropped together, but do not leave a survivor holding a freed pointer if that ever changes:
+    // the next graph build re-establishes the link.
+    for (auto & kv : g_moe_layer_caches) {
+        llama_moe_layer_cache * c = kv.second;
+        if (!c || !c->tier_lo) { continue; }
+        for (const llama_moe_layer_cache * d : dropped) {
+            if (c->tier_lo == d) { c->tier_lo = nullptr; break; }
+        }
     }
 
     g_moe_compute_reserve.store(compute_bytes, std::memory_order_release);
     g_moe_cached_cap = 0;
+    g_moe_cached_cap_lo = 0; // both tiers come out of one split; recomputing one alone desynchronises them
     g_moe_autocap_logged = false;
 
     return true;
@@ -5361,6 +6771,10 @@ void llama_moe_cache_shutdown(void) {
             for (auto & kv : g_moe_layer_caches) {
                 llama_moe_layer_cache * c = kv.second;
                 if (!c || c->proj.empty() || !c->proj[0].src) { continue; }
+                // Two-tier mode: the low-precision twin shares its high tier's tensor name, so writing it
+                // too would put two records under one key. Only the high tier is saved - the file keeps its
+                // existing format and meaning, and the low tier simply starts cold (scores are a hint).
+                if (c->tier_low) { continue; }
                 if ((int) c->expert_score.size() != c->n_expert || c->n_expert <= 0) { continue; }
                 const char * nm = c->proj[0].src->name;
                 const uint32_t nlen = (uint32_t) strnlen(nm, GGML_MAX_NAME);

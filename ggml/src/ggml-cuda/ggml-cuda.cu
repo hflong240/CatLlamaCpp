@@ -3192,6 +3192,43 @@ static void ggml_cuda_op_moe_ffn(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 }
 
+// fork: two-tier mixed-quant mul_mat_id (GGML_OP_MUL_MAT_ID_2T) - see ggml_mul_mat_id_2t in ggml.c / ggml.h.
+// src[0]=as_hi, src[1]=b, src[2]=ids, src[3]=as_lo, src[4]=tier. op_params[0]=n_real_hi, op_params[1]=n_real_lo.
+// The two expert tiers are fused into one logical mul_mat_id over a unified channel space (ids < n_slots_hi
+// select high-tier slots, ids >= n_slots_hi select low-tier slot id - n_slots_hi). Two backends:
+//   - decode (single token, no sentinels): ggml_cuda_mul_mat_id_2t_mmvq - two MMVQ launches (mmvq.cu).
+//   - everything else (prefill sweep, sentinels): ggml_cuda_mul_mat_id_2t_mmq - two MMQ launches (mmq.cu).
+// See those files for the invariants.
+static void ggml_cuda_op_mul_mat_id_2t(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * as_hi = dst->src[0];
+    const ggml_tensor * src1  = dst->src[1];
+    const ggml_tensor * ids   = dst->src[2];
+    const ggml_tensor * as_lo = dst->src[3];
+
+    // Sentinel bounds (op_params) are a prefill-sweep concept; decode declares none (full slot count). The
+    // MMVQ two-launch has no sentinel-skip - it partitions channels by tier from the id value and computes
+    // every routed slot - so it is only valid when neither tier declares a sentinel bound.
+    const int32_t n_real_hi = dst->op_params[0];
+    const int32_t n_real_lo = dst->op_params[1];
+    const bool no_sentinels = (n_real_hi <= 0 || n_real_hi >= as_hi->ne[2])
+                           && (n_real_lo <= 0 || n_real_lo >= as_lo->ne[2]);
+
+    // Decode fast path: a single output token (dst->ne[2] == 1) with both tiers MMVQ-eligible. mul_mat_vec_q_2t
+    // implements only ncols_dst == 1, so ne[2] == 1 is the binding constraint; for it, stock's MMVQ batch gate
+    // (ne2 <= MMVQ_MAX_BATCH_SIZE and <= get_mmvq_mmid_max_batch) is trivially satisfied for any quantized type.
+    // Everything else (prefill sweep n_tokens > 1, declared sentinels, non-quant / native-fp4 tiers) uses MMQ.
+    const bool tiers_mmvq_capable =
+           ggml_is_quantized(as_hi->type) && ggml_is_quantized(as_lo->type)
+        && as_hi->type != GGML_TYPE_MXFP4 && as_hi->type != GGML_TYPE_NVFP4
+        && as_lo->type != GGML_TYPE_MXFP4 && as_lo->type != GGML_TYPE_NVFP4;
+
+    if (dst->ne[2] == 1 && no_sentinels && tiers_mmvq_capable) {
+        ggml_cuda_mul_mat_id_2t_mmvq(ctx, as_hi, as_lo, src1, ids, dst);
+        return;
+    }
+    ggml_cuda_mul_mat_id_2t_mmq(ctx, as_hi, as_lo, src1, ids, dst);
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -3524,6 +3561,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_HC_SINKHORN:
             ggml_cuda_op_hc_sinkhorn(ctx, dst);
+            break;
+        case GGML_OP_MUL_MAT_ID_2T:
+            ggml_cuda_op_mul_mat_id_2t(ctx, dst);
             break;
         default:
             return false;
@@ -5860,6 +5900,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_MOE_FFN:
             return true; // fork: fused MoE FFN, CUDA-native decode path
+        case GGML_OP_MUL_MAT_ID_2T:
+            // fork: M1 forwards to the stock mul_mat_id path on the high tier, so anything that path
+            // supports, this op supports. as_lo/tier are validated by the graph builder, not here.
+            return true;
         case GGML_OP_HC_SINKHORN:
             // fork: fused Sinkhorn. Must be claimed here or the scheduler spills it to the CPU backend,
             // which would add two splits per occurrence (86 per decode token) and lose the whole point.

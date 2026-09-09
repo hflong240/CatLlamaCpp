@@ -1081,9 +1081,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MOE_FFN",
     "HC_SINKHORN",
+    "MUL_MAT_ID_2T",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1194,9 +1195,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "moe_ffn(x)",
     "hc_sinkhorn(x)",
+    "X_2t[i]*Y",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3332,6 +3334,60 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_mul_mat_id_2t (fork)
+
+struct ggml_tensor * ggml_mul_mat_id_2t(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as_hi,
+        struct ggml_tensor  * as_lo,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * tier) {
+    // Same contract as ggml_mul_mat_id against as_hi, plus a second expert tensor whose slabs share
+    // as_hi's shape but may carry a different quantization type. `ids` is indexed in the UNIFIED
+    // channel space: id < as_hi->ne[2] selects high-tier slot id, otherwise low-tier slot
+    // (id - as_hi->ne[2]). `tier` is the matching 1/0 selector, kept so the op is self-describing
+    // for backends that cannot decode the bias.
+    GGML_ASSERT(!ggml_is_transposed(as_hi));
+    GGML_ASSERT(!ggml_is_transposed(as_lo));
+    GGML_ASSERT(ids->type  == GGML_TYPE_I32);
+    GGML_ASSERT(tier->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(as_hi->ne[3] == 1); // as is 3d (one matrix per expert)
+    GGML_ASSERT(as_lo->ne[3] == 1);
+    GGML_ASSERT(b->ne[3] == 1); // b is 3d
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
+    GGML_ASSERT(ids->ne[1] == b->ne[2]); // must have an expert list per b row
+    GGML_ASSERT(as_hi->ne[0] == b->ne[0]); // can_mul_mat
+    GGML_ASSERT(ids->ne[0] % b->ne[1] == 0); // can broadcast
+
+    // the two tiers must be interchangeable per routed position: same in/out dims, only the
+    // quantization type and the slot count may differ
+    GGML_ASSERT(as_lo->ne[0] == as_hi->ne[0]);
+    GGML_ASSERT(as_lo->ne[1] == as_hi->ne[1]);
+
+    GGML_ASSERT(tier->ne[0] == ids->ne[0]);
+    GGML_ASSERT(tier->ne[1] == ids->ne[1]);
+    GGML_ASSERT(tier->ne[2] == 1 && tier->ne[3] == 1);
+
+    const int64_t ne[4] = { as_hi->ne[1], ids->ne[0], b->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    // op_params[0]/[1]: per-tier sentinel-skip bound (see the n_real contract in ggml-cuda/mmq.cu).
+    // 0 means "no sentinels declared in this tier", which is what every caller starts from.
+    ggml_set_op_params_i32(result, 0, 0);
+    ggml_set_op_params_i32(result, 1, 0);
+
+    result->op     = GGML_OP_MUL_MAT_ID_2T;
+    result->src[0] = as_hi;
+    result->src[1] = b;
+    result->src[2] = ids;
+    result->src[3] = as_lo;
+    result->src[4] = tier;
 
     return result;
 }

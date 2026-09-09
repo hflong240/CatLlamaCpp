@@ -180,6 +180,13 @@ should not run together. Use `-fit off` with streaming (see the note under Usage
 - **Auto-sized cache tiers**: both the VRAM expert cache (`LLAMA_MOE_CACHE_CAP`) and the host-RAM pool
   (`LLAMA_MOE_RAM_CAP`) size themselves from free VRAM / available system RAM at startup - you normally set
   neither. They fill the device and host uniformly across all MoE layers (see the sizing note below).
+- **Mixed-precision expert tiers** (opt-in, `--moe-expert-gguf-low`): register a low-quantization twin of
+  every routed expert from a second GGUF, so a position the VRAM budget cannot hold is served by the
+  **correct** expert at lower precision instead of a **wrong** (stale) one at full precision. Measured
+  against lossless streaming of the same model, it cuts the mean KL divergence of the fast stale-reuse path
+  by 1.4x and its 99th percentile by 1.3x, at about half the decode rate - a middle rung between the two.
+  On CUDA both tiers fuse into one `mul_mat_id_2t` op by default (decode and the prefill sweep); see
+  [Mixed-precision expert tiers](#mixed-precision-expert-tiers).
 - **Fused CUDA MoE-FFN op** (opt-in, `LLAMA_MOE_FUSED=1`, CUDA only): a single CUDA-native op does the
   per-layer expert sync-load + gate/up + SwiGLU + down + weighted sum, replacing a per-layer CPU op (and its
   scheduler split, 160 splits/token -> 4). Quality-identical to the default path, but measured decode is
@@ -236,6 +243,137 @@ to restore the pure fixed top-2 budget, or `LLAMA_MOE_SYNC_BUDGET=0` to let deco
 faster - though the stale reuse then **degrades quality on hard prompts**). An explicit value always wins
 over the default. To try the fused CUDA op, add `LLAMA_MOE_FUSED=1` (off by default - see below).
 
+#### Mixed-precision expert tiers
+
+Two flags let the routed experts come from a *second* GGUF of the same model at a different quantization.
+Both are opt-in, both require the expert tensor shapes to match the main model exactly, and both refuse a
+quantization no GPU backend has a `mul_mat_id` kernel for (otherwise the experts would silently fall back
+to the CPU after tens of GiB had already been read).
+
+| Flag | What it does |
+|------|--------------|
+| `--moe-expert-gguf FNAME` | **Replace.** Every `ffn_*_exps` tensor is taken from `FNAME` instead of the model file; every other tensor keeps the main model's precision. One expert tier, just a different one. |
+| `--moe-expert-gguf-low FNAME` | **Add a low tier.** The main model keeps its experts *and* a low-precision twin of each is registered from `FNAME`. Requires `--moe-stream-async`; mutually exclusive with `--moe-expert-gguf`. |
+| `--moe-expert-cap N` | Resident experts per layer, high tier. Default auto (from free VRAM). The main quality/speed knob - see Sizing. |
+| `--moe-expert-cap-low N` | Same for the low tier. **Normally unnecessary**: it is auto-fitted to whatever bytes the high tier leaves, including when `--moe-expert-cap` is set by hand. |
+
+A minimal two-tier run is the async-streaming command plus the low-tier GGUF:
+
+```bat
+llama-completion -m model-Q4.gguf --moe-expert-gguf-low model-IQ1_S.gguf ^
+  -ngl 99 --moe-stream-async -fit off -no-cnv -p "..."
+```
+
+Both files are the same model at different quantizations; only their `ffn_*_exps` tensors need matching
+shapes. `--moe-expert-cap` / `--moe-expert-cap-low` are optional - the resident cap for each tier is
+auto-sized and printed at startup. Add `LLAMA_MOE_TIERDBG=1` to see the per-tier serve split.
+
+The point of the low tier is what happens to a routed position the VRAM budget could not hold. Single-tier
+streaming resolves it to a *stale* slot: a real but **wrong** expert, applied at the intended expert's full
+gate weight. With a low tier present that position is served by the **correct** expert instead, just
+quantized lower - identity is preserved everywhere and only precision degrades, and only where the budget
+ran out. A ggml tensor has one type and one expert stride, so mixed precision cannot live in a single
+`mul_mat_id`; the layer therefore runs its expert FFN twice (once per tier) with the gate weights split by
+a hard 0/1 mask, so every routed position is applied exactly once and the two passes sum to the ordinary
+result.
+
+Prefill: by default the two tiers **fuse** into the expert-group sweep (CUDA, `LLAMA_MOE_TIER_SWEEP`, on
+below). A sweep group then spans `cap_hi + cap_lo` experts instead of `cap_hi`, so the per-layer pass count
+drops from `ceil(n_expert/cap_hi)` to `ceil(n_expert/(cap_hi+cap_lo))` - fewer, wider passes and a faster
+prefill - at the cost of evaluating a `cap_lo/(cap_hi+cap_lo)` share of prompt positions at the low tier's
+precision. This is a bounded quality cost (see the fused-op note below), not the stale-reuse hazard decode
+avoids: a prompt position still gets the **correct** expert, only at lower precision. Set
+`LLAMA_MOE_TIER_SWEEP=0` to keep prefill **lossless** - the sweep then runs entirely on the high tier (the
+whole prompt at high precision, the low tier neither warmed nor disturbed in VRAM), exactly as single-tier
+streaming does. Either way the high tier's own VRAM cache is cycled through the whole expert index space by
+the sweep, which is what the post-sweep refill at the first decode token exists to undo.
+
+Sizing: **one byte budget covers both tiers, and only `cap_hi` needs choosing.** A low slab is about half a
+high one, so binding the two tiers to a single slot count would hand the high tier ~2/3 of the VRAM by
+accident; instead `cap_hi` is picked first and every remaining byte goes to the low tier. Prefill runs a
+*step* number of full-width FFN passes per layer, and which capacity sets that count depends on the fused
+sweep: with it on (default) a group spans both tiers, so the count is `ceil(n_expert/(cap_hi+cap_lo))` and
+the auto sizer snaps the **sum** `cap_hi+cap_lo` up to the next boundary - converting high slots into low
+ones (a high slab frees ~two low ones) at constant total bytes, so the move is VRAM-neutral. With
+`LLAMA_MOE_TIER_SWEEP=0` the count is `ceil(n_expert/cap_hi)` and the sizer snaps `cap_hi` instead. Either
+snap is bounded by `LLAMA_MOE_TIER_SNAP` (fraction of the anchor the move may cost, `0` disables). `cap_lo`
+is not a *decode* quality knob: a low-tier VRAM miss falls back to that tier's host RAM pool, deep enough to
+absorb it, so decode serves the same expert either way. Under the fused sweep it does trade prefill speed
+against prefill precision (a larger `cap_lo` means fewer passes but a larger low-precision share), which is
+what the `LLAMA_MOE_TIER_SNAP` budget bounds.
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `LLAMA_MOE_CACHE_CAP_LOW=N` | auto (remaining bytes) | VRAM experts/layer for the low tier only. Same as `--moe-expert-cap-low`. |
+| `LLAMA_MOE_RAM_CAP_LOW=N` | auto | Host-RAM experts/layer for the low tier. An explicit `LLAMA_MOE_RAM_CAP` deliberately does **not** propagate here: it was tuned to fill RAM with one pool. |
+| `LLAMA_MOE_RAM_SPLIT_HI=F` | `0.15` | Share of the host-RAM byte budget the high tier gets; this is the prefill-vs-decode trade. The low tier is read one expert at a time on the decode critical path, while the high tier's reads are the prefill sweep's, issued a whole ubatch at a time across the io threads - so a RAM slot is worth more to the low tier. Raise it if your workload is prompt-dominated. |
+| `LLAMA_MOE_TIER_SNAP=F` | `0.10` | How far (as a fraction of the anchor) the auto sizer may move the prefill-pass axis to reach a group boundary - `cap_hi+cap_lo` with the fused sweep on (default), `cap_hi` with `LLAMA_MOE_TIER_SWEEP=0`. `0` disables. |
+| `LLAMA_MOE_TIER_YIELD=N` | `3` in two-tier mode | Hand a high-tier cache miss down to the low twin instead of loading it: `1` only if the twin is in VRAM, `2` also from its RAM pool, `3` always (the high tier then spends no synchronous load *on decode*; prefill is unaffected, the sweep loads it directly). `0` off. |
+| `LLAMA_MOE_TIER_DEDUP=0` | on | Stop the low tier from caching experts the high tier already holds. On by default; turning it off doubles up on the hot core. |
+| `LLAMA_MOE_SYNC_BUDGET_LOW=N` | `n_expert_used` | Per-step sync-load cap for the low tier. Unbudgeted by default: rationing it would just put the stale expert back. |
+| `LLAMA_MOE_TIERDBG=1` | off | Periodically report what share of routed positions each tier served. |
+
+Two CUDA-only fused ops, **both on by default** when a low tier is present, replace the tier pair's two
+separate `mul_mat_id` passes with a single `mul_mat_id_2t`:
+
+- `LLAMA_MOE_TIER_FUSED` (CUDA only, default on; `=0` to disable) - fuses the mixed-precision **decode**
+  step (the two masked FFN passes described above) into one op. Output-identical to the unfused two-pass
+  decode (verified byte-for-byte); a pure kernel-count / scheduler optimization, no quality change.
+- `LLAMA_MOE_TIER_SWEEP` (CUDA only, default on; `=0` to disable) - fuses the **prefill** sweep so one
+  expert group spans both tiers, cutting the per-layer pass count from `ceil(n_expert/cap_hi)` to
+  `ceil(n_expert/(cap_hi+cap_lo))`. Unlike the decode fusion this changes the numbers: it evaluates a
+  `cap_lo/(cap_hi+cap_lo)` share of prefill positions at the low quant, trading the lossless-prefill
+  property for fewer, wider passes (a faster prefill). The trade is bounded by `LLAMA_MOE_TIER_SNAP`, and
+  `LLAMA_MOE_TIER_SWEEP=0` gives prefill back losslessly. The auto sizer accounts for it - it snaps
+  `cap_hi+cap_lo` to a pass boundary (above) - so the caps need no hand-tuning.
+
+Measured quality, RTX 4090D (24 GB) + 64 GB RAM, Qwen3.8-Flash-Next (512 experts, 10 used, 48 MoE layers),
+high tier `UD-Q4_K_XL`, low tier `UD-IQ1_S` (or `UD-Q2_K_XL` where a row says so).
+`llama-perplexity --kl-divergence` against the reference =
+**the same model with every selected expert streamed at its correct identity in full Q4** (full experts,
+lossless: `SYNC_BUDGET` high, `SYNC_COVER=0`), 8 chunks x 512 = 4096 tokens of this repository's own source.
+That reference is the first table row (KLD 0 by definition); every row below has a larger KLD, i.e. sits
+further from full-experts Q4:
+
+| Config | `cap_hi`/`cap_lo` | Mean KLD | Same top p | 99th pct KLD | PPL ratio | tok/s |
+|--------|-------------------|----------|------------|--------------|-----------|-------|
+| **single-tier Q4, full experts (lossless) - the KLD reference** | - | **0** | **100%** | **0** | **1.00** | n/m |
+| single-tier Q4, pure-GPU stale fast path (`SYNC_BUDGET=2 SYNC_COVER=0.2`, wrong expert identity) | - | 0.400 | 72.8% | 2.30 | 1.078 | 32.2 |
+| single-tier IQ1_S, lossless | - | 0.526 | 70.0% | 2.79 | 1.170 | 32.8 |
+| two-tier, IQ1_S low (2 runs) | 59/59 | 0.290 | 75.7% | 1.80 | 1.06 | 17.8 |
+| two-tier, **Q2_K low** (1 run; same VRAM, same `cap_hi`) | 59/51 | **0.187** | **81.9%** | **1.22** | **1.02** | n/m |
+| **two-tier (3 runs)** | **64/59** | **0.279** | **76.8%** | **1.72** | **1.04** | **17.0** |
+| two-tier | 74/59 | 0.264 | 76.6% | 1.63 | 1.04 | 15.0 |
+| two-tier | 86/15 | 0.247 | 77.7% | 1.56 | 1.07 | 11.2 |
+
+Reading the table: full-experts lossless Q4 (top row) is the reference, so every two-tier row is a quality
+*reduction* from full experts - the price paid to fit a far bigger model in the same VRAM. The two-tier gain
+is over the pure-GPU stale fast path (which serves resident slots at the *wrong* expert identity), not over
+full experts, and it is largest in the **tail** (99th percentile 1.72 vs 2.30, worst case 2.7-4.2 vs 6.2) -
+which is what matters when a single wrong token breaks an identifier. Quality is
+monotone in `cap_hi` and keeps improving past 64, but by 86 the throughput has dropped below plain lossless
+streaming, so on a 24 GB card 64 is the useful end of the range. The low-tier *quant* is a second and
+larger lever: at the same VRAM and the same `cap_hi` (59/51 vs 59/59), swapping the `UD-IQ1_S` low tier for
+`UD-Q2_K_XL` cuts Mean KLD from 0.290 to 0.187 and lifts Same top p to 81.9% - a bigger quality gain than any
+`cap_hi` move on this card, and it edges out even the best IQ1_S row (64/59). Q2_K is a far more faithful low
+tier than IQ1_S; the price is on-disk model size (`UD-Q2_K_XL` is larger than `UD-IQ1_S`), so more of the
+working set streams from disk, and its decode tok/s was not separately measured (n/m).
+
+Caveats on those numbers: `-ub 1` and `-b` = `-c` are **mandatory** for this measurement (at `n_tokens > 1`
+the prefill sweep takes over and the low tier contributes nothing, so the run would measure the high tier
+alone); every arm started from a cold expert-score file; both caps were pinned by hand, so the `cap_lo`
+column is not what the auto sizer would pick (with the fused sweep on it lands around cap_hi 49 / cap_lo 79 -
+4 passes, below the 64 shown here, trading quality for a prefill pass); one model on one card. 1-sigma on a
+whole-run Mean KLD is
+about +/-0.009, so the 74-vs-64 gap is near the resolution limit while 86-vs-64 is not, and `Same top p` is
+a discrete threshold that only resolves differences above ~1.2 points. The full-experts reference row is
+0 / 100% by definition (a distribution scored against itself), so its `-ub 1` tok/s was not separately
+recorded and reads n/m (not measured); the two-tier speed cost is still visible against the stale path's 32.2
+in the same column. The Q2_K-low row is a single run of a non-deterministic arm (which position gets the Q4
+expert vs the Q2 expert depends on loader timing), but its 0.187-vs-0.290 gap against the IQ1_S row at equal
+VRAM is about 10x the +/-0.009 noise floor, so the ordering is not in doubt; its own decode tok/s (n/m) would
+need a separate speed arm.
+
 Measured on an RTX 4090D (24 GB) + 64 GB RAM, coherent and non-degenerate through long generations:
 
 | Model | Fits in | Decode | Prefill |
@@ -243,10 +381,20 @@ Measured on an RTX 4090D (24 GB) + 64 GB RAM, coherent and non-degenerate throug
 | DeepSeek-V4-Flash **IQ2** (78 GiB routed experts) | neither VRAM nor RAM | **~14.5 tok/s** | **~76 tok/s (lossless)** |
 | Hunyuan-v3 **IQ2** (~92 GB) | neither VRAM nor RAM | **~13 tok/s** | ~20-40 tok/s |
 | Hunyuan-v3 **Q4** (~170 GB) | neither VRAM nor RAM | **~3.8 tok/s** | ~10-15 tok/s |
+| Qwen3.8-Flash-Next **two-tier** (Q4 + IQ1_S, ~109 GiB routed experts) | neither VRAM nor RAM | **~8 tok/s** | **~57 tok/s** |
 
 The DeepSeek-V4-Flash row is the shipped default configuration (`--moe-stream-async -fit off -ub 2048`),
 N=3 medians on a 1195-token prompt with a 320-token generation. Its prefill is both lossless and ~5.7x the
 old `-ub 1` path; the Hunyuan-v3 prefill figures predate the expert-group sweep.
+
+The Qwen3.8-Flash-Next row is the two-tier default (both fused ops on; with the sweep on the auto sizer
+snaps to cap_hi ~49 / cap_lo ~79 = 4 fused prefill passes) - a *single* representative run at
+`-ub 2048 -c 6144`, not an N-run median. Prefill is load-bound and swings ~+/-20% run to run, so read ~57 as
+a band, not a point; a sub-20% comparison against the single-tier rows (measured on other days) is not valid.
+Prefill in this mode is *not* lossless - the fused sweep evaluates the `cap_lo` share at IQ1 (quality is the
+KLD table above, whose highlighted 64/59 is hand-pinned and higher-quality than this auto default). Raising
+`LLAMA_MOE_CACHE_CAP` above the auto `cap_hi` trades prefill back for decode and quality (decode measured
+~10-12 tok/s at a hand-pinned cap_hi 59).
 
 Q4 is slower than IQ2 because each expert slab is ~1.8x the bytes, so fewer experts fit resident (both
 tiers hold fewer) and the working set overflows VRAM+RAM further - decode is bounded by NVMe read
@@ -309,6 +457,10 @@ dominant cost. Set `LLAMA_MOE_SYNC_COVER=0` for the fixed-budget baseline.
 > `-ub 1`, set `LLAMA_MOE_PREFILL_SWEEP=0` so the sentinel count drops back to 1.
 >
 > The byte-identical `--moe-stream` (compaction) mode remains lossless at any `-ub`.
+>
+> This note is about single-tier streaming. With a low tier (`--moe-expert-gguf-low`) the fused two-tier
+> sweep is on by default and trades this lossless-prefill property for fewer passes; see
+> [Mixed-precision expert tiers](#mixed-precision-expert-tiers) (`LLAMA_MOE_TIER_SWEEP=0` restores it).
 
 > [!TIP]
 > **Long prompts are bound by expert bytes, not compute.** Every ubatch step must bring each expert it

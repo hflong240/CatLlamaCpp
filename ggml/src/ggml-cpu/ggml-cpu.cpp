@@ -469,6 +469,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_MOE_FFN:
+        case GGML_OP_MUL_MAT_ID_2T:
             return false; // fork: CUDA-only op; never run on CPU (its forward aborts)
         default:
             return true;

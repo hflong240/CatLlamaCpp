@@ -1642,12 +1642,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // is set). Uses each tensor's file index + absolute data offset from the loader's weights map.
     {
         extern void llama_moe_register_expert_file(const struct ggml_tensor * exps, const char * path, uint64_t file_offset);
+        extern void llama_moe_register_low_tier(const struct ggml_tensor * hi, int type,
+                                                const int64_t * ne, const char * path, uint64_t file_offset);
         auto reg = [&](const ggml_tensor * t) {
             if (!t) { return; }
             const auto * w = ml.get_weight(ggml_get_name(t));
             if (!w) { return; }
             if (w->idx >= ml.file_paths.size() || ml.file_paths[w->idx].empty()) { return; }
             llama_moe_register_expert_file(t, ml.file_paths[w->idx].c_str(), (uint64_t) w->offs);
+            // fork: the same tensor's low-precision twin, if --moe-expert-gguf-low was given. Keyed on
+            // the main tensor, so the streaming layer can go from either tier to the other.
+            auto lo = ml.expert_tier_low.find(ggml_get_name(t));
+            if (lo != ml.expert_tier_low.end()) {
+                llama_moe_register_low_tier(t, (int) lo->second.type, lo->second.ne,
+                                            lo->second.path.c_str(), (uint64_t) lo->second.offs);
+            }
         };
         for (auto & layer : layers) {
             reg(layer.ffn_gate_exps);
@@ -2356,6 +2365,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.moe_expert_model            =*/ nullptr,
+        /*.moe_expert_model_low        =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

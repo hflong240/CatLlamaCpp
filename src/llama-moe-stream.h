@@ -283,6 +283,24 @@ bool llama_moe_stride_freefly(void);
 // the first graph build. Only consulted when LLAMA_MOE_NOMMAP is set.
 void llama_moe_register_expert_file(const ggml_tensor * exps, const char * path, uint64_t file_offset);
 
+// fork: LOW-PRECISION EXPERT TIER (--moe-expert-gguf-low). Register the low-quantization TWIN of the
+// routed-expert tensor `hi`: its ggml type, its 3D shape, and where its bytes start in the second GGUF.
+// No memory is allocated for the twin and it is never mmapped - the streaming layer builds a parallel
+// per-layer cache over a meta-only descriptor and freads experts from the file on demand. Call once per
+// expert tensor at model load, before the first graph build.
+// `type` is a ggml_type passed as int: this header only forward-declares the ggml structs it needs and
+// an unscoped enum cannot be forward-declared, so keeping it an int avoids pulling in ggml.h here.
+void llama_moe_register_low_tier(const ggml_tensor * hi, int type, const int64_t * ne,
+                                 const char * path, uint64_t file_offset);
+
+// True once any low-precision twin has been registered (i.e. the two-tier mode is available).
+bool llama_moe_low_tier_enabled(void);
+
+// Fill `out_lo[0..n_proj)` with the low-precision twins of `exps_list[0..n_proj)`. Returns n_proj on
+// success, or 0 if the tier is off or any projection lacks a twin (all-or-nothing: a partially twinned
+// layer would mix precisions inside a single FFN pass, which the two-pass sum cannot express).
+int llama_moe_low_tier_list(ggml_tensor * const * exps_list, int n_proj, ggml_tensor ** out_lo);
+
 //
 // Per-layer async expert cache with drop-on-miss (the practical async path).
 //
@@ -315,12 +333,21 @@ llama_moe_layer_cache * llama_moe_layer_cache_lookup(const ggml_tensor * exps0);
 // LLAMA_MOE_CACHE_CAP. `n_moe_layers` is the count of layers that build a streamed MoE cache (total
 // layers minus the leading dense block). Returns a capacity in [n_used, n_expert], or 0 if it cannot
 // measure (caller keeps its own default). Tune the VRAM fraction with LLAMA_MOE_VRAM_FRAC (default 0.80).
+//
+// fork two-tier mode: pass BOTH tiers' expert tensors in `exps_list` (the low-precision twins are
+// recognised by having a registered high twin, so the order does not matter) and a non-null
+// `cap_lo_out`. The single byte budget is then split between the tiers instead of being spent on one
+// capacity shared by both - which, since a low slab is about half a high one, silently handed the high
+// tier ~2/3 of the VRAM. `cap_hi_fixed > 0` means the caller already has an explicit high capacity
+// (LLAMA_MOE_CACHE_CAP) and only wants the low tier sized against what that leaves.
 int llama_moe_auto_capacity(ggml_backend_sched_t  sched,
                             ggml_tensor * const * exps_list,
                             int                   n_proj,
                             int                   n_expert,
                             int                   n_used,
-                            int                   n_moe_layers);
+                            int                   n_moe_layers,
+                            int                   cap_hi_fixed,
+                            int *                 cap_lo_out);
 
 // Device slot table [1,n_expert] i32 (expert -> cache slot, sentinel `capacity` if missing).
 ggml_tensor * llama_moe_layer_cache_slot_table(llama_moe_layer_cache * c);
@@ -379,6 +406,48 @@ ggml_tensor * llama_moe_layer_cache_remap(llama_moe_layer_cache * c,
                                           ggml_tensor *           weights,
                                           float                   threshold,
                                           int                     sync_budget);
+
+// fork: TWO-TIER DECODE REMAP (--moe-expert-gguf-low). Same contract as llama_moe_layer_cache_remap for
+// the high tier, but resolves the positions the high tier could NOT serve against a second cache holding
+// a low-precision twin of the same experts - so an out-of-budget position gets the CORRECT expert at
+// reduced precision instead of a wrong (stale) expert at full precision.
+//
+// Returns ONE i32 tensor packing everything the caller needs, so the two-tier path costs the same
+// single CPU op (one ggml split) as the one-tier path. Two output layouts, selected by `fused`:
+//
+//   fused == false (masked two-pass sum) - [n_used, 3*n_tokens]:
+//     rows [0*n_tokens, 1*n_tokens) - high-tier slot ids  -> ids for the high mul_mat_id pass
+//     rows [1*n_tokens, 2*n_tokens) - low-tier slot ids   -> ids for the low  mul_mat_id pass
+//     rows [2*n_tokens, 3*n_tokens) - 1 if the high tier served the position, else 0
+//   The caller takes the first two blocks as contiguous 2D views and turns the third into the f32 gate
+//   mask via ggml_get_rows over llama_moe_layer_cache_tier_weights(c_hi) (the constant {0,1} table):
+//     w_hi = weights * mask; w_lo = weights - w_hi; out = FFN_hi(x)*w_hi + FFN_lo(x)*w_lo
+//   which applies every routed position exactly once (one of the two weights is a hard zero).
+//
+//   fused == true (ggml_mul_mat_id_2t) - [n_used, 2*n_tokens]:
+//     rows [0*n_tokens, 1*n_tokens) - UNIFIED slot ids: a high slot as-is, a low slot biased by the
+//                                     high cache's slot count (c_hi->proj[0].dev->ne[2]), so one id
+//                                     tensor indexes both tiers in the op's unified channel space.
+//     rows [1*n_tokens, 2*n_tokens) - 1 if the high tier served the position, else 0: the op's `tier`
+//                                     selector, kept self-describing (the CUDA path derives it from id).
+//   The caller feeds both blocks to a single ggml_mul_mat_id_2t per projection, which computes each
+//   position exactly once against its owning tier - no mask, no complement, no sum.
+//
+// Decode only (n_tokens == 1 in practice); prefill keeps the lossless expert-group sweep on the high
+// tier. Returns nullptr if either cache is unusable, in which case the caller falls back to the
+// single-tier path.
+ggml_tensor * llama_moe_layer_cache_remap_tiered(llama_moe_layer_cache * c_hi,
+                                                 llama_moe_layer_cache * c_lo,
+                                                 ggml_context *          ctx0,
+                                                 ggml_tensor *           selected_experts,
+                                                 ggml_tensor *           weights,
+                                                 float                   threshold,
+                                                 int                     sync_budget,
+                                                 bool                    fused);
+
+// Constant device table [1,2] f32 = {0.0f, 1.0f} owned by a high-tier cache; get_rows over it turns the
+// packed 0/1 tier selector into the f32 gate mask. Null unless the two-tier mode is active.
+ggml_tensor * llama_moe_layer_cache_tier_weights(llama_moe_layer_cache * c);
 
 // fork: PREFILL EXPERT-GROUP SWEEP (LLAMA_MOE_PREFILL_SWEEP=1, opt-in).
 //
@@ -454,6 +523,18 @@ ggml_tensor * llama_moe_layer_cache_remap_group(llama_moe_layer_cache * c,
                                                 ggml_tensor *           selected_experts,
                                                 int                     group,
                                                 ggml_tensor *           dep);
+
+// fork: TWO-TIER prefill sweep (LLAMA_MOE_TIER_SWEEP, CUDA only). Like llama_moe_layer_cache_remap_group,
+// but a group spans c_hi->capacity + c_lo->capacity experts, split across the two caches by selection
+// frequency, and the returned tensor is a [n_used, 2*n_tokens] pack (row block 0 = unified slot ids, row
+// block 1 = 0/1 tier selector) feeding one ggml_mul_mat_id_2t per projection. Returns null on refusal
+// (bad shapes, mismatched n_expert, or n_sentinel < n_used), so the caller can fall back cleanly.
+ggml_tensor * llama_moe_layer_cache_remap_group_tiered(llama_moe_layer_cache * c_hi,
+                                                       llama_moe_layer_cache * c_lo,
+                                                       ggml_context *          ctx0,
+                                                       ggml_tensor *           selected_experts,
+                                                       int                     group,
+                                                       ggml_tensor *           dep);
 
 // A sweep leaves every layer cache holding its LAST expert group - an index range unrelated to what
 // decode will route to - so decode would run cold for the rest of the generation. These two restore

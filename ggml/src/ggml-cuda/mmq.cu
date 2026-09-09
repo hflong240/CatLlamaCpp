@@ -245,6 +245,199 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
 
+// fork: GGML_OP_MUL_MAT_ID_2T (M2) - one logical mul_mat_id whose expert slabs come from two quant tiers.
+// The unified channel space has ne02_u = as_hi->ne[2] + as_lo->ne[2] slots; an ids value < n_slots_hi selects
+// a high-tier slot, an id >= n_slots_hi selects low-tier slot (id - n_slots_hi). We build ONE set of MoE
+// routing buffers (ids_src1 / ids_dst / expert_bounds / shared q8_1) over that unified space with a single
+// mm_ids_helper, then issue TWO mul_mat_q launches that SHARE those buffers: the high launch reads
+// expert_bounds base, the low launch reads the sliced pointer expert_bounds + n_slots_hi. Because
+// expert_bounds is a global prefix sum and the kernel addresses y / ids_dst / dst by ABSOLUTE column
+// (col_low = expert_bounds[zt]), the slice reads exactly the low tier's sub-range with zero kernel change -
+// the stock single-tier path already handles a non-zero col_low for every expert after the first. Both
+// launches run on one stream; (token, used-slot) -> dst row is injective (mmid.cu ids_dst = it*n_used+iex),
+// so the two launches write disjoint dst rows and their overwrite stores cannot race. Decode (n_tokens == 1,
+// no sentinels) instead takes the dedicated MMVQ two-launch (ggml_cuda_mul_mat_id_2t_mmvq in mmvq.cu); this
+// MMQ path serves prefill sweep (n_tokens > 1) and any launch that declares per-tier sentinel bounds.
+void ggml_cuda_mul_mat_id_2t_mmq(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * as_hi, const ggml_tensor * as_lo,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    const ggml_tensor * src0 = as_hi; // GGML_TENSOR_BINARY_OP_LOCALS takes ne0X/nb0X from the high tier
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ids && ids->type == GGML_TYPE_I32);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    // Both tiers must share the contraction dim (K) and the output feature dim (n_ff) so one shared y and one
+    // dst are valid for both launches.
+    GGML_ASSERT(as_lo->ne[0] == as_hi->ne[0]);
+    GGML_ASSERT(as_lo->ne[1] == as_hi->ne[1]);
+
+    // The q8_1 quantization of src1 picks its scale layout from the src0 type. When both tiers resolve to the
+    // SAME DS layout (a matched tier pair) one quantization serves both launches. When they differ - the common
+    // case for real mixed-quant tiers, e.g. a Q4_K/DS4 high tier paired with an IQ4_NL/D4 low tier - the low
+    // launch needs activations quantized in ITS layout, so src1 is quantized a second time below. The block size
+    // is identical across layouts (only the per-block d/s packing changes; see block_q8_1_mmq), so the second
+    // buffer and every y stride match the first.
+    const bool split_quant = mmq_get_q8_1_ds_layout(as_hi->type) != mmq_get_q8_1_ds_layout(as_lo->type);
+    // Native-fp4 tiers use a different src1 quantization (block_fp4_mmq); not supported by this fused path.
+    GGML_ASSERT(as_hi->type != GGML_TYPE_MXFP4 && as_hi->type != GGML_TYPE_NVFP4 &&
+                as_lo->type != GGML_TYPE_MXFP4 && as_lo->type != GGML_TYPE_NVFP4 &&
+                "two-tier mul_mat_id does not support native fp4 tiers");
+
+    cudaStream_t stream = ctx.stream();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    const size_t ts_hi   = ggml_type_size(as_hi->type);
+    const size_t ts_lo   = ggml_type_size(as_lo->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const size_t ts_dst  = ggml_type_size(dst->type);
+
+    GGML_ASSERT(as_hi->nb[0] == ts_hi);
+    GGML_ASSERT(as_lo->nb[0] == ts_lo);
+    GGML_ASSERT(nb10 == ts_src1);
+    GGML_ASSERT(nb0  == ts_dst);
+    GGML_ASSERT(ids->nb[0] == ggml_type_size(ids->type));
+
+    const float * src1_d = (const float *) src1->data;
+    float     *  dst_d = (float       *)  dst->data;
+
+    // If either expert slab is a temporary compute buffer, clear its padding (mirrors ggml_cuda_mul_mat_q).
+    for (const ggml_tensor * s0 : { as_hi, as_lo }) {
+        if (ggml_backend_buffer_get_usage(s0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            const size_t size_data  = ggml_nbytes(s0);
+            const size_t size_alloc = ggml_backend_buffer_get_alloc_size(s0->buffer, s0);
+            if (size_alloc > size_data) {
+                GGML_ASSERT(ggml_is_contiguously_allocated(s0));
+                GGML_ASSERT(!s0->view_src);
+                CUDA_CHECK(cudaMemsetAsync((char *) s0->data + size_data, 0, size_alloc - size_data, stream));
+            }
+        }
+    }
+
+    GGML_ASSERT(ne13 == 1);
+    GGML_ASSERT(nb12 % nb11 == 0);
+    GGML_ASSERT(nb2  % nb1  == 0);
+
+    const int64_t n_slots_hi = as_hi->ne[2];
+    const int64_t n_slots_lo = as_lo->ne[2];
+    const int64_t ne02_u     = n_slots_hi + n_slots_lo;
+
+    // Per-tier sentinel bounds (segmented sentinel-skip): op_params[0]=n_real_hi, op_params[1]=n_real_lo.
+    // Zero (the constructor default) means "no sentinels declared in this tier" -> every slot is real.
+    int32_t n_real_hi = 0, n_real_lo = 0;
+    memcpy(&n_real_hi, (const char *) dst->op_params + 0*sizeof(int32_t), sizeof(int32_t));
+    memcpy(&n_real_lo, (const char *) dst->op_params + 1*sizeof(int32_t), sizeof(int32_t));
+    if (n_real_hi <= 0 || n_real_hi > n_slots_hi) { n_real_hi = (int32_t) n_slots_hi; }
+    if (n_real_lo <= 0 || n_real_lo > n_slots_lo) { n_real_lo = (int32_t) n_slots_lo; }
+
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t ne_get_rows   = ne12 * n_expert_used;
+    GGML_ASSERT(ne1 == n_expert_used);
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02_u + 1); // unified space: n_slots_hi + n_slots_lo + 1
+
+    // If EITHER tier declares sentinels, some routed positions are dropped from ids_dst and their dst columns
+    // are never written; zero dst first so those read as the zeros they represent. A single-tier check would
+    // leave the other tier's dropped columns holding recycled ggml-alloc memory.
+    if (n_real_hi != n_slots_hi || n_real_lo != n_slots_lo) {
+        CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
+    }
+
+    {
+        const int si1  = ids->nb[1] / ggml_element_size(ids);
+        const int sis1 = nb12 / nb11;
+
+        // One helper over the full unified channel space with n_real == ne02_u (scan everything, no skip). That
+        // yields a genuine global prefix sum where expert_bounds[n_slots_hi] is exactly the low tier's first
+        // column, so the low launch's sliced pointer lands correctly. The per-tier sentinel bounds are applied
+        // at the launches via nchannels (n_real_hi / n_real_lo), NOT in the helper: the helper's single trailing
+        // n_real cannot give zero-width buckets to hi-tier sentinels that sit mid-range in the unified space.
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+            ne02_u, ne12, n_expert_used, ne11, si1, sis1, /*n_real=*/ (int) ne02_u, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+    ggml_cuda_pool_alloc<char> src1_q8_1_lo; // allocated only when the two tiers need distinct DS layouts
+    const char * y_lo = src1_q8_1.get();     // low launch reads the shared buffer unless split_quant below
+
+    const int64_t ne11_flat = ne12*n_expert_used;
+    const int64_t ne12_flat = 1;
+    const int64_t ne13_flat = 1;
+
+    {
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+
+        // High-tier (or shared) quantization: the layout is chosen from the high tier's type.
+        quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), as_hi->type, ne10, s11, s12, s13,
+            ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+        CUDA_CHECK(cudaGetLastError());
+
+        // Distinct low-tier layout: quantize src1 a second time in the low tier's layout. Same routing
+        // (ids_src1), same block size and strides - only the per-block d/s packing differs.
+        if (split_quant) {
+            src1_q8_1_lo.alloc(ctx.pool(), nbytes_src1_q8_1);
+            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1_lo.get(), as_lo->type, ne10, s11, s12, s13,
+                ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+            CUDA_CHECK(cudaGetLastError());
+            y_lo = src1_q8_1_lo.get();
+        }
+    }
+
+    // y k-tile strides: each quantization is one contiguous buffer with identical block size, so both launches
+    // use the SAME ncols_y (ne_get_rows) and the same channel/sample strides regardless of split_quant. Only the
+    // x side, the y pointer (src1_q8_1 vs y_lo), and the expert_bounds base differ between the two launches.
+    const int64_t y_s12 = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t y_s13 = ne12 * y_s12;
+
+    const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
+            || GGML_CUDA_CC_IS_CDNA(cc);
+
+    const int64_t s1 = nb1 / ts_dst;
+    const int64_t s2 = nb2 / ts_dst;
+    const int64_t s3 = nb3 / ts_dst;
+
+    // High tier: expert_bounds base pointer, nchannels_x == nchannels_y == n_real_hi.
+    {
+        const int64_t s01 = as_hi->nb[1] / ts_hi;
+        const int64_t s02 = as_hi->nb[2] / ts_hi;
+        const int64_t s03 = as_hi->nb[3] / ts_hi;
+        const mmq_args args = {
+            (const char *) as_hi->data, as_hi->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+            ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+            (int64_t) n_real_hi, (int64_t) n_real_hi, s02, y_s12, s2,
+            ne03, ne13, s03, y_s13, s3,
+            use_stream_k, ne12};
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    }
+
+    // Low tier: SLICED expert_bounds + n_slots_hi (the structural slot count, NOT n_real_hi - using n_real_hi
+    // would shift the low tier's zt mapping into the high tier's flat sentinel region), nchannels == n_real_lo.
+    {
+        const int64_t s01 = as_lo->nb[1] / ts_lo;
+        const int64_t s02 = as_lo->nb[2] / ts_lo;
+        const int64_t s03 = as_lo->nb[3] / ts_lo;
+        const mmq_args args = {
+            (const char *) as_lo->data, as_lo->type, (const int *) y_lo, ids_dst.get(), expert_bounds.get() + n_slots_hi, dst_d,
+            ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+            (int64_t) n_real_lo, (int64_t) n_real_lo, s02, y_s12, s2,
+            ne03, ne13, s03, y_s13, s3,
+            use_stream_k, ne12};
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    }
+}
+
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

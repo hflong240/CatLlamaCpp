@@ -1552,6 +1552,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = params.speculative.has_draft_mtp();
+    mparams.moe_expert_model            = params.moe_expert_model.empty()     ? nullptr : params.moe_expert_model.c_str();
+    mparams.moe_expert_model_low        = params.moe_expert_model_low.empty() ? nullptr : params.moe_expert_model_low.c_str();
 
     return mparams;
 }
@@ -1665,6 +1667,29 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         // slabs of VRAM per layer and therefore a slightly smaller auto capacity. Measured cost of that on
         // decode was within run-to-run noise; the prefill win is not.
         set_if_unset("LLAMA_MOE_PREFILL_SWEEP", "1");
+    }
+    // fork: the low-precision expert tier is built on the per-layer async cache, so without
+    // --moe-stream-async the second GGUF is read, validated and then never used. Say so rather than
+    // leaving the user to wonder why nothing changed.
+    if (!params.moe_expert_model_low.empty() && !params.moe_stream_async) {
+        LOG_WRN("%s: --moe-expert-gguf-low needs --moe-stream-async; the low-precision tier is inactive\n",
+                __func__);
+    }
+    // fork: --moe-expert-cap[-low] reach the streaming cache the same way as the rest of its knobs, through
+    // the environment. Overwritten rather than set-if-unset: an explicit command line beats an inherited
+    // LLAMA_MOE_CACHE_CAP*. Leaving a flag at 0 leaves the var alone, so the auto sizer still runs.
+    {
+        auto set_env_int = [](const char * k, int32_t v) {
+            if (v <= 0) { return; }
+            const std::string s = std::to_string(v);
+#ifdef _WIN32
+            _putenv_s(k, s.c_str());
+#else
+            setenv(k, s.c_str(), 1);
+#endif
+        };
+        set_env_int("LLAMA_MOE_CACHE_CAP",     params.moe_expert_cap);
+        set_env_int("LLAMA_MOE_CACHE_CAP_LOW", params.moe_expert_cap_low);
     }
 
     cparams.type_k = params.cache_type_k;

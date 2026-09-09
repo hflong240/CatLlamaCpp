@@ -745,6 +745,121 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
+// fork (M3a): dedicated two-tier MMVQ kernel for single-token MUL_MAT_ID_2T decode.
+//
+// Unlike the MMQ two-launch (which slices a shared expert_bounds prefix sum and needs ZERO kernel change),
+// the stock MMVQ mul_mat_id kernel reads channel_x = ids[channel_dst] DIRECTLY and has no expert_bounds to
+// slice - so the shared-kernel trick is impossible and a real kernel is required. This is a copy of the
+// ncols_dst == 1 path of mul_mat_vec_q (fusion stripped: the 2t op is a bare matmul, any GLU is a separate
+// downstream node) with exactly one behavioural change: each launch owns ONE tier. The tier is derived from
+// the id value the same way the MMQ launches slice it - id < n_slots_hi is a high-tier slot, id >= n_slots_hi
+// is low-tier slot (id - n_slots_hi). channel_dst == blockIdx.y is uniform across the block, so a whole block
+// either runs or early-outs together; no thread diverges at __syncthreads.
+//
+// small_k is forced off here (rows_per_cuda_block == 1). small_k changes only the block row-tiling
+// (rows_per_cuda_block and grid.x), never the per-output-element accumulation or its order, so the result is
+// bit-identical to whichever small_k the stock kernel would pick for the same dims.
+template <ggml_type type, int ncols_dst>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_2t(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_col_dst, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const uint32_t n_slots_hi, const int32_t want_hi) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, false, nwarps);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const     int tid  = warp_size*threadIdx.y + threadIdx.x;
+    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter  = vdr * nwarps*warp_size / qi;
+
+    const uint32_t channel_dst = blockIdx.y;
+
+    ggml_cuda_pdl_sync();
+    // Single-token MUL_MAT_ID: channel_x comes straight from the routing ids (the ncols_dst == 1 path).
+    const uint32_t id = ids[channel_dst];
+    // This launch owns exactly one tier; a block whose id belongs to the other tier does no work. Because
+    // channel_dst (== blockIdx.y) is uniform across the block, either all threads return or none do.
+    if ((int32_t) (id < n_slots_hi) != want_hi) {
+        return;
+    }
+    const uint32_t channel_x  = want_hi ? id : (id - n_slots_hi);
+    const uint32_t channel_y  = fastmodulo(channel_dst, nchannels_y);
+    const uint32_t sample_dst = blockIdx.z;
+    const uint32_t sample_x   = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y   = sample_dst;
+
+    // partial sum for each thread
+    float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+
+    const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    const int kbx_offset  = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+        const int kqs = vdr * (tid % (qi/vdr));
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp[j][i] += vec_dot_q_cuda(
+                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            }
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+    dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+            }
+            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+        }
+
+        if (threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+            dst[j*stride_col_dst + threadIdx.x] = tmp[j][threadIdx.x];
+        }
+    }
+}
+
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
@@ -1250,4 +1365,186 @@ void ggml_cuda_op_mul_mat_vec_q(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+}
+
+// fork (M3a): single-token decode path for GGML_OP_MUL_MAT_ID_2T (see mul_mat_vec_q_2t above and the op
+// dispatch in ggml-cuda.cu). One shared q8_1 quantization of src1 (routing/type independent for MMVQ) feeds
+// two launches over the SAME dst: the high launch writes channels whose id < n_slots_hi, the low launch the
+// rest (id - n_slots_hi into as_lo's slab). Every routed channel belongs to exactly one tier, so the two
+// launches write disjoint dst channels and no clear-to-zero is needed.
+
+template <ggml_type type>
+static void launch_mul_mat_vec_q_2t(
+        const void * vx, const void * vy, const int32_t * ids, float * dst,
+        const int ncols_x, const int nrows_x,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int nchannels_y, const int nchannels_dst,
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        const uint32_t n_slots_hi, const int32_t want_hi, cudaStream_t stream) {
+    GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
+
+    constexpr int c_ncols_dst = 1; // single-token decode only
+
+    const uint3 nchannels_y_fd  = init_fastdiv_values(nchannels_y);
+    const uint3 sample_ratio_fd = init_fastdiv_values(nsamples_dst / nsamples_x);
+
+    const int device    = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
+
+    // small_k forced off (see the kernel comment): bit-identical to stock's choice, simpler launch config.
+    std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dims.first, dims.second, 0, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_2t<type, c_ncols_dst>, launch_params,
+        vx, vy, ids, dst,
+        (uint32_t) ncols_x, nchannels_y_fd, (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst,
+        (uint32_t) stride_channel_x, (uint32_t) stride_channel_y, (uint32_t) stride_channel_dst, sample_ratio_fd,
+        (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst,
+        n_slots_hi, want_hi);
+}
+
+static void mul_mat_vec_q_2t_switch_type(
+        const void * vx, const ggml_type type_x, const void * vy, const int32_t * ids, float * dst,
+        const int ncols_x, const int nrows_x,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int nchannels_y, const int nchannels_dst,
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        const uint32_t n_slots_hi, const int32_t want_hi, cudaStream_t stream) {
+#define MMVQ_2T_LAUNCH(T) \
+    launch_mul_mat_vec_q_2t<T>(vx, vy, ids, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, \
+        nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, \
+        nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, n_slots_hi, want_hi, stream)
+    switch (type_x) {
+        case GGML_TYPE_Q1_0:    MMVQ_2T_LAUNCH(GGML_TYPE_Q1_0);    break;
+        case GGML_TYPE_Q4_0:    MMVQ_2T_LAUNCH(GGML_TYPE_Q4_0);    break;
+        case GGML_TYPE_Q4_1:    MMVQ_2T_LAUNCH(GGML_TYPE_Q4_1);    break;
+        case GGML_TYPE_Q5_0:    MMVQ_2T_LAUNCH(GGML_TYPE_Q5_0);    break;
+        case GGML_TYPE_Q5_1:    MMVQ_2T_LAUNCH(GGML_TYPE_Q5_1);    break;
+        case GGML_TYPE_Q8_0:    MMVQ_2T_LAUNCH(GGML_TYPE_Q8_0);    break;
+        case GGML_TYPE_Q2_K:    MMVQ_2T_LAUNCH(GGML_TYPE_Q2_K);    break;
+        case GGML_TYPE_Q3_K:    MMVQ_2T_LAUNCH(GGML_TYPE_Q3_K);    break;
+        case GGML_TYPE_Q4_K:    MMVQ_2T_LAUNCH(GGML_TYPE_Q4_K);    break;
+        case GGML_TYPE_Q5_K:    MMVQ_2T_LAUNCH(GGML_TYPE_Q5_K);    break;
+        case GGML_TYPE_Q6_K:    MMVQ_2T_LAUNCH(GGML_TYPE_Q6_K);    break;
+        case GGML_TYPE_IQ2_XXS: MMVQ_2T_LAUNCH(GGML_TYPE_IQ2_XXS); break;
+        case GGML_TYPE_IQ2_XS:  MMVQ_2T_LAUNCH(GGML_TYPE_IQ2_XS);  break;
+        case GGML_TYPE_IQ2_S:   MMVQ_2T_LAUNCH(GGML_TYPE_IQ2_S);   break;
+        case GGML_TYPE_IQ3_XXS: MMVQ_2T_LAUNCH(GGML_TYPE_IQ3_XXS); break;
+        case GGML_TYPE_IQ1_S:   MMVQ_2T_LAUNCH(GGML_TYPE_IQ1_S);   break;
+        case GGML_TYPE_IQ1_M:   MMVQ_2T_LAUNCH(GGML_TYPE_IQ1_M);   break;
+        case GGML_TYPE_IQ4_NL:  MMVQ_2T_LAUNCH(GGML_TYPE_IQ4_NL);  break;
+        case GGML_TYPE_IQ4_XS:  MMVQ_2T_LAUNCH(GGML_TYPE_IQ4_XS);  break;
+        case GGML_TYPE_IQ3_S:   MMVQ_2T_LAUNCH(GGML_TYPE_IQ3_S);   break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
+#undef MMVQ_2T_LAUNCH
+}
+
+void ggml_cuda_mul_mat_id_2t_mmvq(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * as_hi, const ggml_tensor * as_lo,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    const ggml_tensor * src0 = as_hi; // GGML_TENSOR_BINARY_OP_LOCALS reads ne0X/nb0X from the high tier
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ids && ids->type == GGML_TYPE_I32);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    GGML_ASSERT(as_lo->ne[0] == as_hi->ne[0]);
+    GGML_ASSERT(as_lo->ne[1] == as_hi->ne[1]);
+
+    // Single output token only (mul_mat_vec_q_2t implements ncols_dst == 1); the op dispatch guarantees this.
+    GGML_ASSERT(ne2 == 1 && "two-tier MMVQ path is single-token decode only");
+    GGML_ASSERT(ne1 == ids->ne[0]); // nchannels_dst == n_expert_used
+
+    // Native-fp4 tiers use a different vec_dot path; excluded here (also filtered in the op dispatch).
+    GGML_ASSERT(as_hi->type != GGML_TYPE_MXFP4 && as_hi->type != GGML_TYPE_NVFP4 &&
+                as_lo->type != GGML_TYPE_MXFP4 && as_lo->type != GGML_TYPE_NVFP4 &&
+                "two-tier MMVQ does not support native fp4 tiers");
+
+    cudaStream_t stream = ctx.stream();
+
+    const size_t ts_hi   = ggml_type_size(as_hi->type);
+    const size_t ts_lo   = ggml_type_size(as_lo->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const size_t ts_dst  = ggml_type_size(dst->type);
+
+    GGML_ASSERT(as_hi->nb[0] == ts_hi);
+    GGML_ASSERT(as_lo->nb[0] == ts_lo);
+    GGML_ASSERT(nb10 == ts_src1);
+    GGML_ASSERT(nb0  == ts_dst);
+    GGML_ASSERT(ids->nb[0] == ggml_type_size(ids->type));
+
+    GGML_ASSERT(ne12 <= MMVQ_MAX_BATCH_SIZE);
+
+    const float   * src1_d = (const float   *) src1->data;
+    const int32_t *  ids_d = (const int32_t *)  ids->data;
+    float         *  dst_d = (float         *)  dst->data;
+
+    // If either expert slab is a temporary compute buffer, clear its padding (mirrors ggml_cuda_mul_mat_vec_q).
+    for (const ggml_tensor * s0 : { as_hi, as_lo }) {
+        if (ggml_backend_buffer_get_usage(s0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            const size_t size_data  = ggml_nbytes(s0);
+            const size_t size_alloc = ggml_backend_buffer_get_alloc_size(s0->buffer, s0);
+            if (size_alloc > size_data) {
+                GGML_ASSERT(ggml_is_contiguously_allocated(s0));
+                GGML_ASSERT(!s0->view_src);
+                CUDA_CHECK(cudaMemsetAsync((char *) s0->data + size_data, 0, size_alloc - size_data, stream));
+            }
+        }
+    }
+
+    // One shared q8_1 quantization of src1 feeds both launches. MMVQ's q8_1 layout is type-independent
+    // (quantize_row_q8_1_cuda ends GGML_UNUSED(type_src0)), so - unlike the MMQ path - no matching-DS-layout
+    // assertion across tiers is needed; the high type is passed only to satisfy the signature.
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    {
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), as_hi->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    }
+
+    // Shared (both tiers) y/dst geometry. Mirrors the ids-mode mapping in ggml_cuda_mul_mat_vec_q:
+    // ncols_dst = ne2 (== 1), nchannels_y = ne11, nchannels_dst = ne1.
+    const int64_t s11q = ne10_padded / QK8_1; // q8_1 row stride
+    const int64_t s1   =  dst->nb[1] / ts_dst;
+    const int64_t s2   =  dst->nb[2] / ts_dst;
+    const int64_t s3   =  dst->nb[3] / ts_dst;
+    const int64_t s12q = ne11*s11q;
+    const int64_t s13q = ne12*s12q;
+
+    const int64_t nchannels_y        = ne11;
+    const int64_t nchannels_dst      = ne1;
+    const int64_t stride_col_y       = s12q;
+    const int64_t stride_col_dst     = s2;
+    const int64_t stride_channel_y   = s11q;
+    const int64_t stride_channel_dst = s1;
+    const int64_t stride_sample_y    = s13q;
+    const int64_t stride_sample_dst  = s3;
+
+    const uint32_t n_slots_hi = (uint32_t) as_hi->ne[2];
+
+    // Two launches over the SAME dst. want_hi=1 handles ids < n_slots_hi (as_hi slabs); want_hi=0 the rest.
+    for (int pass = 0; pass < 2; ++pass) {
+        const ggml_tensor * as = pass == 0 ? as_hi : as_lo;
+        const size_t        ts = pass == 0 ? ts_hi : ts_lo;
+        const int32_t  want_hi = pass == 0 ? 1 : 0;
+        const int64_t s01 = as->nb[1] / ts; // stride_row_x
+        const int64_t s02 = as->nb[2] / ts; // stride_channel_x
+        const int64_t s03 = as->nb[3] / ts; // stride_sample_x
+        mul_mat_vec_q_2t_switch_type(
+            as->data, as->type, src1_q8_1.get(), ids_d, dst_d, ne00, ne01,
+            s01, stride_col_y, stride_col_dst, nchannels_y, nchannels_dst,
+            s02, stride_channel_y, stride_channel_dst,
+            (int) as->ne[3], ne3, s03, stride_sample_y, stride_sample_dst,
+            n_slots_hi, want_hi, stream);
+    }
 }

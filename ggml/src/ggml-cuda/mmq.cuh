@@ -4166,6 +4166,13 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
+// fork: two-tier fused mul_mat_id (M2). Computes one logical mul_mat_id whose expert slabs come from two quant
+// tiers (as_hi / as_lo) sharing one set of routing buffers - see the definition in mmq.cu for the invariants.
+void ggml_cuda_mul_mat_id_2t_mmq(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * as_hi, const ggml_tensor * as_lo,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

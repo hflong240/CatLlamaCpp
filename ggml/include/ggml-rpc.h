@@ -11,7 +11,10 @@ extern "C" {
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+// fork: the three fork-private ops (MOE_FFN, HC_SINKHORN, MUL_MAT_ID_2T) are appended after the
+// upstream ops, so they do not renumber any op the RPC protocol can carry. The count is bumped to
+// keep this guard live for real upstream changes; it was left at 96 when the first two were added.
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

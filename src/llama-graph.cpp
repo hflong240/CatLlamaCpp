@@ -1915,6 +1915,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // sync-loads the prompt's hot experts (replacing the old separate warm pass), so a long prompt
     // no longer reads ~every expert of every layer from disk - it is bounded to `capacity`.
     llama_moe_layer_cache * moe_lc = nullptr;
+    llama_moe_layer_cache * moe_lc_lo = nullptr; // fork: low-precision twin cache (--moe-expert-gguf-low)
     float moe_sync_threshold = 0.5f;
     if (cparams.moe_stream && cparams.moe_stream_async && moe_env_on("LLAMA_MOE_ASYNC", cparams.moe_stream_async)) {
         ggml_tensor * projs[4];
@@ -1923,22 +1924,52 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps)    { projs[np++] = gate_exps; }
         if (up_exps)      { projs[np++] = up_exps; }
         if (down_exps)    { projs[np++] = down_exps; }
+        // fork: two-tier mode keeps a SECOND cache over the low-precision twins of these same
+        // projections, so the auto-capacity budget has to cover both tiers or the two caches together
+        // overrun VRAM. Resolve the twins first and hand the combined list to the sizer, which splits one
+        // byte budget between them and returns a slot count for each. weight_before_ffn is refused because
+        // it folds the gate weights into the FFN input, which the two-pass weight split cannot undo.
+        ggml_tensor * projs_lo[4];
+        const bool two_tier = !weight_before_ffn && llama_moe_low_tier_enabled() &&
+                              llama_moe_low_tier_list(projs, np, projs_lo) == np;
         const char * cap_env = getenv("LLAMA_MOE_CACHE_CAP");
         int          cap     = cap_env ? atoi(cap_env) : 0; // 0 => auto (from free VRAM) below
-        if (!cap_env || cap <= 0) {
+        int          cap_lo  = 0;                           // fork: 0 => auto, or the low tier's own env
+        // Sizing the low tier needs the same measurement, so ask even when cap is pinned - but only then,
+        // to keep the single-tier explicit-cap path free of an extra dev_free read and log line.
+        if (!cap_env || cap <= 0 || (two_tier && !getenv("LLAMA_MOE_CACHE_CAP_LOW"))) {
             // No explicit cap: size the resident expert cache to fit free VRAM automatically, instead
             // of the old "full n_expert" default that silently spills a large model to system RAM.
             const int n_moe_layers = (int) hparams.n_layer() - (int) hparams.n_layer_dense_lead;
-            const int auto_cap = llama_moe_auto_capacity(sched, projs, np, n_expert, n_expert_used, n_moe_layers);
-            if (auto_cap > 0) { cap = auto_cap; }
+            ggml_tensor * projs_all[8];
+            int npa = 0;
+            for (int i = 0; i < np; ++i) { projs_all[npa++] = projs[i]; }
+            if (two_tier) { for (int i = 0; i < np; ++i) { projs_all[npa++] = projs_lo[i]; } }
+            const int auto_cap = llama_moe_auto_capacity(sched, projs_all, npa, n_expert, n_expert_used,
+                                                         n_moe_layers, cap, two_tier ? &cap_lo : nullptr);
+            if (auto_cap > 0 && (!cap_env || cap <= 0)) { cap = auto_cap; }
         }
         const char * thr_env = getenv("LLAMA_MOE_SYNC_THRESHOLD");
         if (thr_env) { moe_sync_threshold = (float) atof(thr_env); }
         moe_lc = llama_moe_layer_cache_get(sched, projs, np, selected_experts, cap);
+        if (moe_lc && two_tier) {
+            // cap_lo is whatever bytes the high tier left over. It is the low tier's residency window, and
+            // it is NOT a quality knob: a low-tier VRAM miss falls back to that tier's host RAM pool, which
+            // is deep enough to absorb it, so the same expert is served either way. Below roughly one slot
+            // per hot expert it starts costing throughput. LLAMA_MOE_CACHE_CAP_LOW overrides it (read in
+            // llama_moe_layer_cache_get, the single entry point for that var).
+            moe_lc_lo = llama_moe_layer_cache_get(sched, projs_lo, np, selected_experts,
+                                                  cap_lo > 0 ? cap_lo : cap);
+        }
         if (moe_lc && n_tokens <= 1) {
             // decode: feed the latest selection to the background loader so it can warm the
             // sub-threshold misses this step dropped, keeping later tokens near-resident
             llama_moe_layer_cache_publish(moe_lc, ctx0, gf, selected_experts);
+            if (moe_lc_lo) {
+                // the low tier gets the FULL selection, not the masked one: which positions it will be
+                // asked to serve is only known at compute time, and warming a superset is free here.
+                llama_moe_layer_cache_publish(moe_lc_lo, ctx0, gf, selected_experts);
+            }
         }
     }
 
@@ -2021,6 +2052,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // With a warm RAM tier these syncs read from locked RAM, not disk, so the CPU-op cost is far lower
     // than the disk-bound worst case.
     ggml_tensor * moe_cache_ids = nullptr;
+    // fork: two-tier decode (--moe-expert-gguf-low). When set, moe_cache_ids holds the HIGH-tier slot
+    // ids, moe_ids_lo the LOW-tier ones, and moe_mask the [1, n_expert_used, n_tokens] 0/1 gate mask
+    // that splits `weights` between the two passes.
+    ggml_tensor * moe_ids_lo = nullptr;
+    ggml_tensor * moe_mask   = nullptr;
+    // fork: two-tier FUSED decode (LLAMA_MOE_TIER_FUSED=1, CUDA only). Instead of the masked two-pass
+    // sum below, one ggml_mul_mat_id_2t per projection computes each routed position exactly once against
+    // its owning tier. moe_cache_ids then holds UNIFIED slot ids (low ids biased into the high tier's
+    // channel space) and moe_tier the 0/1 selector. ON by default (LLAMA_MOE_TIER_FUSED=0 to disable):
+    // bit-identical as a CUDA op (tests/test-mul-mat-id-2t.cpp) and confirmed byte-identical at runtime.
+    ggml_tensor * moe_tier       = nullptr;
+    bool          moe_tier_fused = false;
+    // fork: two-tier FUSED prefill sweep (LLAMA_MOE_TIER_SWEEP=1, CUDA only). Parallel to moe_tier_fused
+    // for decode: each sweep group's experts are split across the high and low caches and one
+    // ggml_mul_mat_id_2t per projection evaluates each in-group position against its owning tier. These
+    // hold the current group's unified ids / tier selector and the per-tier REAL slot counts, which the
+    // mm_id_exps branch copies into op_params so the MMQ two-launch memsets dst and skips the sentinel
+    // tiles (out-of-group positions route to high sentinels). Cleared after the sweep loop.
+    ggml_tensor * moe_sweep_ids  = nullptr;
+    ggml_tensor * moe_sweep_tier = nullptr;
+    int           moe_sweep_nrh  = 0;
+    int           moe_sweep_nrl  = 0;
     // fork: prefill expert-group sweep (LLAMA_MOE_PREFILL_SWEEP=1). When on, prefill does NOT build a
     // single capacity-capped ids tensor; it evaluates the FFN once per static expert-index group with a
     // per-group ids tensor, so nothing is ever dropped. Only useful when capacity < n_expert (otherwise
@@ -2088,8 +2141,49 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 decode_cpu_sync = true;
             }
         }
+        // fork: two-tier decode. One CPU op resolves BOTH tiers and emits the tier selector, so this
+        // costs the same single scheduler split as the one-tier CPU-sync path. The high tier keeps its
+        // ordinary budget/coverage rules; every position it could not serve is then served by the
+        // low-precision twin of the CORRECT expert instead of a wrong (stale) one. Resolved before the
+        // path chain so a decline falls back cleanly to the ordinary paths.
+        ggml_tensor * moe_pack = nullptr;
+        ggml_tensor * moe_tw   = nullptr;
+        if (!moe_prefill_sweep && moe_lc_lo && n_tokens <= 1 && ok_shape) {
+            // Fuse the two tiers into one ggml_mul_mat_id_2t per projection when both caches are on CUDA
+            // (the only backend that implements the op). On by default: byte-identical to the two-pass path
+            // below (verified at runtime, --temp 0, fixed seed, NOLOADER=1). LLAMA_MOE_TIER_FUSED=0 forces
+            // the two-pass path.
+            moe_tier_fused = moe_env_on("LLAMA_MOE_TIER_FUSED", true) &&
+                             llama_moe_layer_cache_backend_is_cuda(moe_lc) &&
+                             llama_moe_layer_cache_backend_is_cuda(moe_lc_lo);
+            moe_pack = llama_moe_layer_cache_remap_tiered(moe_lc, moe_lc_lo, ctx0, selected_experts,
+                                                          weights, moe_sync_threshold, moe_sync_budget,
+                                                          moe_tier_fused);
+            if (!moe_tier_fused) {
+                moe_tw = llama_moe_layer_cache_tier_weights(moe_lc);
+            }
+        }
         if (moe_prefill_sweep) {
             // ids are built per expert group further down; leave moe_cache_ids null
+        } else if (moe_pack && moe_tier_fused) {
+            // FUSED: row block 0 = unified ids, row block 1 = tier selector. One build_experts pass
+            // (further down) feeds both to ggml_mul_mat_id_2t; no mask / complement / sum.
+            const int64_t nu = selected_experts->ne[0];
+            const int64_t nt = selected_experts->ne[1];
+            const size_t  rb = moe_pack->nb[1]; // one [n_used] row
+            moe_cache_ids = ggml_view_2d(ctx0, moe_pack, nu, nt, rb, 0);
+            moe_tier      = ggml_view_2d(ctx0, moe_pack, nu, nt, rb, (size_t) nt * rb);
+        } else if (moe_pack && moe_tw) {
+            const int64_t nu = selected_experts->ne[0];
+            const int64_t nt = selected_experts->ne[1];
+            const size_t  rb = moe_pack->nb[1]; // one [n_used] row
+            moe_cache_ids = ggml_view_2d(ctx0, moe_pack, nu, nt, rb, 0);
+            moe_ids_lo    = ggml_view_2d(ctx0, moe_pack, nu, nt, rb, (size_t) nt * rb);
+            // selector -> gate mask: get_rows over the constant {0.0f, 1.0f} table turns the 0/1 rows
+            // into the f32 factor `weights` is multiplied by for the high pass.
+            ggml_tensor * sel = ggml_view_1d(ctx0, moe_pack, nu * nt, (size_t) (2 * nt) * rb);
+            moe_mask = ggml_get_rows(ctx0, moe_tw, sel);            // [1, n_used*n_tokens]
+            moe_mask = ggml_reshape_3d(ctx0, moe_mask, 1, nu, nt);  // matches `weights`
         } else if (n_tokens > 1 || decode_cpu_sync) {
             // A small multi-token batch that skipped the sweep (MTP/speculative verify) must not drop:
             // for n_tokens>1 the remap sends unresolved positions to the ZERO sentinel, not to a stale
@@ -2166,6 +2260,41 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (moe_lc && ids) {
                 ggml_tensor * dev = llama_moe_layer_cache_dev(moe_lc, exps);
                 if (dev) {
+                    // fork: two-tier FUSED decode. One op resolves both tiers of THIS projection: the
+                    // high slab via moe_lc, the low twin via moe_lc_lo (its dev-lookup maps the main
+                    // tensor through the twin map). `ids` are unified (low biased by the high slot count)
+                    // and moe_tier is the self-describing 0/1 selector. Each routed position is computed
+                    // exactly once against its owning tier - bit-identical to the two-pass masked sum
+                    // (tests/test-mul-mat-id-2t.cpp, MMVQ case). op_params stay 0/0: the decode MMVQ
+                    // two-launch partitions dst channels by tier (each written once), so no sentinel-skip
+                    // memset is needed. Only the frozen decode ids (moe_cache_ids) take this path.
+                    if (moe_tier_fused && moe_lc_lo && moe_tier && ids == moe_cache_ids) {
+                        ggml_tensor * dev_lo = llama_moe_layer_cache_dev(moe_lc_lo, exps);
+                        // Invariant: when the high slab resolves in the fused branch the low twin resolves
+                        // too - every high projection is twinned (the two-tier gate demands it) and both
+                        // slabs are allocated atomically. `ids` here are UNIFIED (low biased by the high
+                        // slot count), so falling through to the single-tier matmul below would index the
+                        // high slab out of bounds for every low-owned position. Assert the invariant rather
+                        // than silently emit that wrong op.
+                        GGML_ASSERT(dev_lo && "two-tier fused decode: low twin slab must resolve when the high slab does");
+                        return ggml_mul_mat_id_2t(ctx0, dev, dev_lo, input, ids, moe_tier);
+                    }
+                    // fork: two-tier FUSED prefill sweep. The decode branch above keys on the frozen
+                    // decode ids (moe_cache_ids); the sweep builds a fresh unified-id + tier pack per
+                    // expert group, so it needs its own branch keyed on the current group's tensors. `dev`
+                    // is the high slab (moe_lc stays the high cache through the sweep). Unlike decode,
+                    // op_params carry the per-tier REAL slot counts (cap_hi, cap_lo): out-of-group
+                    // positions route to high sentinels, so the MMQ two-launch memsets dst and skips the
+                    // sentinel tiles (mmq.cu). Bit-identity is NOT claimed - this is a mixed-precision
+                    // behaviour change, default ON (LLAMA_MOE_TIER_SWEEP=0 to disable; see the sweep loop).
+                    if (moe_sweep_tier && moe_lc_lo && ids == moe_sweep_ids) {
+                        ggml_tensor * dev_lo = llama_moe_layer_cache_dev(moe_lc_lo, exps);
+                        GGML_ASSERT(dev_lo && "two-tier fused sweep: low twin slab must resolve when the high slab does");
+                        ggml_tensor * mm = ggml_mul_mat_id_2t(ctx0, dev, dev_lo, input, ids, moe_sweep_tier);
+                        const int32_t nr[2] = { moe_sweep_nrh, moe_sweep_nrl }; // n_real_hi = cap_hi, n_real_lo = cap_lo
+                        memcpy(mm->op_params, nr, sizeof(nr));
+                        return mm;
+                    }
                     ggml_tensor * mm = ggml_mul_mat_id(ctx0, dev, input, ids);
                     // fork: tell the CUDA MMQ path that channels [capacity, capacity+n_sentinel) of `dev` are
                     // the permanently-zero sentinel slabs, so it can skip their GEMM tiles instead of
@@ -2414,11 +2543,53 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // nothing dropped. Expert bytes read are unchanged: each expert is still touched at most once
         // per ubatch step. The extra cost is n_groups FFN passes, not n_groups expert loads.
         const int cap      = llama_moe_layer_cache_capacity(moe_lc);
-        const int n_groups = ((int) n_expert + cap - 1) / cap;
+        // fork: two-tier FUSED sweep. When both tiers are present and on CUDA (default ON; set
+        // LLAMA_MOE_TIER_SWEEP=0 to disable), a group spans cap_hi + cap_lo experts (fewer, larger groups
+        // -> fewer full-width passes) and each group's experts are split across the two caches by selection
+        // frequency, emitting one ggml_mul_mat_id_2t per projection. This evaluates ~cap_lo/(cap_hi+cap_lo)
+        // of prefill positions at the low quant, so it is NOT bit-identical to the high-only sweep - it is a
+        // mixed-precision quality tradeoff. With LLAMA_MOE_TIER_SWEEP=0 the single-tier high-only path runs
+        // unchanged (byte-identical).
+        const int  cap_lo = moe_lc_lo ? llama_moe_layer_cache_capacity(moe_lc_lo) : 0;
+        // fork: the fused MMQ 2t op handles mismatched q8_1 DS layouts across tiers (it quantizes the activations
+        // once per layout), but NOT native-fp4 tiers - those use a different src1 quantization entirely. Refuse
+        // two-tier here for any projection whose high or low slab is fp4 and fall back to the single-tier sweep,
+        // rather than reaching the op's fp4 assert.
+        auto slab_is_fp4 = [&](llama_moe_layer_cache * lc, ggml_tensor * e) {
+            if (!lc || !e) { return false; }
+            ggml_tensor * d = llama_moe_layer_cache_dev(lc, e);
+            return d && (d->type == GGML_TYPE_MXFP4 || d->type == GGML_TYPE_NVFP4);
+        };
+        bool sweep_fp4 = false;
+        for (ggml_tensor * e : { gate_up_exps, gate_exps, up_exps, down_exps }) {
+            sweep_fp4 = sweep_fp4 || slab_is_fp4(moe_lc, e) || slab_is_fp4(moe_lc_lo, e);
+        }
+        const bool sweep_two_tier = moe_lc_lo && cap_lo > 0 && !sweep_fp4 &&
+                                    moe_env_on("LLAMA_MOE_TIER_SWEEP", true) &&
+                                    llama_moe_layer_cache_backend_is_cuda(moe_lc) &&
+                                    llama_moe_layer_cache_backend_is_cuda(moe_lc_lo);
+        const int grp_cap  = sweep_two_tier ? cap + cap_lo : cap;
+        const int n_groups = ((int) n_expert + grp_cap - 1) / grp_cap;
         ggml_tensor * acc = nullptr;
         ggml_tensor * dep = nullptr;
         for (int g = 0; g < n_groups; ++g) {
-            ggml_tensor * ids = llama_moe_layer_cache_remap_group(moe_lc, ctx0, selected_experts, g, dep);
+            ggml_tensor * ids = nullptr;
+            if (sweep_two_tier) {
+                ggml_tensor * pack = llama_moe_layer_cache_remap_group_tiered(moe_lc, moe_lc_lo, ctx0,
+                                                                              selected_experts, g, dep);
+                if (pack) {
+                    const int64_t nu = selected_experts->ne[0];
+                    const int64_t nt = selected_experts->ne[1];
+                    const size_t  rb = pack->nb[1]; // one [n_used] row
+                    moe_sweep_ids  = ggml_view_2d(ctx0, pack, nu, nt, rb, 0);
+                    moe_sweep_tier = ggml_view_2d(ctx0, pack, nu, nt, rb, (size_t) nt * rb);
+                    moe_sweep_nrh  = cap;
+                    moe_sweep_nrl  = cap_lo;
+                    ids            = moe_sweep_ids;
+                }
+            } else {
+                ids = llama_moe_layer_cache_remap_group(moe_lc, ctx0, selected_experts, g, dep);
+            }
             if (!ids) {
                 acc = nullptr; // cache refused (it logs why): fall back to the single capped pass
                 break;
@@ -2430,10 +2601,46 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             dep = ggml_cont(ctx0, ggml_view_1d(ctx0, part, 1, 0));
             acc = acc ? ggml_add(ctx0, acc, part) : part;
         }
+        // Clear the sweep-fused capture so the fallbacks below can never match a stale group tensor.
+        moe_sweep_ids  = nullptr;
+        moe_sweep_tier = nullptr;
         experts = acc;
         if (experts) {
             cb(experts, "ffn_moe_sweep_sum", il);
         }
+    }
+    if (!experts && moe_ids_lo && moe_mask) {
+        // fork: TWO-TIER DECODE SUM (--moe-expert-gguf-low). The same FFN is evaluated twice - once
+        // against the high-precision expert cache, once against the low-precision twin cache - with the
+        // gate weights split by a hard 0/1 mask so each routed position contributes through exactly ONE
+        // of the two passes. w_hi + w_lo == weights by construction (w*1 + w*0, or w*0 + w*1), so the sum
+        // is the ordinary single-pass result with every position taken from whichever tier actually holds
+        // its expert. This is the DEFAULT two-tier decode and the runtime bit-identity reference. A single
+        // fused op (ggml_mul_mat_id_2t) expresses the same mixed precision in one pass, computing each
+        // position once against its owning tier; it is selected by LLAMA_MOE_TIER_FUSED=1 (CUDA only) and
+        // handled above in mm_id_exps, leaving this masked two-pass sum as the portable fallback.
+        //
+        // The pass that does NOT own a position still computes something there, but at a hard-zero
+        // weight, so it only has to be finite - which it is: every cache slot holds either real expert
+        // weights or the zeroed sentinel slab. Per-expert bias and scale ride along correctly because
+        // each pass applies them inside its own FFN and the two masked weights sum back to `weights`.
+        ggml_tensor * const w_all = weights;
+        weights = ggml_mul(ctx0, w_all, moe_mask);
+        cb(weights, "ffn_moe_weights_hi", il);
+        ggml_tensor * part_hi = build_experts(moe_cache_ids);
+
+        weights = ggml_sub(ctx0, w_all, weights); // exact complement of the high mask
+        cb(weights, "ffn_moe_weights_lo", il);
+        // mm_id_exps resolves each projection's device slab through moe_lc, so pointing it at the low
+        // cache for the duration of this call is the whole of the second pass's plumbing.
+        llama_moe_layer_cache * const lc_hi = moe_lc;
+        moe_lc = moe_lc_lo;
+        ggml_tensor * part_lo = build_experts(moe_ids_lo);
+        moe_lc = lc_hi;
+        weights = w_all;
+
+        experts = ggml_add(ctx0, part_hi, part_lo);
+        cb(experts, "ffn_moe_tier_sum", il);
     }
     if (!experts) {
         experts = build_experts(moe_cache_ids);

@@ -284,6 +284,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         ml.tensor_read_lazy = params.tensor_read_lazy;
 
+        if (!params.vocab_only) {
+            if (params.moe_expert_model && params.moe_expert_model_low) {
+                throw std::runtime_error("--moe-expert-gguf and --moe-expert-gguf-low are mutually exclusive");
+            }
+            ml.override_expert_tensors(params.moe_expert_model);
+            ml.register_expert_tier_low(params.moe_expert_model_low);
+        }
+
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 

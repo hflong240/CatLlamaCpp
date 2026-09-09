@@ -2072,6 +2072,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ABORT("GGML_OP_MOE_FFN has no CPU implementation (CUDA-only fork op)");
             }
             break;
+        case GGML_OP_MUL_MAT_ID_2T:
+            {
+                GGML_ABORT("GGML_OP_MUL_MAT_ID_2T has no CPU implementation (CUDA-only fork op)");
+            }
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             {
                 ggml_compute_forward_cross_entropy_loss(params, tensor);
@@ -2439,6 +2444,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = 1;
             } break;
         case GGML_OP_MOE_FFN:
+        case GGML_OP_MUL_MAT_ID_2T:
             {
                 n_tasks = 1; // CUDA-only op; never actually planned on CPU, but keep planning clean
             } break;

@@ -2406,6 +2406,46 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_ASYNC"));
+    add_opt(common_arg(
+        {"--moe-expert-gguf"}, "FNAME",
+        "take the routed-expert weights (ffn_*_exps) from this GGUF instead of the model file. Must be the same "
+        "model at a different quantization; every other tensor keeps the main model's precision. Pass the first "
+        "shard of a split. Intended to be combined with the --moe-stream* modes.",
+        [](common_params & params, const std::string & value) {
+            params.moe_expert_model = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_GGUF"));
+    add_opt(common_arg(
+        {"--moe-expert-gguf-low"}, "FNAME",
+        "supply a LOW-precision twin of every routed-expert tensor from this GGUF while keeping the main model's "
+        "copy too. The MoE streaming cache then keeps the budgeted experts resident at full precision and serves "
+        "every other routed position from the low-precision twin at the CORRECT expert identity, instead of "
+        "falling back to a wrong (stale) expert. Must be the same model at a lower quantization; pass the first "
+        "shard of a split. Requires --moe-stream-async; mutually exclusive with --moe-expert-gguf.",
+        [](common_params & params, const std::string & value) {
+            params.moe_expert_model_low = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_GGUF_LOW"));
+    add_opt(common_arg(
+        {"--moe-expert-cap"}, "N",
+        "number of routed experts per layer to keep resident in VRAM (experts, not bytes). Default is auto-sized "
+        "from free VRAM. This is the main quality/speed knob of the streaming cache: raising it serves more routed "
+        "positions from resident weights and cuts the prefill sweep's pass count (ceil(n_expert/N) full-width FFN "
+        "passes per layer), at the cost of VRAM.",
+        [](common_params & params, int value) {
+            params.moe_expert_cap = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CAP"));
+    add_opt(common_arg(
+        {"--moe-expert-cap-low"}, "N",
+        "resident experts per layer for the --moe-expert-gguf-low tier. Normally NOT needed: the low tier is "
+        "auto-sized to whatever bytes the high tier leaves inside the same VRAM budget, including when "
+        "--moe-expert-cap is given. Setting both means you own the budget - too large and the caches overcommit "
+        "VRAM.",
+        [](common_params & params, int value) {
+            params.moe_expert_cap_low = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CAP_LOW"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

@@ -323,6 +323,19 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // fork: path to a second GGUF of the same model whose routed-expert tensors (ffn_*_exps)
+        // replace this model's. Lets a low-bit copy of the experts be streamed from disk while
+        // every other tensor keeps the main model's precision. NULL = disabled.
+        const char * moe_expert_model;
+
+        // fork: path to a second GGUF of the same model that supplies a LOW-precision TWIN of every
+        // routed-expert tensor. Unlike moe_expert_model above (which replaces the experts outright),
+        // both copies stay available: the MoE streaming cache keeps `k` experts resident at the main
+        // model's precision and serves every other routed position from the low-precision twin at the
+        // CORRECT expert identity, instead of falling back to a wrong (stale/spare) expert. Mutually
+        // exclusive with moe_expert_model. NULL = disabled.
+        const char * moe_expert_model_low;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -1592,6 +1605,25 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    //
+    // fork: MoE-streaming verify-batch residency gate (LLAMA_MOE_VERIFY_GATE=1, off by default)
+    //
+    // A speculative/MTP verify batch is [1 sampled token + k drafts]. Its columns are INDEPENDENT
+    // routing steps, so the streaming remap normally sync-loads the UNION of their experts: k+1
+    // columns cost k+1 columns' worth of expert loads while producing at most k+1 tokens. The gate
+    // loads column 0 in full, loads a draft column's miss only when the expert is already in the
+    // host RAM pool (a cheap H2D instead of a disk read), and reports how many LEADING draft
+    // columns still ended up exact. Clamping the accepted run to that many means every committed
+    // token ran on its real experts (which is not the same as byte-identical text: the clamp also
+    // changes the batch width, and that alone moves the logits in the last bits).
+    //
+    // Call arm() immediately before the verify llama_decode and max_accept() immediately after it:
+    // max_accept() disarms, so a later prefill batch of the same width can never take this path.
+    // Returns the number of drafts that may be accepted, or -1 for "no limit" (gate off, not armed,
+    // or LLAMA_MOE_VERIFY_GATE_LOSSY=1). Both are no-ops when the gate is disabled.
+    LLAMA_API void    llama_moe_verify_gate_arm(int32_t n_cols);
+    LLAMA_API int32_t llama_moe_verify_gate_max_accept(void);
 
 #ifdef __cplusplus
 }

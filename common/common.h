@@ -508,6 +508,10 @@ struct common_params {
     bool     moe_stream             = false;
     bool     moe_stream_async       = false; // stale-expert async VRAM cache (experimental, changes output)
     uint64_t moe_stream_cache_bytes = 0;
+    std::string moe_expert_model;            // GGUF to take the routed-expert tensors from (empty = the model itself)
+    std::string moe_expert_model_low;        // GGUF supplying a low-precision twin of every routed-expert tensor (empty = off)
+    int32_t  moe_expert_cap     = 0;         // resident experts per layer, high tier (0 = auto from free VRAM)
+    int32_t  moe_expert_cap_low = 0;         // same for the low tier (0 = auto: whatever bytes the high tier leaves)
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale

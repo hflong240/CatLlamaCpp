@@ -834,6 +834,408 @@ llama_model_loader::llama_model_loader(
     this->load_mtp = load_mtp;
 }
 
+//
+// fork: routed-expert tensor source override
+//
+
+// Same name set as LLM_FFN_EXPS_REGEX in common/common.h, which src/ cannot link against.
+// Matches blk.N.ffn_{gate,up,down,gate_up}_{,ch}exps plus any suffix (.weight, .bias, ...), so a
+// tensor's companions follow it into the override file. Shared experts (ffn_*_shexp) and the
+// router (ffn_gate_inp, ffn_exp_probs_b) do not match and stay in the main model.
+static bool llama_tensor_is_routed_expert(const std::string & name) {
+    const size_t p = name.find(".ffn_");
+    if (p == std::string::npos) {
+        return false;
+    }
+
+    const char * s = name.c_str() + p + 5;
+
+    // gate_up_ must be tested before gate_: the first prefix that matches decides
+    for (const char * proj : { "gate_up_", "gate_", "up_", "down_" }) {
+        const size_t n = strlen(proj);
+        if (strncmp(s, proj, n) != 0) {
+            continue;
+        }
+        const char * t = s + n;
+        if (strncmp(t, "ch", 2) == 0) {
+            t += 2;
+        }
+        return strncmp(t, "exps", 4) == 0;
+    }
+
+    return false;
+}
+
+// A quantization type with no kernel on the offload device does not fail loudly here: the MoE
+// streaming modes pin the expert tensors to a CPU buffer, so no backend is asked to support them
+// at load time, and the scheduler later just runs mul_mat_id on the CPU - correct, but orders of
+// magnitude slower, after tens of GiB have already been read. Ask the devices up front instead.
+// Takes the type and shape by value, not a tensor pointer: the low-precision tier frees the gguf
+// context that owns its representative tensors before this check runs, so a pointer into it would
+// dangle (an intermittent bad-type crash later, depending on which quant recipe reused the memory).
+static bool llama_expert_type_has_gpu_kernel(ggml_type type, const int64_t * ne) {
+    std::vector<ggml_backend_dev_t> gpus;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpus.push_back(dev);
+        }
+    }
+
+    if (gpus.empty()) {
+        return true; // CPU-only build or machine: nothing to check
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*8,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(ip) };
+    if (!ctx) {
+        return true;
+    }
+
+    ggml_tensor * as  = ggml_new_tensor_3d(ctx.get(), type, ne[0], ne[1], ne[2]);
+    ggml_tensor * b   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, ne[0], 1, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1);
+    ggml_tensor * op  = ggml_mul_mat_id(ctx.get(), as, b, ids);
+
+    for (ggml_backend_dev_t dev : gpus) {
+        if (ggml_backend_dev_supports_op(dev, op)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// Convenience for callers that still hold a live tensor (override_expert_tensors keeps its gguf
+// contexts alive in `contexts`, so its representative pointers stay valid).
+static bool llama_expert_type_has_gpu_kernel(const ggml_tensor * exps) {
+    return llama_expert_type_has_gpu_kernel(exps->type, exps->ne);
+}
+
+void llama_model_loader::override_expert_tensors(const char * path) {
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+
+    const uint16_t idx_first = (uint16_t) files.size();
+
+    int n_expected = 0;
+    for (const auto & it : weights_map) {
+        n_expected += llama_tensor_is_routed_expert(it.first) ? 1 : 0;
+    }
+    if (n_expected == 0) {
+        throw std::runtime_error(format("%s: an expert model was given but %s has no routed-expert tensors",
+                    __func__, arch_name.c_str()));
+    }
+
+    size_t bytes_old = 0;
+    size_t bytes_new = 0;
+    // one representative tensor per type, so a per-tensor recipe (gate/up at one width, down at
+    // another) gets every one of its types checked, not just whichever landed last
+    std::map<ggml_type, std::pair<int, const ggml_tensor *>> types_new;
+
+    // Replace, never append: both loops above throw on a duplicated tensor name, and the streaming
+    // layer derives the MoE layer count from the number of registered expert files, so a second
+    // entry for the same tensor would silently double it.
+    auto absorb = [&](const gguf_context * gguf, ggml_context * ctx, uint16_t idx) {
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            const std::string name = ggml_get_name(cur);
+            if (!llama_tensor_is_routed_expert(name)) {
+                continue;
+            }
+
+            auto it = weights_map.find(name);
+            if (it == weights_map.end()) {
+                continue; // extra expert tensor the main model does not use
+            }
+
+            const ggml_tensor * old = it->second.tensor;
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                if (old->ne[d] != cur->ne[d]) {
+                    throw std::runtime_error(format(
+                                "%s: tensor '%s' is %" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " in the model but "
+                                "%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " in the expert model",
+                                __func__, name.c_str(),
+                                old->ne[0], old->ne[1], old->ne[2], old->ne[3],
+                                cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]));
+                }
+            }
+
+            n_elements -= ggml_nelements(old);
+            n_bytes    -= ggml_nbytes(old);
+            bytes_old  += ggml_nbytes(old);
+
+            weights_map.erase(it);
+            // the llama_tensor_weight ctor validates offs + nbytes against the override file size
+            weights_map.emplace(name, llama_tensor_weight(files.back().get(), idx, gguf, cur));
+
+            n_elements += ggml_nelements(cur);
+            n_bytes    += ggml_nbytes(cur);
+            bytes_new  += ggml_nbytes(cur);
+
+            auto & slot = types_new[cur->type];
+            slot.first++;
+            slot.second = cur;
+        }
+    };
+
+    // main shard of the override
+    uint16_t n_split = 0;
+    {
+        struct ggml_context * ctx = nullptr;
+        struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &ctx };
+
+        gguf_context_ptr gguf { gguf_init_from_file(path, gp) };
+        if (!gguf) {
+            throw std::runtime_error(format("%s: failed to load expert model from %s", __func__, path));
+        }
+
+        {
+            const int kid = gguf_find_key(gguf.get(), llm_kv(LLM_KV_GENERAL_ARCHITECTURE).c_str());
+            const std::string arch_ov = (kid >= 0 && gguf_get_kv_type(gguf.get(), kid) == GGUF_TYPE_STRING)
+                ? std::string(gguf_get_val_str(gguf.get(), kid)) : std::string();
+            if (arch_ov != arch_name) {
+                throw std::runtime_error(format("%s: expert model is arch '%s', expected '%s'",
+                            __func__, arch_ov.c_str(), arch_name.c_str()));
+            }
+        }
+
+        {
+            const int kid = gguf_find_key(gguf.get(), llm_kv(LLM_KV_SPLIT_COUNT).c_str());
+            n_split = (kid >= 0 && gguf_get_kv_type(gguf.get(), kid) == GGUF_TYPE_UINT16)
+                ? gguf_get_val_u16(gguf.get(), kid) : 0;
+        }
+
+        files.emplace_back(new llama_file(path, "rb", use_direct_io));
+        file_paths.emplace_back(path);
+        contexts.emplace_back(ctx);
+
+        absorb(gguf.get(), ctx, idx_first);
+    }
+
+    // remaining shards
+    if (n_split > 1) {
+        std::vector<std::string> splits = llama_get_list_splits(path, 0, n_split);
+
+        for (uint16_t i = 1; i < n_split; i++) {
+            const char * fname_split = splits[i].c_str();
+
+            struct ggml_context * ctx = nullptr;
+            struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &ctx };
+
+            gguf_context_ptr gguf { gguf_init_from_file(fname_split, gp) };
+            if (!gguf) {
+                throw std::runtime_error(format("%s: failed to load expert model split from %s", __func__, fname_split));
+            }
+
+            files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+            file_paths.emplace_back(fname_split);
+            contexts.emplace_back(ctx);
+
+            absorb(gguf.get(), ctx, (uint16_t) (files.size() - 1));
+        }
+    }
+
+    // every expert tensor must have moved: a half-applied override is a wrong model, not a slow one
+    {
+        std::vector<std::string> missing;
+        for (const auto & it : weights_map) {
+            if (llama_tensor_is_routed_expert(it.first) && it.second.idx < idx_first) {
+                missing.push_back(it.first);
+            }
+        }
+        if (!missing.empty()) {
+            throw std::runtime_error(format("%s: %zu of %d routed-expert tensors are absent from the expert model (e.g. '%s')",
+                        __func__, missing.size(), n_expected, missing.front().c_str()));
+        }
+    }
+
+    for (const auto & kv : types_new) {
+        if (!llama_expert_type_has_gpu_kernel(kv.second.second)) {
+            throw std::runtime_error(format("%s: no GPU backend has a mul_mat_id kernel for %s; those experts would "
+                        "silently fall back to the CPU", __func__, ggml_type_name(kv.first)));
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: expert tensors overridden from %s\n", __func__, path);
+    for (const auto & kv : types_new) {
+        LLAMA_LOG_INFO("%s:   - type %4s: %4d tensors\n", __func__, ggml_type_name(kv.first), kv.second.first);
+    }
+    LLAMA_LOG_INFO("%s:   expert size: %.2f GiB -> %.2f GiB (%.3fx smaller)\n", __func__,
+            bytes_old/(double)GiB, bytes_new/(double)GiB, bytes_new ? bytes_old/(double)bytes_new : 0.0);
+}
+
+// Second tier, not a replacement: the main model's expert tensors stay exactly where they are and
+// this only records where their low-precision twins live on disk. Nothing is added to weights_map,
+// `files` or `contexts`, so the loader, mmap and load_all_data are all unaffected - the MoE
+// streaming layer opens the file itself and reads experts by offset.
+void llama_model_loader::register_expert_tier_low(const char * path) {
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+
+    int n_expected = 0;
+    for (const auto & it : weights_map) {
+        n_expected += llama_tensor_is_routed_expert(it.first) ? 1 : 0;
+    }
+    if (n_expected == 0) {
+        throw std::runtime_error(format("%s: a low-precision expert model was given but %s has no routed-expert tensors",
+                    __func__, arch_name.c_str()));
+    }
+
+    size_t bytes_hi = 0;
+    size_t bytes_lo = 0;
+    // one representative shape per type, so a per-tensor recipe (gate/up at one width, down at
+    // another) gets every one of its types checked, not just whichever landed last. Store the shape
+    // by value: the gguf contexts these tensors live in are freed below, before the kernel check.
+    std::map<ggml_type, std::pair<int, std::array<int64_t, GGML_MAX_DIMS>>> types_lo;
+
+    auto absorb = [&](const gguf_context * gguf, ggml_context * ctx, const char * fname) {
+        // opened only to bounds-check the offsets; the streaming layer opens its own handles later
+        llama_file f(fname, "rb", /*.use_direct_io =*/ false);
+        const size_t fsize = f.size();
+
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            const std::string name = ggml_get_name(cur);
+            if (!llama_tensor_is_routed_expert(name)) {
+                continue;
+            }
+
+            auto it = weights_map.find(name);
+            if (it == weights_map.end()) {
+                continue; // extra expert tensor the main model does not use
+            }
+
+            const ggml_tensor * hi = it->second.tensor;
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                if (hi->ne[d] != cur->ne[d]) {
+                    throw std::runtime_error(format(
+                                "%s: tensor '%s' is %" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " in the model but "
+                                "%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " in the low-precision expert model",
+                                __func__, name.c_str(),
+                                hi->ne[0], hi->ne[1], hi->ne[2], hi->ne[3],
+                                cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]));
+                }
+            }
+
+            const int ti = gguf_find_tensor(gguf, name.c_str());
+            if (ti < 0) {
+                continue;
+            }
+
+            const size_t offs = gguf_get_data_offset(gguf) + gguf_get_tensor_offset(gguf, ti);
+            if (offs + ggml_nbytes(cur) < offs || offs + ggml_nbytes(cur) > fsize) {
+                throw std::runtime_error(format("%s: tensor '%s' data is not within the bounds of %s, "
+                            "the low-precision expert model is corrupted or incomplete", __func__, name.c_str(), fname));
+            }
+
+            low_tier_entry ent;
+            ent.path = fname;
+            ent.offs = offs;
+            ent.type = cur->type;
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                ent.ne[d] = cur->ne[d];
+            }
+            expert_tier_low[name] = ent;
+
+            bytes_hi += ggml_nbytes(hi);
+            bytes_lo += ggml_nbytes(cur);
+
+            auto & slot = types_lo[cur->type];
+            slot.first++;
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                slot.second[d] = cur->ne[d];
+            }
+        }
+    };
+
+    // main shard of the low-precision model
+    uint16_t n_split = 0;
+    {
+        struct ggml_context * ctx = nullptr;
+        struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &ctx };
+
+        gguf_context_ptr gguf { gguf_init_from_file(path, gp) };
+        if (!gguf) {
+            throw std::runtime_error(format("%s: failed to load low-precision expert model from %s", __func__, path));
+        }
+        ggml_context_ptr ctx_owner { ctx };
+
+        {
+            const int kid = gguf_find_key(gguf.get(), llm_kv(LLM_KV_GENERAL_ARCHITECTURE).c_str());
+            const std::string arch_lo = (kid >= 0 && gguf_get_kv_type(gguf.get(), kid) == GGUF_TYPE_STRING)
+                ? std::string(gguf_get_val_str(gguf.get(), kid)) : std::string();
+            if (arch_lo != arch_name) {
+                throw std::runtime_error(format("%s: low-precision expert model is arch '%s', expected '%s'",
+                            __func__, arch_lo.c_str(), arch_name.c_str()));
+            }
+        }
+
+        {
+            const int kid = gguf_find_key(gguf.get(), llm_kv(LLM_KV_SPLIT_COUNT).c_str());
+            n_split = (kid >= 0 && gguf_get_kv_type(gguf.get(), kid) == GGUF_TYPE_UINT16)
+                ? gguf_get_val_u16(gguf.get(), kid) : 0;
+        }
+
+        absorb(gguf.get(), ctx, path);
+    }
+
+    // remaining shards
+    if (n_split > 1) {
+        std::vector<std::string> splits = llama_get_list_splits(path, 0, n_split);
+
+        for (uint16_t i = 1; i < n_split; i++) {
+            const char * fname_split = splits[i].c_str();
+
+            struct ggml_context * ctx = nullptr;
+            struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &ctx };
+
+            gguf_context_ptr gguf { gguf_init_from_file(fname_split, gp) };
+            if (!gguf) {
+                throw std::runtime_error(format("%s: failed to load low-precision expert model split from %s",
+                            __func__, fname_split));
+            }
+            ggml_context_ptr ctx_owner { ctx };
+
+            absorb(gguf.get(), ctx, fname_split);
+        }
+    }
+
+    // partial coverage is not an option: a routed position with no low-precision twin would have to
+    // fall back to the wrong-expert path this whole feature exists to remove
+    {
+        std::vector<std::string> missing;
+        for (const auto & it : weights_map) {
+            if (llama_tensor_is_routed_expert(it.first) && expert_tier_low.find(it.first) == expert_tier_low.end()) {
+                missing.push_back(it.first);
+            }
+        }
+        if (!missing.empty()) {
+            throw std::runtime_error(format("%s: %zu of %d routed-expert tensors are absent from the low-precision "
+                        "expert model (e.g. '%s')", __func__, missing.size(), n_expected, missing.front().c_str()));
+        }
+    }
+
+    for (const auto & kv : types_lo) {
+        if (!llama_expert_type_has_gpu_kernel(kv.first, kv.second.second.data())) {
+            throw std::runtime_error(format("%s: no GPU backend has a mul_mat_id kernel for %s; the low-precision "
+                        "experts would silently fall back to the CPU", __func__, ggml_type_name(kv.first)));
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: low-precision expert tier registered from %s\n", __func__, path);
+    for (const auto & kv : types_lo) {
+        LLAMA_LOG_INFO("%s:   - type %4s: %4d tensors\n", __func__, ggml_type_name(kv.first), kv.second.first);
+    }
+    LLAMA_LOG_INFO("%s:   expert size: %.2f GiB -> %.2f GiB (%.3fx smaller)\n", __func__,
+            bytes_hi/(double)GiB, bytes_lo/(double)GiB, bytes_lo ? bytes_hi/(double)bytes_lo : 0.0);
+}
+
 std::string llama_model_loader::get_arch_name() const {
     return arch_name;
 }

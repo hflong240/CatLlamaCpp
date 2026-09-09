@@ -587,6 +587,8 @@ extern "C" {
 
         GGML_OP_HC_SINKHORN, // fork: fused Sinkhorn normalisation for dsv4 hyper-connections (see ggml_hc_sinkhorn)
 
+        GGML_OP_MUL_MAT_ID_2T, // fork: mul_mat_id over two expert tensors of differing quant type (see ggml_mul_mat_id_2t)
+
         GGML_OP_COUNT,
     };
 
@@ -2693,6 +2695,23 @@ extern "C" {
             struct ggml_tensor  * a,       // [hc, hc, n_tokens] f32, contiguous, hc is 2 or 4
             float                 eps,
             int                   n_iter); // total passes = 1 + 2*(n_iter - 1); n_iter <= 1 gives one norm_cols
+
+    // fork: mul_mat_id over TWO expert tensors that may carry different quantization types, computing
+    // each routed position exactly once against whichever tier owns it. Equivalent to - but one pass
+    // instead of two - the masked sum
+    //     mul_mat_id(as_hi, b, ids_hi)*mask + mul_mat_id(as_lo, b, ids_lo)*(1 - mask)
+    // that the MoE-streaming fork uses to express mixed precision today.
+    //
+    // `ids` is in the UNIFIED channel space: values below as_hi->ne[2] index a high-tier slot, values
+    // at or above it index a low-tier slot (id - as_hi->ne[2]). `tier` carries the same split as an
+    // explicit 1 (high) / 0 (low) selector. Result matches ggml_mul_mat_id(ctx, as_hi, b, ids).
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_2t(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as_hi, // [n_embd, n_ff, n_slots_hi] high-precision expert slabs
+            struct ggml_tensor  * as_lo, // [n_embd, n_ff, n_slots_lo] low-precision expert slabs
+            struct ggml_tensor  * b,     // [n_embd, n_used, n_tokens] input activations
+            struct ggml_tensor  * ids,   // [n_used, n_tokens] i32, unified-space slot ids
+            struct ggml_tensor  * tier); // [n_used, n_tokens] i32, 1 = as_hi owns it, 0 = as_lo
 
     // loss function
 

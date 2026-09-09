@@ -143,6 +143,31 @@ struct llama_model_loader {
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
 
+    // fork: replace every routed-expert tensor (ffn_*_exps) in weights_map with the tensor of the
+    // same name from `path`, a second GGUF of the same model quantized differently. Everything
+    // downstream - tensor creation, mmap, load_all_data, and the MoE streaming registration in
+    // llama_model::load_tensors - then reads the experts from that file with no further changes.
+    // Call immediately after construction, before create_tensor(). No-op when path is null/empty;
+    // throws on any mismatch rather than loading a model that would silently misbehave.
+    void override_expert_tensors(const char * path);
+
+    // fork: LOW-PRECISION EXPERT TIER. Unlike override_expert_tensors above, this does not touch
+    // weights_map at all - the main model keeps its own experts. It only records where the same
+    // routed-expert tensors live inside a second, lower-quantization GGUF, so the MoE streaming
+    // layer can build a parallel expert cache and serve out-of-budget routed positions from the
+    // low-precision copy of the CORRECT expert instead of a wrong (stale) one. The bytes are read
+    // by that layer straight from the file by offset; nothing here is mmapped or loaded.
+    // Call immediately after construction. No-op when path is null/empty; throws on any mismatch.
+    struct low_tier_entry {
+        std::string path;                        // file holding the tensor (may be a split)
+        size_t      offs = 0;                    // absolute byte offset of its data in that file
+        ggml_type   type = GGML_TYPE_F32;
+        int64_t     ne[GGML_MAX_DIMS] = {0, 0, 0, 0};
+    };
+    std::unordered_map<std::string, low_tier_entry> expert_tier_low;
+
+    void register_expert_tier_low(const char * path);
+
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
     get_arr_n(const std::string & key, T & result, bool required = true);

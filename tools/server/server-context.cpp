@@ -833,6 +833,9 @@ private:
                     params_dft.cache_type_k          = params_spec.cache_type_k;
                     params_dft.cache_type_v          = params_spec.cache_type_v;
                     params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+                    // the target's expert GGUF describes the target's tensors, not the draft's
+                    params_dft.moe_expert_model.clear();
+                    params_dft.moe_expert_model_low.clear();
                 } else {
                     // MTP draft context lives on the target model, only context+compute are new
                     measure_model_bytes = false;
@@ -930,6 +933,9 @@ private:
             }
 
             params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+            // the target's expert GGUF describes the target's tensors, not the draft's
+            params_dft.moe_expert_model.clear();
+            params_dft.moe_expert_model_low.clear();
 
             auto mparams_dft = common_model_params_to_llama(params_dft);
 
@@ -3279,6 +3285,25 @@ private:
 
         int32_t i_next = 0;
 
+        // fork: arm the MoE-streaming verify-batch residency gate, but ONLY for a pure speculative verify
+        // batch - one generating slot whose [sampled + drafts] columns are the whole batch. A prefill
+        // batch must never take the gated load path (it needs its full expert working set), and a
+        // multi-slot batch interleaves columns from different sequences, which the per-column verdict
+        // does not model. 0 = do not arm.
+        int32_t moe_vgate_cols = 0;
+        {
+            int n_spec = 0;
+            for (auto & slot : slots) {
+                if (!slot.spec_i_batch.empty()) {
+                    n_spec++;
+                    moe_vgate_cols = (int32_t) slot.spec_i_batch.size();
+                }
+            }
+            if (n_spec != 1 || moe_vgate_cols != batch.n_tokens) {
+                moe_vgate_cols = 0;
+            }
+        }
+
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -3293,7 +3318,14 @@ private:
                 batch.logits   + i,
             };
 
+            if (moe_vgate_cols > 0 && n_tokens == batch.n_tokens) {
+                llama_moe_verify_gate_arm(moe_vgate_cols);
+            }
+
             const int ret = llama_decode(ctx_tgt, batch_view);
+
+            // reads the gate's verdict and disarms it; -1 when the gate is off or was not armed
+            const int32_t moe_vgate_ok = llama_moe_verify_gate_max_accept();
 
             metrics.on_decoded(slots);
 
@@ -3535,6 +3567,16 @@ private:
                     slot.spec_i_batch.clear();
 
                     GGML_ASSERT(accepted.size() >= 1);
+
+                    // fork: the MoE verify gate may have skipped disk-only experts for the later draft
+                    // columns, so those columns' logits are not exact - keep only the leading run it
+                    // vouched for. Guarded on FULL seq_rm because only that path restores smpl_save
+                    // below, which is what undoes the tokens the sampler already accepted above; without
+                    // the restore the sampler would keep tokens we dropped here.
+                    if (moe_vgate_ok >= 0 && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                        accepted.size() > (size_t) moe_vgate_ok + 1) {
+                        accepted.resize((size_t) moe_vgate_ok + 1);
+                    }
 
                     const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 

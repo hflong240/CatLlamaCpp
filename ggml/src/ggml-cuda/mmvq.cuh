@@ -11,6 +11,14 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+// fork (M3a): single-token decode path for the two-tier fused mul_mat_id (GGML_OP_MUL_MAT_ID_2T). Computes
+// one logical mul_mat_id whose expert slabs come from two quant tiers via two MMVQ launches sharing one q8_1
+// quantization - see the definition in mmvq.cu. Requires dst->ne[2] == 1 (single decode token).
+void ggml_cuda_mul_mat_id_2t_mmvq(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * as_hi, const ggml_tensor * as_lo,
+    const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
