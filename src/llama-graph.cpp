@@ -2367,7 +2367,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // function of one slot-id assignment. Called once normally, or once per expert group when the
     // prefill sweep is on. `cur`/`up`/`experts` stay the enclosing variables so the body below is
     // unchanged from the single-pass version; each pass re-derives `cur` from the saved FFN input.
-    ggml_tensor * moe_in = cur;
+    // fork TRACE: identity passthrough that (only when LLAMA_MOE_TRACE_X is set) dumps this layer's real
+    // expert-matmul input x for offline substitution analysis. Byte-identical no-op when the env is unset,
+    // and placed AFTER the router logits (computed above) so routing is never perturbed by the capture.
+    ggml_tensor * moe_in = llama_moe_trace_capture_x(ctx0, cur, il);
 
     auto build_experts = [&](ggml_tensor * ids) -> ggml_tensor * {
     cur = moe_in;

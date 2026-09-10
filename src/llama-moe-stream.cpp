@@ -2119,6 +2119,7 @@ static std::atomic<uint64_t> g_slot_hit[2]      = {{0}, {0}};
 static std::atomic<uint64_t> g_slot_sentinel[2] = {{0}, {0}};
 static std::atomic<uint64_t> g_slot_spare[2]    = {{0}, {0}};
 static std::atomic<uint64_t> g_slot_stale[2]    = {{0}, {0}};
+static std::atomic<uint64_t> g_slot_stz[2]      = {{0}, {0}}; // stale positions whose VALUE was zeroed (Arm 3)
 static std::atomic<uint64_t> g_slot_tokens[2]   = {{0}, {0}};
 static std::atomic<uint64_t> g_slot_hist[2][33]; // per-token hit count histogram (index = hits, capped)
 
@@ -4083,6 +4084,61 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
 // VRAM before the matmul that reads these ids runs. See llama_moe_cache_remap_cb for the same
 static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
 
+// fork TRACE: activation-capture state for llama_moe_trace_capture_x() (see the header). Meyers singleton so
+// the env is read exactly once; when LLAMA_MOE_TRACE_X is unset fp stays null and the capture is a no-op.
+static constexpr int MOE_TRACE_X_MAX_L = 512; // == LLAMA_MAX_LAYERS (that header is not pulled in here)
+struct llama_moe_trace_x_state {
+    FILE *                fp = nullptr;
+    bool                  lmask[MOE_TRACE_X_MAX_L] = {}; // which layers dump (default: all)
+    std::mutex            mu;                            // serializes fwrite (compute ops are sequential anyway)
+    std::atomic<uint64_t> step[MOE_TRACE_X_MAX_L];       // per-il decode-step counter (aligns with remap trace)
+    llama_moe_trace_x_state() {
+        for (int i = 0; i < MOE_TRACE_X_MAX_L; ++i) { step[i].store(0, std::memory_order_relaxed); }
+        const char * p = getenv("LLAMA_MOE_TRACE_X");
+        if (p && *p) { fp = fopen(p, "wb"); }
+        const char * ls = getenv("LLAMA_MOE_TRACE_X_LAYERS");
+        if (ls && *ls) {
+            const char * s = ls;
+            while (*s) {
+                char * end = nullptr;
+                long v = strtol(s, &end, 10);
+                if (end == s) { s++; continue; } // skip a non-numeric separator char
+                if (v >= 0 && v < MOE_TRACE_X_MAX_L) { lmask[v] = true; }
+                s = end;
+            }
+        } else {
+            for (int i = 0; i < MOE_TRACE_X_MAX_L; ++i) { lmask[i] = true; }
+        }
+    }
+};
+static llama_moe_trace_x_state & llama_moe_trace_x() {
+    static llama_moe_trace_x_state s;
+    return s;
+}
+// identity map_custom1 (single task): copies x through unchanged (so the downstream expert matmul is
+// byte-identical) and, as a side effect, appends one record (il, step, n, x[n]) to the trace file.
+static void llama_moe_trace_x_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    (void) nth;
+    if (ith != 0 || !dst || !a || !dst->data || !a->data) { return; }
+    memcpy(dst->data, a->data, ggml_nbytes(a)); // passthrough
+    llama_moe_trace_x_state & st = llama_moe_trace_x();
+    if (!st.fp || a->type != GGML_TYPE_F32) { return; }
+    const int il = (int) (intptr_t) userdata;
+    if (il < 0 || il >= MOE_TRACE_X_MAX_L) { return; }
+    const int32_t n    = (int32_t) a->ne[0];
+    const int32_t step = (int32_t) st.step[il].fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(st.mu);
+    const int32_t hdr[3] = { (int32_t) il, step, n };
+    fwrite(hdr, sizeof(int32_t), 3, st.fp);
+    fwrite(a->data, sizeof(float), (size_t) n, st.fp);
+}
+ggml_tensor * llama_moe_trace_capture_x(ggml_context * ctx0, ggml_tensor * cur, int il) {
+    llama_moe_trace_x_state & st = llama_moe_trace_x();
+    if (!st.fp || !cur || cur->ne[1] != 1) { return cur; }        // disabled, or not pure decode -> no-op
+    if (il < 0 || il >= MOE_TRACE_X_MAX_L || !st.lmask[il]) { return cur; }
+    return ggml_map_custom1(ctx0, cur, llama_moe_trace_x_cb, 1, (void *) (intptr_t) il);
+}
+
 // fork: coverage-mode remap callback (LLAMA_MOE_SYNC_COVER). `a` = selected_experts [n_used, 1] (argsort,
 // descending gate weight); `b` = normalized weights [1, n_used, 1]. Computes this step's per-expert weight
 // share into c->step_wexp and sets c->step_cover, then delegates to remap_cb, which applies the rule:
@@ -4825,10 +4881,64 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     // expert_slot can change the moment this callback drops the mutex.
     const bool want_hit = c->tier_hit_want;
     if (want_hit) { c->tier_hit.assign((size_t) n, 0); }
+    // fork TRACE (LLAMA_MOE_TRACE=path): decode-only capture of (routed expert, served expert, fill kind)
+    // per routing position, for offline weight-space analysis of WHY stale reuse (donor D) beats the router
+    // sibling (S) at a miss. One rec group per token-layer; CSV rows "rec,il,u,A,served,kind" with kind
+    // 0=HIT 1=STALE 2=SENTINEL 3=SPARE. On a true miss served==D!=A. If LLAMA_MOE_TRACE_RES=path2 is also
+    // set, dump the full resident expert set per token-layer to that file ("rec,il,count,e0 e1 ..."), so the
+    // offline "argmax over all resident sim(A,.)" grouping rule can be evaluated without a second run.
+    // Single-threaded (ith==0, holds g_moe_layer_mutex); zero cost when unset (getenv once).
+    static FILE * const trace_fp = []() -> FILE * {
+        const char * p = getenv("LLAMA_MOE_TRACE");
+        if (!p || !*p) { return nullptr; }
+        FILE * f = fopen(p, "w");
+        if (f) { fprintf(f, "rec,il,step,u,A,served,kind\n"); }
+        return f;
+    }();
+    static FILE * const trace_res_fp = []() -> FILE * {
+        const char * p = getenv("LLAMA_MOE_TRACE_RES");
+        if (!p || !*p) { return nullptr; }
+        FILE * f = fopen(p, "w");
+        if (f) { fprintf(f, "rec,il,step,count,experts\n"); }
+        return f;
+    }();
+    static std::atomic<uint64_t> g_trace_rec{0};
+    // fork TRACE: per-il single-token-step counter. The activation-capture hook (llama_moe_trace_capture_x)
+    // keeps an identical per-il counter, so (il,step) is the offline join key between x and the routing rec.
+    static std::atomic<uint64_t> g_trace_lstep[512]; // zero-init (static storage)
+    const bool tracing = trace_fp && stale_reuse; // decode only
+    // fork (LLAMA_MOE_STALE_VALUE_ZERO): on a stale-reuse miss, keep the residency bookkeeping (pos_slot +
+    // pin) exactly as the default fast path, but serve a zeroed sentinel to the matmul instead of the stale
+    // donor. The stale donor is near-orthogonal to the correct expert (measured cos ~= 0.02 = random), so
+    // feeding it injects a large orthogonal perturbation into the residual; feeding zero (just omitting one
+    // correct expert's contribution) stays closer to the full-expert reference. Default ON for streaming:
+    // KLD 0.403 -> 0.349 (-13.3%) and Same top p +2.2pp at the fast operating point, zero extra cost. Set
+    // LLAMA_MOE_STALE_VALUE_ZERO=0 to restore stale-donor reuse. No effect on the lossless/full-coverage
+    // path (no misses fire this) nor on non-async compaction (a different callback), so byte-identical modes
+    // stay byte-identical. Shared by single-tier and two-tier decode (two-tier not separately KLD-validated).
+    static const bool stale_value_zero = moe_env_on("LLAMA_MOE_STALE_VALUE_ZERO", true);
     std::vector<char> used_slot((size_t) n_slots);
     for (int64_t t = 0; t < n_tokens; ++t) {
         std::fill(used_slot.begin(), used_slot.end(), 0);
-        int sdb_hit = 0, sdb_sen = 0, sdb_spa = 0, sdb_sta = 0;
+        int sdb_hit = 0, sdb_sen = 0, sdb_spa = 0, sdb_sta = 0, sdb_stz = 0;
+        const uint64_t trace_rec = tracing ? g_trace_rec.fetch_add(1, std::memory_order_relaxed) : 0;
+        const uint64_t trace_step = tracing
+            ? g_trace_lstep[(c->il >= 0 && c->il < 512) ? c->il : 0].fetch_add(1, std::memory_order_relaxed)
+            : 0;
+        if (tracing && trace_res_fp) {
+            fprintf(trace_res_fp, "%llu,%d,%llu,", (unsigned long long) trace_rec, c->il, (unsigned long long) trace_step);
+            int rcount = 0;
+            for (int s = 0; s < c->capacity; ++s) {
+                if (c->slot_expert[(size_t) s] >= 0) { rcount++; }
+            }
+            fprintf(trace_res_fp, "%d,", rcount);
+            bool first = true;
+            for (int s = 0; s < c->capacity; ++s) {
+                const int32_t se = c->slot_expert[(size_t) s];
+                if (se >= 0) { fprintf(trace_res_fp, "%s%d", first ? "" : " ", se); first = false; }
+            }
+            fprintf(trace_res_fp, "\n");
+        }
         // pass 1: mark slots taken by resident (hit) experts
         for (int64_t u = 0; u < n_used; ++u) {
             const int32_t e    = flat[(size_t) (t * n_used + u)];
@@ -4842,6 +4952,7 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
             const int32_t e    = flat[(size_t) (t * n_used + u)];
             int32_t slot = (e >= 0 && e < c->n_expert) ? c->expert_slot[(size_t) e] : -1;
             if (want_hit) { c->tier_hit[(size_t) (t * n_used + u)] = slot >= 0 ? 1 : 0; }
+            int trace_kind = 0; // 0=HIT 1=STALE 2=SENTINEL 3=SPARE (fork TRACE)
             if (slot >= 0) {
                 // hit: record this position's current real slot for future stale reuse
                 sdb_hit++;
@@ -4855,16 +4966,18 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
                     if (cand < 0 || cand >= n_slots || used_slot[(size_t) cand]) { cand = -1; }
                     if (cand >= 0 && cand < c->capacity && c->slot_loading[(size_t) cand]) { cand = -1; }
                 }
-                if (cand >= 0) { sdb_sta++; }
+                if (cand >= 0) { sdb_sta++; trace_kind = 1; }
                 if (cand < 0) {
                     while (next_sentinel < n_slots && used_slot[(size_t) next_sentinel]) { next_sentinel++; }
                     if (next_sentinel < n_slots) {
                         cand = next_sentinel;
                         sdb_sen++;
+                        trace_kind = 2;
                     } else {
                         while (next_spare < n_slots && used_slot[(size_t) next_spare]) { next_spare++; }
                         cand = next_spare; // exists: at most n_used-1 slots used so far
                         sdb_spa++;
+                        trace_kind = 3;
                     }
                 }
                 slot = cand;
@@ -4879,13 +4992,36 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
             // victims, so they need no pin. Released next step when pin_gen is bumped (decode steps
             // are separated by a full sched synchronize, so the prior matmul has finished by then).
             if (slot < c->capacity) { c->slot_pin[(size_t) slot] = gen; }
-            *(int32_t *) ((char *) dst->data + t * dst->nb[1] + u * dst->nb[0]) = slot;
+            // fork Arm 3: redirect ONLY the matmul gather id for a stale-reuse miss to a distinct zeroed
+            // sentinel slot. Everything above (used_slot[slot], pos_slot, pin) is byte-identical to the
+            // default path, so the residency trajectory and loader behaviour are unchanged - the only
+            // difference is that get_rows reads all-zero weights (contribution 0) instead of the wrong
+            // donor. Needs a free zero sentinel this token (MMQ requires distinct ids per token); if none
+            // is left, fall back to serving the donor so we never crash or collide.
+            int32_t dst_slot = slot;
+            if (stale_value_zero && trace_kind == 1) {
+                int zs = c->capacity;
+                while (zs < n_slots && used_slot[(size_t) zs]) { zs++; }
+                if (zs < n_slots) {
+                    used_slot[(size_t) zs] = 1; // reserve so no other position lands on it
+                    dst_slot = zs;
+                    sdb_stz++;
+                }
+            }
+            *(int32_t *) ((char *) dst->data + t * dst->nb[1] + u * dst->nb[0]) = dst_slot;
+            if (tracing) {
+                const int32_t served = (slot >= 0 && slot < c->capacity) ? c->slot_expert[(size_t) slot] : -2;
+                fprintf(trace_fp, "%llu,%d,%llu,%d,%d,%d,%d\n",
+                        (unsigned long long) trace_rec, c->il, (unsigned long long) trace_step,
+                        (int) u, e, served, trace_kind);
+            }
         }
         if (slotdbg) {
             g_slot_hit[sdb_i]      += (uint64_t) sdb_hit;
             g_slot_sentinel[sdb_i] += (uint64_t) sdb_sen;
             g_slot_spare[sdb_i]    += (uint64_t) sdb_spa;
             g_slot_stale[sdb_i]    += (uint64_t) sdb_sta;
+            g_slot_stz[sdb_i]      += (uint64_t) sdb_stz;
             g_slot_tokens[sdb_i]++;
             g_slot_hist[sdb_i][(size_t) (sdb_hit < 33 ? sdb_hit : 32)]++;
         }
@@ -4913,7 +5049,8 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
             }
             LLAMA_LOG_WARN("MoE SLOTDBG %s: %llu token-layers, cap=%d n_sentinel=%d | per-position: "
                            "HIT %.1f%% SENTINEL %.1f%% SPARE(wrong-expert) %.1f%% STALE %.1f%% | "
-                           "per-token mean hit %.2f/%d sentinel %.2f spare %.2f | hits/token hist %s\n",
+                           "per-token mean hit %.2f/%d sentinel %.2f spare %.2f | stale-zeroed %.2f/tok | "
+                           "hits/token hist %s\n",
                            sdb_i ? "DECODE" : "PREFILL", (unsigned long long) tk, c->capacity, c->n_sentinel,
                            100.0 * (double) g_slot_hit[sdb_i].load() / td,
                            100.0 * (double) g_slot_sentinel[sdb_i].load() / td,
@@ -4921,7 +5058,8 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
                            100.0 * (double) g_slot_stale[sdb_i].load() / td,
                            (double) g_slot_hit[sdb_i].load() / nn, (int) n_used,
                            (double) g_slot_sentinel[sdb_i].load() / nn,
-                           (double) g_slot_spare[sdb_i].load() / nn, hist);
+                           (double) g_slot_spare[sdb_i].load() / nn,
+                           (double) g_slot_stz[sdb_i].load() / nn, hist);
         }
     }
 

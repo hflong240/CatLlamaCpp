@@ -195,6 +195,17 @@ struct ggml_context;
 struct ggml_backend_sched;
 typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
+// fork TRACE (offline substitution analysis): capture the routed-expert FFN input activation x (the
+// gate/up matmul input) at decode time so an offline pass can compute FFN_e(x) for the true routed expert
+// A, the served stale donor D, and the router sibling S on the REAL activation - the fully determined,
+// weights-only measure of which substitute's output is actually closest to the missing-correct A output.
+// Enabled only by LLAMA_MOE_TRACE_X=<path.bin> (LLAMA_MOE_TRACE_X_LAYERS="0,11,.." restricts the layers;
+// default all). Decode only (n_tokens==1). Returns `cur` unchanged when disabled, so the graph and every
+// numeric result stay byte-identical; when enabled it wraps `cur` in an identity ggml_map_custom1 whose
+// side effect dumps x. Binary records: int32 il, int32 step, int32 n, float x[n]; `step` is a per-il
+// counter matching the per-il `step` the remap trace writes, so the offline join key is (il, step).
+ggml_tensor * llama_moe_trace_capture_x(ggml_context * ctx0, ggml_tensor * cur, int il);
+
 // Build the cache path for one expert weight tensor. Returns the persistent device
 // cache tensor [ne0,ne1,capacity] to feed as mul_mat_id src0, and via `out_ids` the
 // remapped ids [n_used,n_tokens] pointing into the cache. Returns nullptr on failure
