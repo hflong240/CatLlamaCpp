@@ -7,8 +7,36 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 
 class llama_memory_hybrid_idx_context;
+
+// fork: token-chunk size for a DSA / lightning-indexer scoring loop whose per-token peak transient
+// is `per_token_bytes`. The indexer materialises a [n_kv/r, n_head, n_tokens] score pair that scales
+// with n_ubatch and dominates the reserved compute buffer at long context (on GLM-5.3-Flash it is
+// ~17 GiB at n_ctx 131072 / ub 2048, which spills into shared host memory). Scoring the query tokens
+// in chunks of this many tokens bounds that peak to ~budget MiB (LLAMA_DSA_LID_CHUNK_MB, default 256;
+// 0 disables chunking = one pass = the original unchunked graph), floored at LLAMA_DSA_LID_MIN_CHUNK
+// tokens (default 64) so the per-pass node count stays within the ggml graph object pool. Shared so
+// any indexer build can reuse it (glm5next today; deepseek4 has its own dsv4_lid_chunk_tokens twin).
+inline int64_t llm_dsa_chunk_tokens(int64_t n_tps, int64_t per_token_bytes) {
+    static const int64_t budget = []() {
+        const char * env = getenv("LLAMA_DSA_LID_CHUNK_MB");
+        return env ? atoll(env) : 256;
+    }();
+    static const int64_t min_chunk = []() {
+        const char * env = getenv("LLAMA_DSA_LID_MIN_CHUNK");
+        return env ? atoll(env) : 64;
+    }();
+    if (budget <= 0) {
+        return n_tps;
+    }
+    int64_t n_chunk = budget*1024*1024/std::max<int64_t>(per_token_bytes, 1);
+    n_chunk = std::max(n_chunk, min_chunk);
+    return std::min(std::max<int64_t>(n_chunk, 1), n_tps);
+}
 
 //
 // base classes
