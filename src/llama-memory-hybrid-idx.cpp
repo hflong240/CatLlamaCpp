@@ -48,7 +48,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
-        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
+        // glm5next rebuilds a softmax-gated pool of past cells at decode, so each idx cell caches
+        // its indexer key and pool gate side by side (2*indexer_head_size); other DSA arches cache
+        // the key alone. this only sizes the idx row (n_embd_k_gqa = head * 1 kv head) and disables
+        // the rot-Hadamard gate in llama-kv-cache (key_full != indexer_head_size), which is right:
+        // glm5next is NoPE and never rotates the pooled key.
+        hparams_idx.n_embd_head_k_full = model.arch == LLM_ARCH_GLM5NEXT
+            ? 2*model.hparams.indexer_head_size
+            : model.hparams.indexer_head_size;
 
         // the indexer caches keys only, so ask for K-only storage the way dsv4_make_k_only does:
         // llama_kv_cache keys that off hparams.is_mla(). without this the unused V is allocated at
@@ -360,24 +367,28 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
     const int64_t n_kv     = cell_blk->ne[0];
     const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
-    const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
-    const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
+    // NoPE arches pass a null blk_pos (no rope on the pooled key); recover n_blocks from blk_cells
+    const int64_t n_blocks = blk_pos != nullptr ? blk_pos->ne[0]/(4*n_ns) : blk_cells->ne[0]/r;
+    const int64_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
-    int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
+    int32_t * dst_blk_pos   = blk_pos != nullptr ? (int32_t *) blk_pos->data : nullptr;
     float   * dst_bias      = (float   *) bias->data;
 
     // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio
     // all mrope sections carry it: exact for text, approximate for images
-    for (int64_t sec = 0; sec < 4; ++sec) {
-        for (int64_t s = 0; s < n_ns; ++s) {
-            for (int64_t b = 0; b < n_blocks; ++b) {
-                dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = (int32_t) (b*r);
+    // a null blk_pos means the arch does not rope the pooled key (glm5next, NoPE)
+    if (dst_blk_pos != nullptr) {
+        for (int64_t sec = 0; sec < 4; ++sec) {
+            for (int64_t s = 0; s < n_ns; ++s) {
+                for (int64_t b = 0; b < n_blocks; ++b) {
+                    dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = (int32_t) (b*r);
+                }
             }
         }
     }

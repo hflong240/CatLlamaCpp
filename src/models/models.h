@@ -2183,6 +2183,95 @@ struct llama_model_kimi_linear : public llama_model_base {
 };
 
 
+struct llama_model_glm5next : public llama_model_base {
+    llama_model_glm5next(const struct llama_model_params & params) : llama_model_base(params) {}
+
+    class llm_graph_input_dsa;
+
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_build_delta_net_base {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        // KDA (delta-net) linear-attention sub-block; cur is [n_embd, n_tokens] (already normed)
+        ggml_tensor * build_kda(llm_graph_input_rs * inp_rs, ggml_tensor * cur, int il);
+
+        // MLA (NoPE, weight-absorbed) attention sub-block; cur is [n_embd, n_tokens] (already normed).
+        // mctx_hyb carries the DSA indexer cache; when present the attention is restricted to the
+        // top_k cells the indexer scores, else it falls back to dense MLA (phase-1 numerics).
+        ggml_tensor * build_mla(
+                    llm_graph_input_attn_k * inp_attn_k,
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                    ggml_tensor * cur,
+                            int   il);
+
+        // DSA lightning indexer: block-pooled scoring that returns the token indices this layer's
+        // queries may attend to (skeleton adapted from qwen4exp build_qsa_top_k). NoPE, no rope.
+        ggml_tensor * build_dsa_top_k(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                    ggml_tensor * cur,
+                    ggml_tensor * q_lora,
+                    ggml_tensor * kq_mask,
+                            int   il);
+
+        // weight-absorbed MLA restricted to the cells top_k names; top_k == nullptr keeps the
+        // dense mask (== the phase-1 build_attn path)
+        ggml_tensor * build_attn_dsa(
+                    llm_graph_input_attn_k * inp,
+                    ggml_tensor * wo,
+                    ggml_tensor * wo_b,
+                    ggml_tensor * wo_s,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                    ggml_tensor * kq_b,
+                    ggml_tensor * sinks,
+                    ggml_tensor * v_mla,
+                    ggml_tensor * top_k,
+                          float   kq_scale,
+                            int   il);
+
+        // the indexer cache layout inputs depend only on the compress ratio, so layers sharing a
+        // ratio share one input set (only one ratio in glm5next, but keep the qwen4exp structure)
+        std::map<uint32_t, llm_graph_input_dsa *> dsa_inps;
+
+        // sinkhorn hyper-connection helpers, ported verbatim from deepseek4 (both assert hc == 4)
+        ggml_tensor * build_hc_weighted_sum(
+                ggml_tensor * x,
+                ggml_tensor * weights) const;
+
+        ggml_tensor * build_hc_sinkhorn(
+                ggml_tensor * comb,
+                int il) const;
+
+        ggml_tensor * build_hc_pre(
+                ggml_tensor * x,
+                ggml_tensor * hc_fn,
+                ggml_tensor * hc_scale,
+                ggml_tensor * hc_base,
+                ggml_tensor ** post,
+                ggml_tensor ** comb,
+                int il) const;
+
+        ggml_tensor * build_hc_post(
+                ggml_tensor * x,
+                ggml_tensor * residual,
+                ggml_tensor * post,
+                ggml_tensor * comb,
+                int il) const;
+
+        // final collapse over the hc axis; glm5next has no learned hc_head tensors, so plain mean
+        // (the result feeds an RMS norm, which makes the mean-vs-sum scale factor irrelevant)
+        ggml_tensor * build_hc_mean(ggml_tensor * x) const;
+
+        const llama_model & model;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_step35 : public llama_model_base {
     llama_model_step35(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

@@ -164,6 +164,9 @@ struct llama_hparams {
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
 
+    // for GLM5NEXT KDA: lower bound applied to the forget gate (negative)
+    float kda_gate_lower_bound = 0.0f;
+
     bool ssm_dt_b_c_rms = false;
 
     float f_clamp_kqv      = 0.0f;
