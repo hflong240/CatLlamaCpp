@@ -30,8 +30,10 @@ public:
     void apply_copies(const stream_copy_info & sc_info) const;
 
     uint32_t get_ratio()    const;
+    bool     is_overlap()   const; // V4 CSA: state holds 2*ratio rows of 2x width
     uint32_t get_state_size() const;
     uint32_t get_n_stream() const;
+    uint32_t get_n_rows()   const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -40,6 +42,8 @@ public:
 
     ggml_tensor * get_kv   (ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_score(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_kv_all   (ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_score_all(ggml_context * ctx, int32_t il) const;
 
     ggml_tensor * cpy_kv   (ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
     ggml_tensor * cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
@@ -141,6 +145,9 @@ public:
     llama_dsv4_comp_state * get_hca_state() const;
     llama_dsv4_comp_state * get_lid_state() const;
 
+    // layer whose compressed-KV storage `il` reads, -1 = no compressed KV
+    int32_t get_comp_read_layer(int32_t il) const;
+
 private:
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
@@ -148,6 +155,12 @@ private:
     llama_hparams hparams_lid;
 
     const uint32_t n_seq_max;
+
+    // [n_layer] storage layer -> layer whose rows it holds (itself, or the source of a mirror)
+    std::vector<int32_t> comp_il_src;
+
+    // [n_layer] layer -> layer whose compressed-KV storage it reads (itself, its V4.1 kv source or a mirror), -1 = none
+    std::vector<int32_t> comp_read;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
@@ -199,6 +212,9 @@ public:
     void set_input_k_idxs(ggml_tensor * dst) const;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_k_rot(ggml_tensor * dst) const;
+
+    // token history of the raw (window) cells, for host-side n-gram hashing (deepseek41 Engram)
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     size_t i_next = 0;
@@ -346,6 +362,8 @@ public:
     const comp_plan & get_hca_plan(const llama_ubatch & ubatch) const;
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
 
+    int32_t get_comp_read_layer(int32_t il) const;
+
 private:
     size_t i_next = 0;
 
@@ -378,4 +396,6 @@ private:
     mutable comp_plan reserve_plan_lid;
 
     const llama_memory_status status;
+
+    const llama_kv_cache_dsv4 * kv = nullptr;
 };

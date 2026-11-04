@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1522,6 +1523,10 @@ struct llama_moe_layer_cache {
     bool                    tier_hit_want = false;
     std::vector<char>       tier_hit;
 
+    // n_expert: 1 if this decode step's miss was left to the CPU expert lane instead of being H2D-loaded
+    // (LLAMA_MOE_CPU_LANE_H2D_ONLY). Cleared at the start of each remap callback.
+    std::vector<char>       cpu_h2d_skip;
+
     // fork: when set, llama_moe_tiered_pack_cb emits the FUSED layout for ggml_mul_mat_id_2t (unified
     // ids + tier, 2 rows) instead of the masked two-pass layout (hi ids + lo ids + tier, 3 rows). Set by
     // llama_moe_layer_cache_remap_tiered from its `fused` argument; run-constant (LLAMA_MOE_TIER_FUSED).
@@ -2066,6 +2071,12 @@ static uint64_t g_diag_publish_ns = 0; // time in the slot_table/stale_table pub
 // the wall time of the parallel_load they are inside. Never subtract them from a wall figure.
 static std::atomic<uint64_t> g_diag_read_ns{0};     // parallel_load: disk fread, thread-sum
 static std::atomic<uint64_t> g_diag_h2d_ns{0};      // parallel_load: staged per-expert H2D, thread-sum
+// H2D-only CPU lane census (LLAMA_MOE_CPU_LANE_DIAG): skip = experts left to the CPU, mask = positions
+// the lane saw, missing = of those, RAM slots that vanished before the lane ran, jobs = computed.
+static std::atomic<uint64_t> g_cpu_lane_skip{0};
+static std::atomic<uint64_t> g_cpu_lane_mask{0};
+static std::atomic<uint64_t> g_cpu_lane_missing{0};
+static std::atomic<uint64_t> g_cpu_lane_jobs{0};
 static std::atomic<uint64_t> g_diag_h2d_wall_ns{0}; // parallel_load: async H2D batch, WALL (issuing thread)
 // The background loader calls parallel_load too, on its own thread, and g_diag_pl_ns does NOT cover it.
 // Its reads therefore must not land in the counters above, or "read" ends up larger than the
@@ -4442,6 +4453,20 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     // new pin generation for this step; slots pinned by the previous step are now releasable
     const uint64_t gen = ++c->pin_gen;
 
+    // H2D-only CPU lane: the CPU takes over decode misses that are RAM-resident, so they must not be
+    // loaded here. The mask is rebuilt every step and read by llama_moe_cpu_lane.
+    static const bool cpu_h2d_only = getenv("LLAMA_MOE_CPU_LANE_H2D_ONLY") != nullptr;
+    // Maximum misses this layer may hand to the CPU lane (0 = none, unset = all eligible). This is the
+    // static "share only part of the H2D work" knob; a feedback controller can vary it per step later.
+    static const int cpu_h2d_max = [] {
+        const char * e = getenv("LLAMA_MOE_CPU_LANE_MAX_PER_LAYER");
+        return e ? atoi(e) : INT_MAX;
+    }();
+    int cpu_h2d_marked = 0;
+    if (cpu_h2d_only) {
+        c->cpu_h2d_skip.assign((size_t) c->n_expert, 0);
+    }
+
     // per-expert selection frequency this step
     std::vector<int> freq((size_t) c->n_expert, 0);
     for (int64_t p = 0; p < n; ++p) {
@@ -4513,6 +4538,13 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
                        c->sync_budget, c->sync_cover,
                        c->capacity, distinct, c->capacity,
                        100.0 * (double) top_cap / (double) (total ? total : 1));
+        if (getenv("LLAMA_MOE_CPU_LANE_DIAG") && c->il == 0) {
+            LLAMA_LOG_WARN("MoE CPU lane: skip=%llu mask=%llu missing=%llu jobs=%llu\n",
+                           (unsigned long long) g_cpu_lane_skip.exchange(0, std::memory_order_relaxed),
+                           (unsigned long long) g_cpu_lane_mask.exchange(0, std::memory_order_relaxed),
+                           (unsigned long long) g_cpu_lane_missing.exchange(0, std::memory_order_relaxed),
+                           (unsigned long long) g_cpu_lane_jobs.exchange(0, std::memory_order_relaxed));
+        }
     }
 
     // Budget mode (LLAMA_MOE_SYNC_BUDGET=N): instead of the all-or-nothing threshold sync, load at
@@ -4723,6 +4755,16 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
                 g_tier_yield_cnt.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
+        }
+        // H2D-only CPU lane: this miss would be sync-loaded, but the expert is already in the host RAM
+        // pool, so let the CPU lane compute it instead. Skipping the load here is the whole point: the
+        // lane must save H2D, not recompute experts that were uploaded anyway.
+        if (cpu_h2d_only && n_tokens == 1 && cpu_h2d_marked < cpu_h2d_max &&
+            !c->ram_slot.empty() && c->ram_slot[(size_t) e] >= 0) {
+            c->cpu_h2d_skip[(size_t) e] = 1;
+            ++cpu_h2d_marked;
+            g_cpu_lane_skip.fetch_add(1, std::memory_order_relaxed);
+            continue;
         }
         // pick an eviction victim among slots not pinned this step: empty first; then, in weighted
         // mode, the LOWEST-score slot (protect the high-weight core), else the oldest (age-LRU).
@@ -5295,6 +5337,103 @@ ggml_moe_ffn_sync_fn llama_moe_layer_cache_sync_fn(void) {
 //
 // Layout (verified): gate/up expert slab = n_ff rows of n_embd quantized elems; down slab = n_embd rows
 // of n_ff quantized elems. One row = ggml_row_size(type, k). vec_dot(k, &s, 0, wrow, 0, actq, 0, 1).
+// simple reusable barrier for the within-expert CPU lane path (C++17, no std::barrier)
+struct llama_moe_lane_barrier {
+    explicit llama_moe_lane_barrier(int n) : n(n) {}
+
+    void wait() {
+        std::unique_lock<std::mutex> lk(m);
+        const int g = gen;
+        if (++count == n) {
+            count = 0;
+            ++gen;
+            cv.notify_all();
+        } else {
+            cv.wait(lk, [&] { return gen != g; });
+        }
+    }
+
+    std::mutex              m;
+    std::condition_variable cv;
+    int n;
+    int count = 0;
+    int gen   = 0;
+};
+
+// Persistent pool for the within-expert CPU lane: spawning a fresh team per layer costs about as much
+// as the dots themselves (40 layers/token), so the team is created once and reused.
+struct llama_moe_lane_pool {
+    explicit llama_moe_lane_pool(int n) : n(n) {
+        for (int t = 1; t < n; ++t) {
+            threads.emplace_back([this, t]() { worker(t); });
+        }
+    }
+
+    int size() const { return n; }
+
+    void run(const std::function<void(int)> & task) {
+        std::lock_guard<std::mutex> call(call_mtx);
+        {
+            std::lock_guard<std::mutex> lk(m);
+            fn = task;
+            ++gen;
+            done = 0;
+        }
+        cv.notify_all();
+        fn(0);
+        std::unique_lock<std::mutex> lk(done_m);
+        done_cv.wait(lk, [&] { return done == n - 1; });
+    }
+
+private:
+    void worker(int tid) {
+        uint64_t seen = 0;
+        while (true) {
+            std::function<void(int)> f;
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [&] { return stop || gen != seen; });
+                if (stop) { return; }
+                seen = gen;
+                f = fn;
+            }
+            f(tid);
+            {
+                std::lock_guard<std::mutex> lk(done_m);
+                ++done;
+            }
+            done_cv.notify_one();
+        }
+    }
+
+    const int n;
+    std::vector<std::thread> threads;
+    std::mutex call_mtx;
+    std::mutex m;
+    std::condition_variable cv;
+    std::mutex done_m;
+    std::condition_variable done_cv;
+    std::function<void(int)> fn;
+    uint64_t gen  = 0;
+    int      done = 0;
+    bool     stop = false;
+};
+
+static llama_moe_lane_pool * llama_moe_lane_pool_get() {
+    static llama_moe_lane_pool * pool = [] {
+        int n = 16;
+        if (const char * e = getenv("LLAMA_MOE_CPU_LANE_THREADS")) {
+            n = atoi(e);
+        } else if (const char * e = getenv("LLAMA_MOE_IO_THREADS")) {
+            n = atoi(e);
+        }
+        if (n < 1) { n = 1; }
+        if (n > 32) { n = 32; }
+        return new llama_moe_lane_pool(n); // leaked: lives for the process, like the layer caches
+    }();
+    return pool;
+}
+
 static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weights_host,
                               const int32_t * sel_host, int32_t * /*ids_host*/, float * partial_host,
                               int n_used, int n_tokens, int n_embd, int n_ff, int /*gpu_skip_slot*/) {
@@ -5313,10 +5452,14 @@ static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weig
     const ggml_type dtype = down_pr.src ? down_pr.src->type : GGML_TYPE_COUNT;
     const auto * tt_gu = ggml_get_type_traits_cpu(wtype);   // gate/up weight traits
     const auto * tt_dn = ggml_get_type_traits_cpu(dtype);   // down weight traits
-    if (!tt_gu || !tt_gu->vec_dot || !tt_gu->from_float) { return 0; }
-    if (!tt_dn || !tt_dn->vec_dot || !tt_dn->from_float) { return 0; }
+    if (!tt_gu || !tt_gu->vec_dot || !tt_dn || !tt_dn->vec_dot) { return 0; }
     const ggml_type gu_vdt = tt_gu->vec_dot_type; // activation quant type for gate/up dots
     const ggml_type dn_vdt = tt_dn->vec_dot_type; // activation quant type for down dots
+    // IQ1_M/IQ1_S/IQ2_* have vec_dot but no from_float of their own: the activation is quantized to
+    // their vec_dot_type, so borrow that type's quantizer.
+    const auto * tt_gu_act = tt_gu->from_float ? tt_gu : ggml_get_type_traits_cpu(gu_vdt);
+    const auto * tt_dn_act = tt_dn->from_float ? tt_dn : ggml_get_type_traits_cpu(dn_vdt);
+    if (!tt_gu_act || !tt_gu_act->from_float || !tt_dn_act || !tt_dn_act->from_float) { return 0; }
 
     const size_t gu_rowbytes = ggml_row_size(wtype, n_embd); // one gate/up weight row (n_embd elems)
     const size_t dn_rowbytes = ggml_row_size(dtype, n_ff);   // one down weight row (n_ff elems)
@@ -5324,6 +5467,8 @@ static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weig
     // Build the CPU job list under the lock: each job is a (token, used-position) whose expert is
     // RAM-resident in ALL three projections. Zero its router weight so the GPU sum drops it. We snapshot
     // the RAM pointers here; the slots are pinned by the residency machinery until this step completes.
+    static const bool h2d_only = getenv("LLAMA_MOE_CPU_LANE_H2D_ONLY") != nullptr;
+
     struct Job { int t; int u; int e; float w; const char * gate; const char * up; const char * down; };
     std::vector<Job> jobs;
     {
@@ -5335,6 +5480,16 @@ static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weig
                 if (e < 0 || e >= c->n_expert) { continue; }
                 const int32_t rs = c->ram_slot[(size_t) e];
                 if (rs < 0) { continue; } // not RAM-resident => leave it to the GPU
+                if (h2d_only) {
+                    if ((int) c->cpu_h2d_skip.size() != c->n_expert || !c->cpu_h2d_skip[(size_t) e]) {
+                        continue; // this position was H2D-loaded (or is a VRAM hit): leave it to the GPU
+                    }
+                    g_cpu_lane_mask.fetch_add(1, std::memory_order_relaxed);
+                    if (rs < 0) {
+                        g_cpu_lane_missing.fetch_add(1, std::memory_order_relaxed);
+                        continue; // RAM slot evicted before the lane ran: the load skip already happened
+                    }
+                }
                 Job j;
                 j.t = t; j.u = u; j.e = e;
                 j.w = weights_host[(size_t) (t * n_used + u)];
@@ -5342,6 +5497,7 @@ static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weig
                 j.up   = (const char *) up_pr.ram   + (size_t) rs * up_pr.stride;
                 j.down = (const char *) down_pr.ram + (size_t) rs * down_pr.stride;
                 jobs.push_back(j);
+                g_cpu_lane_jobs.fetch_add(1, std::memory_order_relaxed);
                 weights_host[(size_t) (t * n_used + u)] = 0.0f; // GPU sum excludes this position
             }
         }
@@ -5354,8 +5510,58 @@ static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weig
     const size_t act_dn_bytes = ggml_row_size(dn_vdt, n_ff);
 
     int nthreads = 1;
-    if (const char * e = getenv("LLAMA_MOE_IO_THREADS")) { nthreads = atoi(e); }
+    if (const char * e = getenv("LLAMA_MOE_CPU_LANE_THREADS")) {
+        nthreads = atoi(e);
+    } else if (const char * e = getenv("LLAMA_MOE_IO_THREADS")) {
+        nthreads = atoi(e);
+    }
     if (nthreads < 1) { nthreads = 1; }
+    if (nthreads > 32) { nthreads = 32; }
+
+    // A layer usually has only a handful of CPU positions (often one), so splitting the work by job
+    // leaves all but one core idle. When the job count fits the pool, run each job with all threads:
+    // gate/up rows then down rows are split across the pool.
+    llama_moe_lane_pool * lane_pool = llama_moe_lane_pool_get();
+    const int pool_n = lane_pool->size();
+    if ((int) jobs.size() <= pool_n) {
+        const int nt = pool_n;
+        llama_moe_lane_barrier bar(nt);
+        std::vector<char>  xq(act_gu_bytes);
+        std::vector<char>  midq(act_dn_bytes);
+        std::vector<float> mid((size_t) n_ff);
+
+        auto worker_par = [&](int tid) {
+            for (const Job & j : jobs) {
+                if (tid == 0) {
+                    tt_gu_act->from_float(cur_host + (size_t) j.t * n_embd, xq.data(), n_embd);
+                }
+                bar.wait();
+                for (int f = tid; f < n_ff; f += nt) {
+                    float g = 0.0f, u = 0.0f;
+                    tt_gu->vec_dot(n_embd, &g, 0, j.gate + (size_t) f * gu_rowbytes, 0, xq.data(), 0, 1);
+                    tt_gu->vec_dot(n_embd, &u, 0, j.up   + (size_t) f * gu_rowbytes, 0, xq.data(), 0, 1);
+                    const float s = g / (1.0f + expf(-g));
+                    mid[(size_t) f] = s * u;
+                }
+                bar.wait();
+                if (tid == 0) {
+                    tt_dn_act->from_float(mid.data(), midq.data(), n_ff);
+                }
+                bar.wait();
+                float * dst = partial_host + (size_t) j.t * n_embd;
+                for (int i = tid; i < n_embd; i += nt) {
+                    float o = 0.0f;
+                    tt_dn->vec_dot(n_ff, &o, 0, j.down + (size_t) i * dn_rowbytes, 0, midq.data(), 0, 1);
+                    dst[(size_t) i] += o * j.w;
+                }
+                bar.wait(); // mid/midq/xq are reused by the next job
+            }
+        };
+
+        lane_pool->run(worker_par);
+        return (int) jobs.size();
+    }
+
     if (nthreads > (int) jobs.size()) { nthreads = (int) jobs.size(); }
 
     auto worker = [&](int tid) {
@@ -5370,7 +5576,7 @@ static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weig
             // quantize this token's input activations to the gate/up dot type (reuse across experts of
             // the same token handled by this thread)
             if (j.t != last_t) {
-                tt_gu->from_float(cur_host + (size_t) j.t * n_embd, xq.data(), n_embd);
+                tt_gu_act->from_float(cur_host + (size_t) j.t * n_embd, xq.data(), n_embd);
                 last_t = j.t;
             }
             // gate/up: n_ff rows each -> silu(gate)*up
@@ -5382,7 +5588,7 @@ static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weig
                 mid[(size_t) f] = s * u;
             }
             // quantize the intermediate to the down dot type
-            tt_dn->from_float(mid.data(), midq.data(), n_ff);
+            tt_dn_act->from_float(mid.data(), midq.data(), n_ff);
             // down: n_embd rows -> out
             for (int i = 0; i < n_embd; ++i) {
                 float o = 0.0f;

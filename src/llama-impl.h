@@ -54,6 +54,9 @@ static inline dst_t llama_cast(src_t v) {
     }
 }
 
+// Prefetch the host pages needed to gather these rows.
+void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
+
 static inline ggml_tensor * llama_mul_mat_hadamard(
         ggml_context * ctx,
         ggml_tensor * cur,

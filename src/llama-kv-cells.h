@@ -386,6 +386,30 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // the token of the cell of sequence seq_id at the largest position <= p
+    // when several cells share that position, the one with the highest index wins
+    // return LLAMA_TOKEN_NULL if the sequence has no cell at or before p
+    // note: used by n-gram input embeddings to recover the tokens preceding a ubatch
+    llama_token seq_pos_tok_le(llama_seq_id seq_id, llama_pos p) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        llama_pos   best = -1;
+        llama_token tok  = LLAMA_TOKEN_NULL;
+
+        for (uint32_t i : used) {
+            if (pos[i] < 0 || pos[i] > p || !seq[i].test(seq_id)) {
+                continue;
+            }
+            if (pos[i] >= best) {
+                best = pos[i];
+                tok  = ext[i].tok;
+            }
+        }
+
+        return tok;
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());

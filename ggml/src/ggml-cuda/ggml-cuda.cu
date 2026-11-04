@@ -3012,30 +3012,18 @@ static void ggml_cuda_op_moe_ffn(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // device via ggml_backend_tensor_set), then upload the resolved ids.
     const int64_t n_sel = n_used * n_tokens;
     std::vector<int32_t> sel_host((size_t) n_sel), ids_host((size_t) n_sel);
-    CUDA_CHECK(cudaMemcpyAsync(sel_host.data(), sel->data, n_sel * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+
     // Diagnostic (LLAMA_MOE_FUSED_NOSYNC): skip the residency plan + expert sync-load, just route each
     // position to its expert id mod capacity (stale, wrong-quality). Isolates the matmul/kernel cost of
     // this op from the sync-load cost - if decode is still slow with this, the slowness is the matmuls,
     // not the H2D sync wall.
     static const bool nosync = getenv("LLAMA_MOE_FUSED_NOSYNC") != nullptr;
-    if (nosync) {
-        const int cap = (int) gate_dev->ne[2];
-        for (int64_t i = 0; i < n_sel; ++i) {
-            const int32_t e = sel_host[(size_t) i];
-            ids_host[(size_t) i] = (e >= 0 && cap > 0) ? (e % cap) : 0;
-        }
-    } else {
-        sync_fn(cache, sel_host.data(), ids_host.data(), (int) n_used, (int) n_tokens);
-    }
 
     // CPU expert lane (Pulsar-style, opt-in via cpu_fn != nullptr): compute the FULL FFN of any routed
     // expert resident in the host RAM pool on the CPU, so it neither uploads nor competes for a VRAM
-    // slot. The CPU dots run on a BACKGROUND THREAD spawned here; the GPU gate/up/down matmuls launch
-    // async on `stream` immediately below and run concurrently (they need only ids_t, not the CPU work).
-    // We join the thread just before the weighted-sum, which needs the CPU-zeroed router weights. cpu_fn
-    // zeroes w_host for handled positions and fills cpu_partial; the op uploads the modified weights and
-    // adds cpu_partial into dst at the end.
+    // slot. The CPU dots run on a BACKGROUND THREAD spawned below; the GPU gate/up/down matmuls launch
+    // async on `stream` immediately after and run concurrently. The lane's cur/weights D2H copies ride
+    // on the sel copy's existing synchronize, so the lane adds no second full-stream sync per layer.
     const int64_t n_out = n_embd * n_tokens;
     std::vector<float> cpu_partial;
     std::vector<float> w_host;
@@ -3050,8 +3038,23 @@ static void ggml_cuda_op_moe_ffn(ggml_backend_cuda_context & ctx, ggml_tensor * 
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(w_host.data(), weights->data, (size_t) n_sel * sizeof(float),
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream)); // cur_host / w_host ready before the CPU thread reads
         cpu_partial.assign((size_t) n_out, 0.0f);
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(sel_host.data(), sel->data, n_sel * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (nosync) {
+        const int cap = (int) gate_dev->ne[2];
+        for (int64_t i = 0; i < n_sel; ++i) {
+            const int32_t e = sel_host[(size_t) i];
+            ids_host[(size_t) i] = (e >= 0 && cap > 0) ? (e % cap) : 0;
+        }
+    } else {
+        sync_fn(cache, sel_host.data(), ids_host.data(), (int) n_used, (int) n_tokens);
+    }
+
+    if (cpu_active) {
         const int gpu_skip_slot = (int) gate_dev->ne[2] - 1;
         // Spawn the CPU FFN in the background; it does not touch any GPU tensor, so it overlaps the GPU
         // matmuls queued below. sel_host/ids_host are finalized by sync_fn above and only read here.

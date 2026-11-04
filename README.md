@@ -15,8 +15,8 @@ LLM inference in C/C++
 > [!NOTE]
 > This is the **CatEngine** fork of `llama.cpp`. In addition to everything upstream provides, it adds
 > **on-demand MoE expert streaming from disk** (run Mixture-of-Experts models whose expert weights are
-> far larger than your VRAM/RAM) and support for the **DeepSeek-V4-Flash (`deepseek4`)** and
-> **Hunyuan-v3 (`hy_v3`)** architectures. See
+> far larger than your VRAM/RAM) and support for the **DeepSeek-V4-Flash (`deepseek4`)**, **DeepSeek-V4.1-Flash
+> (`deepseek41`)**, and **Hunyuan-v3 (`hy_v3`)** architectures. See
 > [CatEngine fork additions](#catengine-fork-additions) below. All upstream functionality is unchanged.
 
 ## CatEngine fork additions
@@ -27,8 +27,14 @@ whose routed experts are several times the size of VRAM *and* system RAM combine
 **DeepSeek-V4-Flash** (78 GiB of routed experts, on a 24 GB GPU + 64 GB RAM) and a
 **170 GB / 299B-parameter Hunyuan-v3 MoE on a single 32 GB GPU**.
 
-Two architectures are added on top of upstream - **DeepSeek-V4-Flash** (`deepseek4`) and **Hunyuan-v3**
-(`hy_v3`); everything else upstream is unchanged.
+Architectures added on top of upstream include **DeepSeek-V4-Flash** (`deepseek4`), **DeepSeek-V4.1-Flash**
+(`deepseek41`), and **Hunyuan-v3** (`hy_v3`); everything else upstream is unchanged.
+
+DeepSeek-V4.1 keeps its Engram lookup tables in a separate GGUF shard. The loader expects that shard under the
+split name, so link `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` as
+`...-IQ2_XXS-00006-of-00006.gguf` next to the other shards (a hardlink works on NTFS and avoids copying
+110 GB). The tables are mmap'd and read lazily, one block of rows per token; do not use `--no-mmap`, which
+would force the whole table into RAM.
 
 ### Technical background
 
@@ -125,7 +131,13 @@ actually reach for:
 | `LLAMA_MOE_PREFILL_SWEEP` | on | **Lossless prefill.** Evaluate the MoE FFN once per expert group so a prompt batch never drops experts it selected (~5.7x faster *and* more correct than the old `-ub 1` workaround on DeepSeek-V4-Flash). Set `0` to restore capacity-rationed, lossy prefill. |
 | `LLAMA_MOE_IO_THREADS=N` | `16` | Parallel disk-read threads for expert loads. Raise on fast NVMe. |
 | `LLAMA_MOE_FUSED=1` | off | Fused CUDA MoE-FFN op (eliminates the per-layer scheduler split). Quality-identical, but measured decode is ~20% *slower* on the disk/H2D-bound streaming path, so it is off by default. Enable only where the split, not the load, dominates. |
+| `LLAMA_MOE_CPU_LANE_H2D_ONLY=1` | off | Decode-only CPU expert lane: compute sync-load misses on the CPU instead of H2D. Requires `LLAMA_MOE_FUSED=1`. |
+| `LLAMA_MOE_CPU_LANE_MAX_PER_LAYER=N` | all eligible | Max experts per layer handed to the CPU lane. `1` is the measured optimum on DeepSeek-V4.1. |
+| `LLAMA_MOE_CPU_LANE_THREADS=N` | `LLAMA_MOE_IO_THREADS` | CPU-lane worker threads. `12` with the background loader active. |
 | `LLAMA_MOE_DIAG=1` | off | Print decode miss-rate, per-token timing, top-2 residency, and the per-step prefill breakdown (loader time, disk vs H2D, RAM-pool hit rate). |
+
+The CPU lane is not byte-identical to the GPU path: measured Mean KLD 0.0134 / Same-top 96.2% on
+DeepSeek-V4.1 with `MAX_PER_LAYER=1`, and ~1.3-1.4x decode. Leave it off when full-expert parity matters.
 
 If the auto sizer overcommits (OOM) or leaves too little headroom (paging), nudge `LLAMA_MOE_VRAM_RESERVE_MB`
 (VRAM held free, default 3072) or `LLAMA_MOE_RAM_RESERVE_MB` (system RAM held free, default 5120). Further
