@@ -421,6 +421,65 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     return ggml_add(ctx0, x, ggml_mul(ctx0, ggml_repeat_4d(ctx0, value, n_embd, hc, nt, 1), gate));
 }
 
+// Tokens per pass of the build_attention41 indexer scoring loop. Each pass materialises the
+// [n_comp, tokens, indexer_n_head] score twice - the mul_mat result and its transposed copy - so the peak is
+// 2*n_comp*indexer_n_head*n_stream*4 bytes per token and grows with the ubatch; chunking bounds it. The knob is
+// a byte budget rather than a token count because n_comp scales with the context, so a fixed token count would
+// not hold the peak constant across contexts. 0 scores every token in one pass, i.e. the unchunked graph.
+//
+// min_chunk floors the chunk size, i.e. caps the pass count: graph_max_nodes scales at 40*n_tokens and each
+// pass costs ~20 nodes per indexer layer, so a very small chunk (which the budget wants at a long context,
+// where n_comp is large) would overrun the graph object pool. The floor wins over the budget, so a very long
+// context raises the peak instead of failing to build.
+static int64_t dsv41_lid_chunk_tokens(int64_t n_tok, int64_t n_comp, int64_t n_idx_head, int64_t n_stream) {
+    static const int64_t budget = []() {
+        const char * env = getenv("LLAMA_DSV41_LID_CHUNK_MB");
+        return env ? atoll(env) : 256;
+    }();
+    static const int64_t min_chunk = []() {
+        const char * env = getenv("LLAMA_DSV41_LID_MIN_CHUNK");
+        return env ? atoll(env) : 16;
+    }();
+
+    if (budget <= 0) {
+        return n_tok;
+    }
+
+    const int64_t per_token = 2*n_comp*n_idx_head*n_stream*(int64_t) sizeof(float);
+    int64_t n_chunk = budget*1024*1024/std::max<int64_t>(per_token, 1);
+
+    n_chunk = std::max(n_chunk, min_chunk);
+
+    return std::min(std::max<int64_t>(n_chunk, 1), n_tok);
+}
+
+// Tokens per pass of the build_attention41 dense comp-attention. build_top_k_mask materialises a few F32
+// copies of [n_comp, tokens] plus the F16 flash-attention mask, so the peak is ~16*n_comp bytes per token
+// and grows with the ubatch; k_all is shared across passes, only the mask scales. Chunking bounds that peak.
+// The byte budget holds the peak constant across contexts (n_comp scales with the context); min_chunk floors
+// the chunk so the pass count stays within graph_max_nodes (40*n_tokens). 0 runs the whole ubatch in one pass.
+static int64_t dsv41_dense_chunk_tokens(int64_t n_tok, int64_t n_comp) {
+    static const int64_t budget = []() {
+        const char * env = getenv("LLAMA_DSV41_ATTN_CHUNK_MB");
+        return env ? atoll(env) : 512;
+    }();
+    static const int64_t min_chunk = []() {
+        const char * env = getenv("LLAMA_DSV41_ATTN_MIN_CHUNK");
+        return env ? atoll(env) : 64;
+    }();
+
+    if (budget <= 0) {
+        return n_tok;
+    }
+
+    const int64_t per_token = 16*n_comp;
+    int64_t n_chunk = budget*1024*1024/std::max<int64_t>(per_token, 1);
+
+    n_chunk = std::max(n_chunk, min_chunk);
+
+    return std::min(std::max<int64_t>(n_chunk, 1), n_tok);
+}
+
 ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         const llama_model_deepseek41 & model,
         llm_graph_input_dsv4 * inp_dsv4,
@@ -564,10 +623,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
             iw = ggml_view_4d(ctx0, iw, iw->ne[0], nt/n_stream, 1, n_stream, iw->nb[1], iw->nb[1]*(nt/n_stream), iw->nb[1]*(nt/n_stream), 0);
 
-            // chunk queries so the [n_ih, tokens, n_comp] scores stay near 2^26 elements (at most 64 chunks)
+            // chunk queries so the per-pass [n_comp, tokens, n_ih] score buffer stays bounded against the
+            // ubatch (see dsv41_lid_chunk_tokens; tune with LLAMA_DSV41_LID_CHUNK_MB / LLAMA_DSV41_LID_MIN_CHUNK)
             const int64_t n_tok = nt/n_stream;
             GGML_ASSERT(ci.kq_mask->ne[1] == n_tok);
-            const int64_t chunk = std::max({ (n_tok + 63)/64, (INT64_C(1) << 26)/(n_idx_head*n_comp*n_stream), INT64_C(1) });
+            const int64_t chunk = dsv41_lid_chunk_tokens(n_tok, n_comp, n_idx_head, n_stream);
 
             const int32_t cand_src = hparams.dsv41_cand_src;
             const bool    pick_blk = cand_src == il && cand_pin;              // level one: pick the candidate blocks
@@ -746,15 +806,43 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             cb(comp_k, "comp_k", il);
             ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
 
-            ggml_tensor * sel_mask = build_top_k_mask(ci.kq_mask, top_k, "comp_top_k_mask", il);
-            if (sel_mask->type != raw_mask->type) {
-                // the raw mask is F16 when flash attention is on
-                sel_mask = ggml_cast(ctx0, sel_mask, raw_mask->type);
-            }
-            ggml_tensor * kq_mask  = ggml_concat(ctx0, raw_mask, sel_mask, 0);
-            cb(kq_mask, "comp_kq_mask", il);
+            if (n_stream == 1) {
+                // chunk the queries so the dense top-k mask (O(n_comp*nt)) stays bounded against the ubatch;
+                // k_all is shared across chunks, so only the per-chunk mask scales. attention is independent
+                // per query, so this is identical to the single-pass result.
+                const int64_t chunk = dsv41_dense_chunk_tokens(nt, n_comp);
+                for (int64_t t0 = 0; t0 < nt; t0 += chunk) {
+                    const int64_t c = std::min(chunk, nt - t0);
 
-            out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, kq_scale, il);
+                    ggml_tensor * tk_c = ggml_view_4d(ctx0, top_k, top_k->ne[0], c, top_k->ne[2], top_k->ne[3],
+                            top_k->nb[1], top_k->nb[2], top_k->nb[3], t0*top_k->nb[1]);
+                    ggml_tensor * cm_c = ggml_view_4d(ctx0, ci.kq_mask, ci.kq_mask->ne[0], c, ci.kq_mask->ne[2], ci.kq_mask->ne[3],
+                            ci.kq_mask->nb[1], ci.kq_mask->nb[2], ci.kq_mask->nb[3], t0*ci.kq_mask->nb[1]);
+
+                    ggml_tensor * sel_mask = build_top_k_mask(cm_c, tk_c, "comp_top_k_mask", il);
+                    if (sel_mask->type != raw_mask->type) {
+                        sel_mask = ggml_cast(ctx0, sel_mask, raw_mask->type);
+                    }
+                    ggml_tensor * rm_c = ggml_view_4d(ctx0, raw_mask, raw_mask->ne[0], c, raw_mask->ne[2], raw_mask->ne[3],
+                            raw_mask->nb[1], raw_mask->nb[2], raw_mask->nb[3], t0*raw_mask->nb[1]);
+                    ggml_tensor * kq_mask = ggml_concat(ctx0, rm_c, sel_mask, 0);
+
+                    ggml_tensor * q_c = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], c, q->nb[1], q->nb[2], t0*q->nb[2]);
+                    ggml_tensor * out_c = build_attn_mha(q_c, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, kq_scale, il);
+
+                    out = out ? ggml_concat(ctx0, out, out_c, 1) : out_c;
+                }
+            } else {
+                ggml_tensor * sel_mask = build_top_k_mask(ci.kq_mask, top_k, "comp_top_k_mask", il);
+                if (sel_mask->type != raw_mask->type) {
+                    // the raw mask is F16 when flash attention is on
+                    sel_mask = ggml_cast(ctx0, sel_mask, raw_mask->type);
+                }
+                ggml_tensor * kq_mask  = ggml_concat(ctx0, raw_mask, sel_mask, 0);
+                cb(kq_mask, "comp_kq_mask", il);
+
+                out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, kq_scale, il);
+            }
         }
         if (k_rot) {
             out = dsv41_mul_mat_hadamard(ctx0, out, k_rot);
