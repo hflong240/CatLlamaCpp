@@ -3219,6 +3219,29 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_reconstruction()
             .run();
 
+        // Regression (leading-whitespace preservation): a string argument whose FIRST line is
+        // indented must keep its leading Tab. The tagged value is wrapped as
+        // "<parameter=code>\nVALUE\n</parameter>", so only the structural newlines may be
+        // stripped, never the value's own leading Tab. Previously the generic whitespace trim
+        // dropped the first Tab, yielding "if indented:" instead of "\tif indented:".
+        tst.test(
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "\tif indented:\n"
+               "\t\tpass\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({
+                python_tool
+        })
+            .expect_tool_calls({
+                { "python", "{\"code\": \"\\tif indented:\\n\\t\\tpass\"}", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
         // Test with code content (asian unicode chars)
         tst.test(
                "<tool_call>\n"

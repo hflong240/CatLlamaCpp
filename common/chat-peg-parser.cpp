@@ -32,6 +32,33 @@ static std::string_view trim_leading_space(std::string_view sv, int max = -1) {
     return sv;
 }
 
+// Strip at most one leading line break (one of "\r\n", "\n" or "\r"), and nothing else.
+// Tagged tool-call formats (e.g. Qwen3-Coder's "<parameter=NAME>\nVALUE\n</parameter>") wrap
+// argument values in structural newlines. Those must be removed, but spaces and tabs must be
+// preserved because they can be significant string content (e.g. source-code indentation).
+// Using the generic whitespace trimmers here would silently drop a value's leading Tab/space.
+static std::string_view trim_one_leading_linebreak(std::string_view sv) {
+    if (!sv.empty() && sv.front() == '\r') {
+        sv.remove_prefix(1);
+    }
+    if (!sv.empty() && sv.front() == '\n') {
+        sv.remove_prefix(1);
+    }
+    return sv;
+}
+
+// Strip at most one trailing line break (one of "\r\n", "\n" or "\r"), and nothing else.
+// Counterpart of trim_one_leading_linebreak; see that comment for the rationale.
+static std::string_view trim_one_trailing_linebreak(std::string_view sv) {
+    if (!sv.empty() && sv.back() == '\n') {
+        sv.remove_suffix(1);
+    }
+    if (!sv.empty() && sv.back() == '\r') {
+        sv.remove_suffix(1);
+    }
+    return sv;
+}
+
 static std::string_view trim(std::string_view sv) {
     return trim_trailing_space(trim_leading_space(sv, 1));
 }
@@ -363,7 +390,14 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
     }
 
     if ((is_arg_value || is_arg_string_value) && current_tool) {
-        std::string value_content = std::string(trim_trailing_space(trim_leading_space(node.text, 1), 1));
+        // Schema-declared string values must preserve significant leading/trailing whitespace
+        // (e.g. source-code indentation sent as a string argument): only strip the structural
+        // line break that tagged formats wrap the value in, never spaces or tabs. Non-string
+        // scalars/containers keep the original insignificant-whitespace trim so that value
+        // normalization (numbers, bools, lists, dicts) stays robust.
+        std::string value_content = is_arg_string_value
+            ? std::string(trim_one_trailing_linebreak(trim_one_leading_linebreak(node.text)))
+            : std::string(trim_trailing_space(trim_leading_space(node.text, 1), 1));
 
         std::string value_to_add;
         if (value_content.empty() && is_arg_string_value) {
