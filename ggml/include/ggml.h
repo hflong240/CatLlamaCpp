@@ -2669,9 +2669,21 @@ extern "C" {
     //        the GPU weighted-sum excludes them (the op uploads the modified weights + adds partial_host).
     //   returns: number of positions handled on the CPU (0 => lane inactive, op skips the add).
     //   gpu_skip_slot is unused by the weight-zeroing contract but kept for flexibility.
+    //   swiglu_limit: clamp the up projection to [-limit, limit] and the gate to (-inf, limit] before
+    //   silu(gate)*up (GLM5.3/DSV4 build_moe_ffn semantics). <= 0 means unclamped.
     typedef int (*ggml_moe_ffn_cpu_fn)(void * cache, const float * cur_host, float * weights_host,
                                        const int32_t * sel_host, int32_t * ids_host, float * partial_host,
-                                       int n_used, int n_tokens, int n_embd, int n_ff, int gpu_skip_slot);
+                                       int n_used, int n_tokens, int n_embd, int n_ff, int gpu_skip_slot,
+                                       float swiglu_limit);
+
+    // Fork-internal op_params layout of GGML_OP_MOE_FFN; shared by ggml.c (writer) and the CUDA op
+    // (reader) so the two cannot drift apart.
+    typedef struct ggml_moe_ffn_params {
+        ggml_moe_ffn_sync_fn sync_fn;
+        ggml_moe_ffn_cpu_fn  cpu_fn;
+        void               * cache;
+        float                swiglu_limit;
+    } ggml_moe_ffn_params;
 
     GGML_API struct ggml_tensor * ggml_moe_ffn(
             struct ggml_context * ctx,
@@ -2683,7 +2695,8 @@ extern "C" {
             struct ggml_tensor  * down_dev,   // [n_ff, n_embd, n_slots] cache down proj
             ggml_moe_ffn_sync_fn  sync_fn,    // host residency/sync-load callback
             ggml_moe_ffn_cpu_fn   cpu_fn,     // optional CPU expert lane (nullptr = off)
-            void                * cache);     // llama_moe_layer_cache*
+            void                * cache,      // llama_moe_layer_cache*
+            float                 swiglu_limit); // up/gate clamp, <= 0 = none (see build_moe_ffn)
 
     // fork: fused Sinkhorn normalisation. `a` is a contiguous [hc, hc, n_tokens] f32 tensor. Runs a softmax
     // over dim 0, adds eps, then one column normalisation followed by (n_iter - 1) row/column pairs, adding

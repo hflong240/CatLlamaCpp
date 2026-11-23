@@ -6146,15 +6146,16 @@ struct ggml_tensor * ggml_moe_ffn(
         struct ggml_tensor  * down_dev,
         ggml_moe_ffn_sync_fn  sync_fn,
         ggml_moe_ffn_cpu_fn   cpu_fn,
-        void                * cache) {
+        void                * cache,
+        float                 swiglu_limit) {
     GGML_ASSERT(cur && sel && gate_dev && up_dev && down_dev);
     // output is [n_embd, n_tokens] - n_embd is the down proj's output dim (down_dev->ne[1])
     const int64_t n_embd   = down_dev->ne[1];
     const int64_t n_tokens = cur->ne[1];
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
 
-    // stash {sync_fn, cpu_fn, cache} in op_params (3 pointers = 24 bytes, fits GGML_MAX_OP_PARAMS = 64)
-    void * params[3] = { (void *) sync_fn, (void *) cpu_fn, cache };
+    // stash the callback pointers + clamp in op_params (fits GGML_MAX_OP_PARAMS = 64)
+    const ggml_moe_ffn_params params = { sync_fn, cpu_fn, cache, swiglu_limit };
     ggml_set_op_params(result, &params, sizeof(params));
 
     result->op     = GGML_OP_MOE_FFN;

@@ -15,9 +15,12 @@ LLM inference in C/C++
 > [!NOTE]
 > This is the **CatEngine** fork of `llama.cpp`. In addition to everything upstream provides, it adds
 > **on-demand MoE expert streaming from disk** (run Mixture-of-Experts models whose expert weights are
-> far larger than your VRAM/RAM) and support for the **DeepSeek-V4-Flash (`deepseek4`)**, **DeepSeek-V4.1-Flash
-> (`deepseek41`)**, and **Hunyuan-v3 (`hy_v3`)** architectures. See
-> [CatEngine fork additions](#catengine-fork-additions) below. All upstream functionality is unchanged.
+> far larger than your VRAM/RAM), support for the **DeepSeek-V4-Flash (`deepseek4`)**, **DeepSeek-V4.1-Flash
+> (`deepseek41`)**, and **Hunyuan-v3 (`hy_v3`)** architectures, and **remote speculative drafting**
+> (`draft-remote`, run the draft model on a second machine over the network). See
+> [CatEngine fork additions](#catengine-fork-additions) and
+> [Remote speculative draft model](#remote-speculative-draft-model-draft-remote) below. All upstream
+> functionality is unchanged.
 
 ## CatEngine fork additions
 
@@ -35,6 +38,10 @@ split name, so link `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` as
 `...-IQ2_XXS-00006-of-00006.gguf` next to the other shards (a hardlink works on NTFS and avoids copying
 110 GB). The tables are mmap'd and read lazily, one block of rows per token; do not use `--no-mmap`, which
 would force the whole table into RAM.
+
+On top of upstream speculative decoding, the fork can also run the draft model on a second machine over the
+network (`draft-remote`), keeping the target model and verification local. See
+[Remote speculative draft model](#remote-speculative-draft-model-draft-remote).
 
 ### Technical background
 
@@ -226,6 +233,76 @@ Caveats:
   (~1.7x) swamps the effect. Prefer counters (node counts, device syncs, bytes moved) over tok/s below ~1.1x.
 - Expert LoRA is not applied on the streamed path.
 - These features are a fork-local addition and are **not** proposed upstream.
+
+## Remote speculative draft model (`draft-remote`)
+
+The fork can run the speculative-decoding **draft model on a different machine** while the target model and the
+verification stay local. The draft model's weights, KV cache and compute live on the second machine, so the
+target machine reserves no VRAM for it. The two sides only exchange token ids over HTTP: no weights and no
+logits cross the network. They do not need the same OS or GPU vendor - for example a macOS/Metal draft server
+with a Windows/CUDA target works.
+
+This is useful when a separate draft model with the target's vocab exists (for example a small Qwen variant
+drafting a larger Qwen MoE). MTP heads are not supported here: they consume the target model's hidden states
+and must stay next to the target model.
+
+### Build
+
+Both machines build the same fork. The draft machine only needs the `llama-draft-server` target:
+
+```sh
+# draft machine (macOS + Metal shown; Linux/Windows work the same way)
+cmake -B build -DGGML_METAL=ON
+cmake --build build --target llama-draft-server -j
+
+# target machine
+cmake -B build -DGGML_CUDA=ON
+cmake --build build --target llama-server -j
+```
+
+The draft server does not require `LLAMA_BUILD_SERVER`, its HTTP server, or the UI.
+
+### Run
+
+Draft machine (for example a Mac mini on the LAN):
+
+```sh
+./build/bin/llama-draft-server -m draft.gguf -c 65536 -np 1 -ngl 99 --host 0.0.0.0 --port 8081
+```
+
+Target machine:
+
+```sh
+llama-server -m target.gguf -c 65536 -np 1 --spec-draft-remote 192.168.1.20:8081 -fit off
+```
+
+`--spec-draft-remote` implies `--spec-type draft-remote`. `--spec-draft-n-max`, `--spec-draft-n-min` and
+`--spec-draft-p-min` work as usual; the draft server applies the same top-k/p-min early-stop rule as a local
+draft model.
+
+### Requirements and caveats
+
+- **Same vocab.** The draft server fingerprints its vocab (size, type, BOS/EOS and token texts) and the target
+  rejects it on any mismatch; the draft GGUF must use the target model's tokenizer.
+- **Matching sequence geometry.** `-c` and `-np` must give the same per-sequence context on both sides
+  (`n_ctx / n_parallel`), and the draft server must expose at least as many sequences as the target's `-np`.
+- **Partial KV removal.** The draft context must support removing a partial sequence (standard attention KV
+  caches do); the server refuses to start otherwise.
+- **Text-only.** Multimodal prompts are skipped (no remote draft) because image placeholders break the
+  token/position mapping.
+- **Latency.** Draft generation is on the critical path: each round is one LAN round trip plus the draft
+  model's compute, and it does not overlap the target verify yet. Wired Ethernet is recommended.
+- **First draft of a request** pays a prompt prefill on the draft server. The server reuses the longest common
+  token prefix, so repeated and multi-turn prompts only pay for the new suffix.
+- **State recovery.** The target hashes the full token prefix on every draft; a context shift or slot reuse
+  that changes it makes the server replay the prompt instead of silently using a stale KV.
+- **Failure handling.** If the draft server is unreachable, the target logs the error and disables remote
+  drafting after 3 consecutive failures; generation continues without speculation. Restart the target after
+  fixing or starting the draft server.
+- **Security.** The protocol has no authentication; run it on a trusted LAN only and do not expose the port.
+  Use one draft server per target server, because sequences are addressed by slot id.
+
+Details and the wire protocol are in [docs/speculative.md](docs/speculative.md).
 
 ## Recent API changes
 

@@ -2953,12 +2953,18 @@ static void ggml_cuda_op_hc_sinkhorn(ggml_backend_cuda_context & ctx, ggml_tenso
 // op: host callback plans residency + sync-loads missing experts, then gate/up + SwiGLU + down + weighted
 // sum all run on the op's stream. Reuses the static ggml_cuda_mul_mat_id for the three expert matmuls.
 
-// silu(gate) * up, elementwise over [n_ff, n_used, n_tokens]
-static __global__ void k_moe_swiglu(const float * gate, const float * up, float * dst, int64_t n) {
+// silu(gate) * up, elementwise over [n_ff, n_used, n_tokens]. limit > 0 applies the GLM5.3/DSV4
+// clamp: up to [-limit, limit], gate to (-inf, limit].
+static __global__ void k_moe_swiglu(const float * gate, const float * up, float * dst, int64_t n, float limit) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) { return; }
-    const float g = gate[i];
-    dst[i] = (g / (1.0f + expf(-g))) * up[i];
+    float g = gate[i];
+    float u = up[i];
+    if (limit > 0.0f) {
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+    }
+    dst[i] = (g / (1.0f + expf(-g))) * u;
 }
 
 // weighted sum over the expert dim: out[e_out, t] = sum_u down[e_out, u, t] * w[u, t]
@@ -2991,11 +2997,12 @@ static void ggml_cuda_op_moe_ffn(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_tensor *       up_dev   = dst->src[4]; // [n_embd, n_ff, n_slots]
     ggml_tensor *       down_dev = dst->src[5]; // [n_ff, n_embd, n_slots]
 
-    void * pp[3];
-    memcpy(pp, dst->op_params, sizeof(pp));
-    ggml_moe_ffn_sync_fn sync_fn = (ggml_moe_ffn_sync_fn) pp[0];
-    ggml_moe_ffn_cpu_fn  cpu_fn  = (ggml_moe_ffn_cpu_fn)  pp[1];
-    void *               cache   = pp[2];
+    ggml_moe_ffn_params pp;
+    memcpy(&pp, dst->op_params, sizeof(pp));
+    ggml_moe_ffn_sync_fn sync_fn      = pp.sync_fn;
+    ggml_moe_ffn_cpu_fn  cpu_fn       = pp.cpu_fn;
+    void *               cache        = pp.cache;
+    const float          swiglu_limit = pp.swiglu_limit;
 
     GGML_ASSERT(cur->type == GGML_TYPE_F32 && sel->type == GGML_TYPE_I32);
     GGML_ASSERT(sync_fn != nullptr);
@@ -3061,7 +3068,7 @@ static void ggml_cuda_op_moe_ffn(ggml_backend_cuda_context & ctx, ggml_tensor * 
         cpu_thread = std::thread([&, gpu_skip_slot]() {
             cpu_handled = cpu_fn(cache, cur_host.data(), w_host.data(), sel_host.data(), ids_host.data(),
                                  cpu_partial.data(), (int) n_used, (int) n_tokens, (int) n_embd, (int) n_ff,
-                                 gpu_skip_slot);
+                                 gpu_skip_slot, swiglu_limit);
         });
     }
 
@@ -3117,7 +3124,7 @@ static void ggml_cuda_op_moe_ffn(ggml_backend_cuda_context & ctx, ggml_tensor * 
     {
         const int64_t nthreads = 256;
         const int64_t nblocks  = (n_gu + nthreads - 1) / nthreads;
-        k_moe_swiglu<<<nblocks, nthreads, 0, stream>>>(gate_out.get(), up_out.get(), act.get(), n_gu);
+        k_moe_swiglu<<<nblocks, nthreads, 0, stream>>>(gate_out.get(), up_out.get(), act.get(), n_gu, swiglu_limit);
         CUDA_CHECK(cudaGetLastError());
     }
 

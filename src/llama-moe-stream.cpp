@@ -5332,7 +5332,7 @@ ggml_moe_ffn_sync_fn llama_moe_layer_cache_sync_fn(void) {
 // RAM pool, compute the FULL FFN on the CPU with ggml's AVX2 quantized vec_dot - no H2D upload, no VRAM
 // slot - and accumulate its weighted contribution into partial_host. Zeroes the router weight of every
 // handled position so the GPU weighted-sum excludes it (the caller uploads the modified weights and adds
-// partial_host). Byte-identical math to the GPU path (same quantized weights, q8_K-quantized activations,
+// partial_host). Math matches the GPU path (same quantized weights, activations quantized to vec_dot_type,
 // silu(gate)*up). Threaded across (position) jobs. Returns the number of positions handled.
 //
 // Layout (verified): gate/up expert slab = n_ff rows of n_embd quantized elems; down slab = n_embd rows
@@ -5434,9 +5434,20 @@ static llama_moe_lane_pool * llama_moe_lane_pool_get() {
     return pool;
 }
 
+// Expert SwiGLU as the graph builds it for GLM5.3/DSV4 (llama-graph.cpp): clamp the up projection to
+// [-limit, limit], the gate to (-inf, limit], then silu(gate) * up. limit <= 0 means unclamped.
+static inline float llama_moe_swiglu(float g, float u, float limit) {
+    if (limit > 0.0f) {
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+    }
+    return (g / (1.0f + expf(-g))) * u;
+}
+
 static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weights_host,
                               const int32_t * sel_host, int32_t * /*ids_host*/, float * partial_host,
-                              int n_used, int n_tokens, int n_embd, int n_ff, int /*gpu_skip_slot*/) {
+                              int n_used, int n_tokens, int n_embd, int n_ff, int /*gpu_skip_slot*/,
+                              float swiglu_limit) {
     llama_moe_layer_cache * c = (llama_moe_layer_cache *) cache;
     if (!c || c->proj.size() < 3) { return 0; }
 
@@ -5455,10 +5466,13 @@ static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weig
     if (!tt_gu || !tt_gu->vec_dot || !tt_dn || !tt_dn->vec_dot) { return 0; }
     const ggml_type gu_vdt = tt_gu->vec_dot_type; // activation quant type for gate/up dots
     const ggml_type dn_vdt = tt_dn->vec_dot_type; // activation quant type for down dots
-    // IQ1_M/IQ1_S/IQ2_* have vec_dot but no from_float of their own: the activation is quantized to
-    // their vec_dot_type, so borrow that type's quantizer.
-    const auto * tt_gu_act = tt_gu->from_float ? tt_gu : ggml_get_type_traits_cpu(gu_vdt);
-    const auto * tt_dn_act = tt_dn->from_float ? tt_dn : ggml_get_type_traits_cpu(dn_vdt);
+    // Activations are always quantized to `vec_dot_type`, never to the weight type: a type's from_float
+    // turns f32 into its OWN block format (quantize_row_q4_K -> block_q4_K), while vec_dot reads the
+    // second operand as vec_dot_type (Q8_K here). Using the weight type's from_float fed Q4_K/IQ4_XS
+    // bytes to a Q8_K reader and corrupted every CPU-lane contribution. ggml-cpu's mul_mat does the
+    // same (type_traits_cpu[vec_dot_type].from_float).
+    const auto * tt_gu_act = ggml_get_type_traits_cpu(gu_vdt);
+    const auto * tt_dn_act = ggml_get_type_traits_cpu(dn_vdt);
     if (!tt_gu_act || !tt_gu_act->from_float || !tt_dn_act || !tt_dn_act->from_float) { return 0; }
 
     const size_t gu_rowbytes = ggml_row_size(wtype, n_embd); // one gate/up weight row (n_embd elems)
@@ -5476,29 +5490,35 @@ static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weig
         if (gate_pr.ram == nullptr) { return 0; } // RAM tier off => nothing to do on the CPU
         for (int t = 0; t < n_tokens; ++t) {
             for (int u = 0; u < n_used; ++u) {
-                const int32_t e = sel_host[(size_t) (t * n_used + u)];
+                const size_t wi = (size_t) (t * n_used + u);
+                const int32_t e = sel_host[wi];
                 if (e < 0 || e >= c->n_expert) { continue; }
                 const int32_t rs = c->ram_slot[(size_t) e];
-                if (rs < 0) { continue; } // not RAM-resident => leave it to the GPU
                 if (h2d_only) {
                     if ((int) c->cpu_h2d_skip.size() != c->n_expert || !c->cpu_h2d_skip[(size_t) e]) {
                         continue; // this position was H2D-loaded (or is a VRAM hit): leave it to the GPU
                     }
                     g_cpu_lane_mask.fetch_add(1, std::memory_order_relaxed);
                     if (rs < 0) {
+                        // The remap already skipped this expert's H2D, so the GPU will serve a sentinel or
+                        // a stale donor. Drop the position explicitly instead of applying a wrong expert
+                        // at full router weight.
                         g_cpu_lane_missing.fetch_add(1, std::memory_order_relaxed);
-                        continue; // RAM slot evicted before the lane ran: the load skip already happened
+                        weights_host[wi] = 0.0f;
+                        continue;
                     }
+                } else if (rs < 0) {
+                    continue; // not RAM-resident => leave it to the GPU
                 }
                 Job j;
                 j.t = t; j.u = u; j.e = e;
-                j.w = weights_host[(size_t) (t * n_used + u)];
+                j.w = weights_host[wi];
                 j.gate = (const char *) gate_pr.ram + (size_t) rs * gate_pr.stride;
                 j.up   = (const char *) up_pr.ram   + (size_t) rs * up_pr.stride;
                 j.down = (const char *) down_pr.ram + (size_t) rs * down_pr.stride;
                 jobs.push_back(j);
                 g_cpu_lane_jobs.fetch_add(1, std::memory_order_relaxed);
-                weights_host[(size_t) (t * n_used + u)] = 0.0f; // GPU sum excludes this position
+                weights_host[wi] = 0.0f; // GPU sum excludes this position
             }
         }
     }
@@ -5540,8 +5560,7 @@ static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weig
                     float g = 0.0f, u = 0.0f;
                     tt_gu->vec_dot(n_embd, &g, 0, j.gate + (size_t) f * gu_rowbytes, 0, xq.data(), 0, 1);
                     tt_gu->vec_dot(n_embd, &u, 0, j.up   + (size_t) f * gu_rowbytes, 0, xq.data(), 0, 1);
-                    const float s = g / (1.0f + expf(-g));
-                    mid[(size_t) f] = s * u;
+                    mid[(size_t) f] = llama_moe_swiglu(g, u, swiglu_limit);
                 }
                 bar.wait();
                 if (tid == 0) {
@@ -5566,8 +5585,8 @@ static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weig
 
     auto worker = [&](int tid) {
         // per-thread scratch: quantized input row (shared across a token's experts), gate/up/mid buffers
-        std::vector<char>  xq(act_gu_bytes);   // q8_K of the token's n_embd input
-        std::vector<char>  midq(act_dn_bytes); // q8_K of the n_ff intermediate
+        std::vector<char>  xq(act_gu_bytes);   // activation row (vec_dot_type) of the n_embd input
+        std::vector<char>  midq(act_dn_bytes); // activation row (vec_dot_type) of the n_ff intermediate
         std::vector<float> mid((size_t) n_ff);
         std::vector<float> out((size_t) n_embd);
         int last_t = -1;
@@ -5584,8 +5603,7 @@ static int llama_moe_cpu_lane(void * cache, const float * cur_host, float * weig
                 float g = 0.0f, u = 0.0f;
                 tt_gu->vec_dot(n_embd, &g, 0, j.gate + (size_t) f * gu_rowbytes, 0, xq.data(), 0, 1);
                 tt_gu->vec_dot(n_embd, &u, 0, j.up   + (size_t) f * gu_rowbytes, 0, xq.data(), 0, 1);
-                const float s = g / (1.0f + expf(-g)); // silu(gate)
-                mid[(size_t) f] = s * u;
+                mid[(size_t) f] = llama_moe_swiglu(g, u, swiglu_limit);
             }
             // quantize the intermediate to the down dot type
             tt_dn_act->from_float(mid.data(), midq.data(), n_ff);

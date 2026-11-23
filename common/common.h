@@ -166,6 +166,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE,  // draft model running on a remote llama-draft-server
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -309,6 +310,9 @@ struct common_params_speculative_draft {
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;
+
+    // endpoint (host:port) of a remote llama-draft-server; used by the draft-remote implementation
+    std::string remote_endpoint;
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;

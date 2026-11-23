@@ -2,6 +2,7 @@
 #include "common.h"
 #include "download.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -131,6 +132,13 @@ int main(void) {
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
+
+    // --spec-draft-remote implies the draft-remote implementation
+    argv = {"binary_name", "--spec-draft-remote", "127.0.0.1:8081"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.draft.remote_endpoint == "127.0.0.1:8081");
+    assert(std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                     COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE) != params.speculative.types.end());
 
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};

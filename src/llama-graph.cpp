@@ -2230,7 +2230,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // identical and removes the per-layer scheduler split, but measured decode is ~20% slower because the
     // fused op serializes the expert load with compute, losing the load//compute overlap the split gave on
     // this disk/H2D-bound path).
-    if (moe_lc && moe_stream_async && n_tokens <= 1 &&
+    // The per-projection path below clamps the SwiGLU operands for GLM5.3/DSV4 when the GGUF carries a
+    // swiglu_clamp; the fused op folds the same clamp in, so pass the limit through instead of dropping
+    // it. Archs whose clamp happens AFTER silu (step35/dflash) are not foldable: keep them unfused.
+    const float moe_swiglu_limit  = (il >= 0) ? hparams.swiglu_clamp_exp[il] : 0.0f;
+    const bool  moe_clamp_foldable = moe_swiglu_limit <= 1e-6f ||
+            arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5NEXT;
+
+    if (moe_lc && moe_stream_async && n_tokens <= 1 && moe_clamp_foldable &&
         moe_env_on("LLAMA_MOE_FUSED", false) && llama_moe_layer_cache_backend_is_cuda(moe_lc) &&
         gate_exps && up_exps && down_exps && !gate_up_exps &&
         !gate_exps_b && !up_exps_b && !down_exps_b &&
@@ -2247,7 +2254,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_moe_ffn_cpu_fn cpu_fn = cpu_lane ? llama_moe_layer_cache_cpu_fn() : nullptr;
             ggml_tensor * fused = ggml_moe_ffn(ctx0, cur, selected_experts, weights,
                                                gate_d, up_d, down_d,
-                                               llama_moe_layer_cache_sync_fn(), cpu_fn, moe_lc);
+                                               llama_moe_layer_cache_sync_fn(), cpu_fn, moe_lc,
+                                               moe_swiglu_limit > 1e-6f ? moe_swiglu_limit : 0.0f);
             cb(fused, "ffn_moe_out", il);
             return fused;
         }

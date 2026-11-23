@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "ggml.h"
+#include "http.h"
 #include "llama.h"
 #include "log.h"
 #include "ngram-cache.h"
@@ -11,12 +12,18 @@
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <memory>
+#include <vector>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -30,7 +37,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"draft-remote",  COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -43,6 +51,56 @@ static std::string common_speculative_get_devices_str(const std::vector<ggml_bac
         result += ggml_backend_dev_name(devices[i]);
     }
     return result.empty() ? "default" : result;
+}
+
+static constexpr uint64_t SPEC_HASH_OFFSET = 14695981039346656037ull;
+static constexpr uint64_t SPEC_HASH_PRIME  = 1099511628211ull;
+
+common_speculative_vocab_info common_speculative_get_vocab_info(const llama_vocab * vocab) {
+    const int32_t n_vocab = (int32_t) llama_vocab_n_tokens(vocab);
+
+    uint64_t hash = SPEC_HASH_OFFSET;
+    for (int32_t i = SPEC_VOCAB_CHECK_START_TOKEN_ID; i < n_vocab; ++i) {
+        const char * text = llama_vocab_get_text(vocab, i);
+        const size_t len = text ? std::strlen(text) : 0;
+
+        // mix the length so that token boundaries are unambiguous
+        hash ^= (uint64_t) len;
+        hash *= SPEC_HASH_PRIME;
+        for (size_t j = 0; j < len; ++j) {
+            hash ^= (uint8_t) text[j];
+            hash *= SPEC_HASH_PRIME;
+        }
+    }
+
+    return {
+        /* .n_vocab    = */ n_vocab,
+        /* .vocab_type = */ (int32_t) llama_vocab_type(vocab),
+        /* .add_bos    = */ llama_vocab_get_add_bos(vocab),
+        /* .bos        = */ llama_vocab_bos(vocab),
+        /* .add_eos    = */ llama_vocab_get_add_eos(vocab),
+        /* .eos        = */ llama_vocab_eos(vocab),
+        /* .token_hash = */ hash,
+    };
+}
+
+uint64_t common_speculative_tokens_hash(const llama_token * tokens, size_t n, size_t n_window) {
+    uint64_t hash = SPEC_HASH_OFFSET;
+    if (tokens == nullptr || n == 0 || n_window == 0) {
+        return hash;
+    }
+
+    const size_t n_hash = std::min(n, n_window);
+    const llama_token * beg = tokens + (n - n_hash);
+    for (size_t i = 0; i < n_hash; ++i) {
+        const uint32_t v = (uint32_t) beg[i];
+        for (int b = 0; b < 4; ++b) {
+            hash ^= (uint8_t) (v >> (8*b));
+            hash *= SPEC_HASH_PRIME;
+        }
+    }
+
+    return hash;
 }
 
 struct common_speculative_config {
@@ -786,6 +844,348 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 };
 
+std::string common_speculative_hash_to_hex(uint64_t hash) {
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%016" PRIx64, hash);
+    return std::string(buf);
+}
+
+// draft model running on a remote llama-draft-server
+//
+// the remote side keeps its own KV cache and advances it from the `n_past` and
+// `id_last` values sent with each request; the local side only receives tokens
+struct common_speculative_impl_draft_remote : public common_speculative_impl {
+    common_params_speculative_draft params;
+
+    std::unique_ptr<httplib::Client> cli;
+
+    bool disabled = false;
+    bool warned_prompt_mismatch = false;
+    int  n_fail = 0;
+
+    struct seq_state {
+        bool need_reset = true;
+    };
+
+    std::vector<seq_state> states;
+
+    common_speculative_vocab_info vocab_tgt{};
+
+    int32_t n_vocab = 0;
+
+    struct draft_result {
+        bool ok         = false;
+        bool need_reset = false;
+        llama_tokens tokens;
+    };
+
+    common_speculative_impl_draft_remote(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE, n_seq)
+        , params(params.draft)
+    {
+        LOG_INF("%s: adding speculative implementation 'draft-remote'\n", __func__);
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, endpoint=%s\n", __func__,
+                this->params.n_max, this->params.n_min, this->params.p_min, this->params.remote_endpoint.c_str());
+
+        states.resize(n_seq);
+
+        if (this->params.remote_endpoint.empty()) {
+            LOG_ERR("%s: no remote endpoint specified, disabling remote drafting\n", __func__);
+            disabled = true;
+            return;
+        }
+
+        if (this->params.ctx_tgt == nullptr) {
+            LOG_ERR("%s: target context is not available, disabling remote drafting\n", __func__);
+            disabled = true;
+            return;
+        }
+
+        const llama_model * model_tgt = llama_get_model(this->params.ctx_tgt);
+        vocab_tgt = common_speculative_get_vocab_info(llama_model_get_vocab(model_tgt));
+        n_vocab = vocab_tgt.n_vocab;
+    }
+
+    bool ensure_connected() {
+        if (cli) {
+            return true;
+        }
+        if (disabled) {
+            return false;
+        }
+
+        std::string url = params.remote_endpoint;
+        if (url.find("://") == std::string::npos) {
+            url = "http://" + url;
+        }
+
+        try {
+            auto pair = common_http_client(url);
+
+            httplib::Client client = std::move(pair.first);
+            client.set_connection_timeout(2, 0);
+            client.set_read_timeout(10, 0);
+            client.set_write_timeout(10, 0);
+
+            auto res = client.Get("/props");
+            if (!res) {
+                LOG_ERR("%s: failed to reach remote draft server '%s': %s\n", __func__, url.c_str(),
+                        httplib::to_string(res.error()).c_str());
+                return false;
+            }
+            if (res->status != 200) {
+                LOG_ERR("%s: remote draft server '%s' returned HTTP %d\n", __func__, url.c_str(), res->status);
+                return false;
+            }
+
+            const nlohmann::json j = nlohmann::json::parse(res->body);
+
+            const int32_t v = j.value("v", 0);
+            if (v != 1) {
+                LOG_ERR("%s: unsupported remote draft protocol version %d\n", __func__, v);
+                return false;
+            }
+
+            const int32_t  n_vocab_remote    = j.value("n_vocab", -1);
+            const int32_t  vocab_type_remote = j.value("vocab_type", -1);
+            const uint64_t hash_remote       = std::strtoull(j.value("token_hash", std::string("0")).c_str(), nullptr, 16);
+
+            const bool compatible =
+                n_vocab_remote    == vocab_tgt.n_vocab &&
+                vocab_type_remote == vocab_tgt.vocab_type &&
+                j.value("add_bos", false) == vocab_tgt.add_bos &&
+                j.value("bos", -1)        == (int) vocab_tgt.bos &&
+                j.value("add_eos", false) == vocab_tgt.add_eos &&
+                j.value("eos", -1)        == (int) vocab_tgt.eos &&
+                hash_remote == vocab_tgt.token_hash;
+
+            if (!compatible) {
+                LOG_ERR("%s: the remote draft model vocab is incompatible with the target model\n", __func__);
+                LOG_ERR("%s: target: n_vocab=%d type=%d hash=%016" PRIx64 "; remote: n_vocab=%d type=%d hash=%016" PRIx64 "\n",
+                        __func__,
+                        vocab_tgt.n_vocab, vocab_tgt.vocab_type, vocab_tgt.token_hash,
+                        n_vocab_remote, vocab_type_remote, hash_remote);
+                return false;
+            }
+
+            const int32_t n_seq_max = j.value("n_seq_max", 0);
+            if (n_seq_max < (int32_t) n_seq) {
+                LOG_ERR("%s: remote draft server supports %d sequences, but %u are required\n", __func__, n_seq_max, n_seq);
+                return false;
+            }
+
+            const int32_t  n_ctx_seq     = j.value("n_ctx_seq", 0);
+            const uint32_t n_ctx_seq_tgt = llama_n_ctx_seq(params.ctx_tgt);
+            if (n_ctx_seq > 0 && n_ctx_seq < (int32_t) n_ctx_seq_tgt) {
+                LOG_WRN("%s: remote n_ctx_seq=%d is smaller than target n_ctx_seq=%u - long prompts will not draft\n",
+                        __func__, n_ctx_seq, n_ctx_seq_tgt);
+            }
+
+            cli = std::make_unique<httplib::Client>(std::move(client));
+
+            LOG_INF("%s: connected to remote draft server '%s' (n_ctx=%d, n_ctx_seq=%d, n_seq_max=%d)\n", __func__,
+                    url.c_str(), j.value("n_ctx", 0), n_ctx_seq, n_seq_max);
+            return true;
+        } catch (const std::exception & e) {
+            LOG_ERR("%s: failed to connect to remote draft server '%s': %s\n", __func__, url.c_str(), e.what());
+            return false;
+        }
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) states.size()) {
+            states[seq_id].need_reset = true;
+        }
+    }
+
+    bool process(const llama_batch & /*batch*/) override {
+        return true;
+    }
+
+    bool reset(llama_seq_id seq_id, const llama_tokens & prompt) {
+        nlohmann::json req;
+        req["seq"]    = seq_id;
+        req["tokens"] = prompt;
+
+        cli->set_read_timeout(120, 0);
+        auto res = cli->Post("/reset", req.dump(), "application/json");
+
+        if (!res) {
+            LOG_ERR("%s: reset failed for seq %d: %s\n", __func__, (int) seq_id, httplib::to_string(res.error()).c_str());
+            cli.reset();
+            return false;
+        }
+        cli->set_read_timeout(10, 0);
+        if (res->status != 200) {
+            LOG_ERR("%s: reset failed for seq %d: HTTP %d\n", __func__, (int) seq_id, res->status);
+            return false;
+        }
+
+        const nlohmann::json j = nlohmann::json::parse(res->body, nullptr, false);
+        if (j.is_discarded() || !j.value("ok", false)) {
+            const std::string err = j.is_discarded() ? "invalid response" : j.value("error", std::string("unknown"));
+            LOG_ERR("%s: reset rejected for seq %d: %s\n", __func__, (int) seq_id, err.c_str());
+            return false;
+        }
+
+        return true;
+    }
+
+    draft_result draft_request(llama_seq_id seq_id, const common_speculative_draft_params & dp, int32_t n_max) {
+        draft_result result;
+
+        nlohmann::json req;
+        req["seq"]         = seq_id;
+        req["n_past"]      = dp.n_past;
+        req["id_last"]     = dp.id_last;
+        req["n_max"]       = n_max;
+        req["n_min"]       = params.n_min;
+        req["p_min"]       = params.p_min;
+        // hash the full prefix: a tail-only window can miss middle-token removals from context shifts
+        req["prefix_hash"] = common_speculative_hash_to_hex(
+                common_speculative_tokens_hash(dp.prompt->data(), dp.prompt->size(), dp.prompt->size()));
+
+        auto res = cli->Post("/draft", req.dump(), "application/json");
+        if (!res) {
+            LOG_ERR("%s: draft request failed for seq %d: %s\n", __func__, (int) seq_id,
+                    httplib::to_string(res.error()).c_str());
+            cli.reset();
+            return result;
+        }
+        if (res->status != 200) {
+            LOG_ERR("%s: draft request failed for seq %d: HTTP %d\n", __func__, (int) seq_id, res->status);
+            return result;
+        }
+
+        const nlohmann::json j = nlohmann::json::parse(res->body, nullptr, false);
+        if (j.is_discarded()) {
+            LOG_ERR("%s: invalid draft response for seq %d\n", __func__, (int) seq_id);
+            return result;
+        }
+
+        if (!j.value("ok", false)) {
+            result.need_reset = j.value("need_reset", false);
+            if (!result.need_reset) {
+                const std::string err = j.value("error", std::string("unknown"));
+                LOG_ERR("%s: draft rejected for seq %d: %s\n", __func__, (int) seq_id, err.c_str());
+            }
+            return result;
+        }
+
+        result.ok = true;
+        if (j.contains("tokens")) {
+            for (const auto & id : j["tokens"]) {
+                result.tokens.push_back((llama_token) id.get<int32_t>());
+            }
+        }
+
+        return result;
+    }
+
+    void on_failure() {
+        if (++n_fail >= 3) {
+            disabled = true;
+            LOG_ERR("%s: too many remote draft failures, disabling remote drafting\n", __func__);
+        }
+    }
+
+    void on_success() {
+        n_fail = 0;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        if (disabled) {
+            return;
+        }
+
+        if (!ensure_connected()) {
+            on_failure();
+            return;
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+            auto & dp = dparams[seq_id];
+
+            if (!dp.drafting) {
+                continue;
+            }
+
+            if (dp.prompt == nullptr || dp.prompt->size() != (size_t) dp.n_past) {
+                // mtmd prompts drop LLAMA_TOKEN_NULL entries, so the text prompt no longer matches n_past
+                if (!warned_prompt_mismatch) {
+                    warned_prompt_mismatch = true;
+                    LOG_WRN("%s: prompt size does not match n_past (multimodal?), remote drafting is skipped\n", __func__);
+                }
+                continue;
+            }
+
+            int32_t n_max = params.n_max;
+            if (dp.n_max > 0) {
+                n_max = std::min(n_max, dp.n_max);
+            }
+            if (n_max <= 0) {
+                continue;
+            }
+
+            bool ok = false;
+
+            // one reset + retry per call
+            for (int attempt = 0; attempt < 2 && !ok; ++attempt) {
+                if (states[seq_id].need_reset) {
+                    if (!reset(seq_id, *dp.prompt)) {
+                        break;
+                    }
+                    states[seq_id].need_reset = false;
+                }
+
+                const draft_result res = draft_request(seq_id, dp, n_max);
+                if (res.need_reset) {
+                    states[seq_id].need_reset = true;
+                    continue;
+                }
+                if (!res.ok) {
+                    break;
+                }
+
+                auto & result = *dp.result;
+                result.clear();
+
+                for (const llama_token id : res.tokens) {
+                    if (id < 0 || id >= n_vocab) {
+                        LOG_ERR("%s: remote draft returned invalid token %d (n_vocab = %d)\n", __func__, (int) id, n_vocab);
+                        result.clear();
+                        break;
+                    }
+                    result.push_back(id);
+                }
+
+                if ((int32_t) result.size() > n_max) {
+                    result.resize(n_max);
+                }
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                }
+
+                ok = true;
+            }
+
+            if (ok) {
+                on_success();
+            } else {
+                on_failure();
+            }
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+        // noop
+    }
+
+    bool need_embd() const override {
+        return false;
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
@@ -1287,6 +1687,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE:  return "draft-remote";
         default:                                    return "unknown";
     }
 }
@@ -1351,6 +1752,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
                 break;
+            case COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE:
+                n_max = std::max(n_max, std::max(0, spec->draft.n_max));
+                break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
                 break;
@@ -1371,6 +1775,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
         bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
+        bool has_draft_remote = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE)) && !params.draft.remote_endpoint.empty();
 
         bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
         bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));
@@ -1378,8 +1783,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_map_k4v = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V));
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
+        if ((enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE)) && params.draft.remote_endpoint.empty()) {
+            LOG_WRN("%s: 'draft-remote' is enabled but no endpoint is set (use --spec-draft-remote HOST:PORT)\n", __func__);
+        }
+
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 10);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -1409,6 +1818,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         if (has_mtp) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
         }
+        if (has_draft_remote) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE, params));
+        }
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
@@ -1427,6 +1839,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_remote>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {

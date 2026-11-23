@@ -13,6 +13,45 @@ The `llama-server` application supports several implementations of speculative d
 A much smaller model (called the _draft model_) generates drafts.
 A draft model is the most used approach in speculative decoding.
 
+### Remote Draft Model (`draft-remote`)
+
+The draft model can run on another machine while the target model and the
+verification stay local. This saves the VRAM that the draft model would
+otherwise occupy on the target machine.
+
+The remote side runs `llama-draft-server`, which loads the draft model and
+serves draft tokens over HTTP. The local `llama-server` keeps its normal
+speculative verification loop and only receives tokens. The two sides only need
+TCP connectivity and do not share an OS or a GPU vendor; for example, the draft
+server can run on macOS with Metal while the target runs on Windows with CUDA.
+Only the draft model file has to exist on the remote machine - no weights are
+transferred at runtime.
+
+On the draft machine:
+
+```bash
+llama-draft-server -m draft.gguf -c 65536 -np 1 -ngl 99 --host 0.0.0.0 --port 8081
+```
+
+On the target machine:
+
+```bash
+llama-server -m target.gguf -c 65536 -np 1 --spec-draft-remote 192.168.1.20:8081 -fit off
+```
+
+Notes:
+
+- `--spec-draft-remote` implies `--spec-type draft-remote`.
+- The draft model vocab must match the target model exactly (size, type, BOS/EOS and token texts).
+- `-c` and `-np` on the draft server must match the target server: the usable per-sequence
+  context is `n_ctx / n_parallel` on both sides.
+- The draft server must support partial sequence removal (standard attention KV caches do).
+- Multimodal prompts are not supported by remote drafting; such requests fall back to no drafts.
+- The protocol has no authentication; run it on a trusted LAN only. Use one draft server
+  per target server, because sequences are addressed by slot id.
+- If the draft server is unreachable, the target server logs an error and disables remote
+  drafting after a few failed requests; generation continues normally.
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
@@ -122,6 +161,10 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
 --spec-draft-model, -md, --model-draft  FNAME
                                         draft model for speculative decoding (default: unused)
                                         (env: LLAMA_ARG_SPEC_DRAFT_MODEL)
+--spec-draft-remote                     HOST:PORT
+                                        run the draft model on a remote llama-draft-server
+                                        and receive draft tokens over HTTP (implies --spec-type draft-remote)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_REMOTE)
 --spec-draft-hf, -hfd, -hfrd, --hf-repo-draft  <user>/<model>[:quant]
                                         HuggingFace repository for the draft model
                                         (env: LLAMA_ARG_SPEC_DRAFT_HF_REPO)
@@ -247,6 +290,7 @@ Specifies a comma-separated list of speculative decoding types to use.
 |------|-------------|
 | `none` | No speculative decoding (default) |
 | `draft-simple` | Use a simple draft model for speculation |
+| `draft-remote` | Use a draft model running on a remote llama-draft-server |
 | `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model |
 | `ngram-cache` | Use n-gram cache lookup |
 | `ngram-simple` | Use simple n-gram pattern matching |

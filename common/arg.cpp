@@ -629,6 +629,14 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
 
+    // --spec-draft-remote implies the draft-remote implementation
+    if (!params.speculative.draft.remote_endpoint.empty()) {
+        auto & types = params.speculative.types;
+        if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE) == types.end()) {
+            types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE);
+        }
+    }
+
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
@@ -3741,6 +3749,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.path = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
+    add_opt(common_arg(
+        {"--spec-draft-remote"}, "HOST:PORT",
+        "run the draft model on a remote llama-draft-server and receive draft tokens over HTTP\n"
+        "implies --spec-type draft-remote",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.remote_endpoint = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_REMOTE"));
     add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",

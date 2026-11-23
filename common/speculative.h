@@ -23,6 +23,25 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 
+// vocabulary fingerprint used to verify that a remote draft model is compatible with the target model
+struct common_speculative_vocab_info {
+    int32_t     n_vocab;
+    int32_t     vocab_type;
+    bool        add_bos;
+    llama_token bos;
+    bool        add_eos;
+    llama_token eos;
+    uint64_t    token_hash;
+};
+
+common_speculative_vocab_info common_speculative_get_vocab_info(const llama_vocab * vocab);
+
+// FNV-1a hash over the last min(n, n_window) tokens
+uint64_t common_speculative_tokens_hash(const llama_token * tokens, size_t n, size_t n_window);
+
+// hex form used by the remote draft protocol
+std::string common_speculative_hash_to_hex(uint64_t hash);
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);

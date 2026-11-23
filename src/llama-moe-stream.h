@@ -179,7 +179,8 @@ llama_moe_ffn_sync_fn_t llama_moe_layer_cache_sync_fn(void);
 // returns it; pass to ggml_moe_ffn to compute RAM-resident experts on the CPU instead of the GPU.
 typedef int (*llama_moe_ffn_cpu_fn_t)(void * cache, const float * cur_host, float * weights_host,
                                       const int32_t * sel_host, int32_t * ids_host, float * partial_host,
-                                      int n_used, int n_tokens, int n_embd, int n_ff, int gpu_skip_slot);
+                                      int n_used, int n_tokens, int n_embd, int n_ff, int gpu_skip_slot,
+                                      float swiglu_limit);
 llama_moe_ffn_cpu_fn_t llama_moe_layer_cache_cpu_fn(void);
 
 //
