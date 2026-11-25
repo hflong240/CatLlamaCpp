@@ -88,6 +88,12 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    float * get_embeddings_layer_inp(uint32_t lid);
+    void    set_embeddings_layer_inp(uint32_t lid, bool enable);
+
+    // force the next decode to rebuild the compute graph (e.g. after installing external weights)
+    void require_reserve() { sched_need_reserve = true; }
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -223,6 +229,8 @@ private:
 
     void output_reorder();
 
+    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -287,6 +295,9 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // per-layer target features for dflash (one buffer per enabled layer)
+    std::vector<buffer_view<float>> embd_layer_inp;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

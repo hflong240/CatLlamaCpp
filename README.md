@@ -238,13 +238,18 @@ Caveats:
 
 The fork can run the speculative-decoding **draft model on a different machine** while the target model and the
 verification stay local. The draft model's weights, KV cache and compute live on the second machine, so the
-target machine reserves no VRAM for it. The two sides only exchange token ids over HTTP: no weights and no
-logits cross the network. They do not need the same OS or GPU vendor - for example a macOS/Metal draft server
-with a Windows/CUDA target works.
+target machine reserves no VRAM for it. They do not need the same OS or GPU vendor - for example a macOS/Metal
+draft server with a Windows/CUDA target works.
 
-This is useful when a separate draft model with the target's vocab exists (for example a small Qwen variant
-drafting a larger Qwen MoE). MTP heads are not supported here: they consume the target model's hidden states
-and must stay next to the target model.
+A regular draft model exchanges only token ids over HTTP: no weights and no logits cross the network. This is
+useful when a separate draft model with the target's vocab exists (for example a small Qwen variant drafting a
+larger Qwen MoE). MTP heads are not supported here: they consume the target model's hidden states and must stay
+next to the target model.
+
+A **DFlash/DSpark sidecar** is also supported. It has no token embeddings or output head of its own, so the
+target uploads its `tok_embd` and `output` tensors once at startup and streams the hidden states of the
+draft's `dflash.target_layers` with each draft request. The target must be a `deepseek41` model
+(for example DeepSeek-V4.1-Flash). See the notes below.
 
 ### Build
 
@@ -280,10 +285,26 @@ llama-server -m target.gguf -c 65536 -np 1 --spec-draft-remote 192.168.1.20:8081
 `--spec-draft-p-min` work as usual; the draft server applies the same top-k/p-min early-stop rule as a local
 draft model.
 
+For a DFlash/DSpark sidecar, start the draft server first and use `--fit off` on it:
+
+```sh
+# draft machine
+./build/bin/llama-draft-server -m dspark.gguf -c 65536 -np 1 -ngl 99 --fit off --host 0.0.0.0 --port 8081
+
+# target machine (deepseek41 target)
+llama-server -m target.gguf -c 65536 -np 1 --spec-draft-remote 192.168.1.20:8081 -fit off
+```
+
+The target uploads its `tok_embd` and `output` tensors once, then streams the target layer hidden states with
+each request. No target weights are needed on the draft machine in advance.
+
 ### Requirements and caveats
 
 - **Same vocab.** The draft server fingerprints its vocab (size, type, BOS/EOS and token texts) and the target
   rejects it on any mismatch; the draft GGUF must use the target model's tokenizer.
+- **DSpark target.** A DFlash/DSpark sidecar requires a `deepseek41` target and must be started before the
+  target server; the target sends the sidecar's `tok_embd` and `output` at startup. `--spec-draft-n-max` is
+  clamped to `dflash.block_size`, and `--spec-draft-p-min` uses the sidecar's confidence head when present.
 - **Matching sequence geometry.** `-c` and `-np` must give the same per-sequence context on both sides
   (`n_ctx / n_parallel`), and the draft server must expose at least as many sequences as the target's `-np`.
 - **Partial KV removal.** The draft context must support removing a partial sequence (standard attention KV

@@ -195,8 +195,14 @@ struct llama_hparams {
     // input embedding dimension (0 = use n_embd)
     uint32_t n_embd_inp_impl = 0;
 
+    // encoder input embedding dimension (0 = use n_embd_inp())
+    // e.g. dflash fuses target_layers * target_hidden features
+    uint32_t n_embd_inp_enc_impl = 0;
+
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
+
+    uint32_t dflash_block_size = 0;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
@@ -233,6 +239,7 @@ struct llama_hparams {
     uint32_t dsv4_o_lora_rank          = 0;
     uint32_t dsv4_hc_mult              = 0;
     uint32_t dsv4_hc_sinkhorn_iters    = 0;
+    bool     dsv4_hc_single_pass       = false;
     uint32_t dsv4_hash_layer_count     = 0;
     float    dsv4_compress_rope_base   = 0.0f;
     float    dsv4_hc_eps               = 0.0f;
@@ -357,6 +364,9 @@ struct llama_hparams {
 
     // dimension of main + auxiliary input embeddings
     uint32_t n_embd_inp() const;
+
+    // dimension of the encoder input (target feature fusion)
+    uint32_t n_embd_inp_enc() const;
 
     // dimension of output embeddings
     uint32_t n_embd_out() const;

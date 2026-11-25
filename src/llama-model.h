@@ -608,6 +608,22 @@ struct llama_model {
     struct ggml_tensor * hc_head_base  = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;
 
+    // dflash / dspark draft
+    struct ggml_tensor * fc                  = nullptr;
+    struct ggml_tensor * fc_s                = nullptr;
+    struct ggml_tensor * dspark_markov_w1    = nullptr;
+    struct ggml_tensor * dspark_markov_w2    = nullptr;
+    struct ggml_tensor * dspark_markov_w2_s  = nullptr;
+    struct ggml_tensor * dspark_conf_proj    = nullptr;
+    struct ggml_tensor * dspark_conf_proj_b  = nullptr;
+    std::vector<int32_t> target_layer_ids;
+
+    // external target weights for a remote dspark draft
+    struct ggml_tensor * tok_embd_ext = nullptr;
+    struct ggml_tensor * output_ext   = nullptr;
+    std::vector<struct ggml_context *>    ext_ctxs;
+    std::vector<struct ggml_backend_buffer *> ext_bufs;
+
     // classifier
     struct ggml_tensor * cls       = nullptr;
     struct ggml_tensor * cls_b     = nullptr;

@@ -102,3 +102,40 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+
+// dflash / dspark draft helpers
+LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
+LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+LLAMA_API uint32_t        llama_model_dflash_block_size (const struct llama_model * model);
+LLAMA_API uint32_t        llama_model_n_embd_inp_enc    (const struct llama_model * model);
+
+// install a target weight (tok_embd or output) into an external buffer of a draft model
+LLAMA_API bool llama_model_ext_weight_alloc(
+        struct llama_model * model,
+        const char * name,
+        int32_t type,
+        int64_t ne0,
+        int64_t ne1);
+LLAMA_API bool llama_model_ext_weight_set(
+        struct llama_model * model,
+        const char * name,
+        size_t offset,
+        const void * data,
+        size_t size);
+LLAMA_API bool llama_model_ext_weight_ready(
+        const struct llama_model * model,
+        const char * name);
+LLAMA_API bool llama_model_has_weight(
+        const struct llama_model * model,
+        const char * name);
+
+// fetch tok_embd / output of the target model for transfer to a remote draft
+LLAMA_API struct ggml_tensor * llama_model_get_ext_source(const struct llama_model * model, const char * name);
+
+
+// force a compute-graph rebuild on the next decode
+LLAMA_API void llama_context_require_reserve(struct llama_context * ctx);
+
+// target layer input extraction (DSV4.1 / dspark)
+LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
+LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);

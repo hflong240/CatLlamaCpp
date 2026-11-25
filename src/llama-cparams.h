@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <vector>
 
 #define LLAMA_MAX_SEQ 256
 
@@ -32,6 +33,9 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
+
+    // per-layer target feature extraction (dflash)
+    std::vector<bool> embeddings_layer_inp;
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;

@@ -480,6 +480,17 @@ static int64_t dsv41_dense_chunk_tokens(int64_t n_tok, int64_t n_comp) {
     return std::min(std::max<int64_t>(n_chunk, 1), n_tok);
 }
 
+// mean over the hc copies of the layer input [n_embd, hc, n_tokens]
+static ggml_tensor * dsv41_hc_mean(ggml_context * ctx0, ggml_tensor * x, int64_t n_embd, int64_t hc, int64_t n_tokens) {
+    ggml_tensor * acc = nullptr;
+    for (int64_t ih = 0; ih < hc; ++ih) {
+        ggml_tensor * xh = ggml_view_2d(ctx0, x, n_embd, n_tokens, x->nb[2], ih*x->nb[1]);
+        acc = acc ? ggml_add(ctx0, acc, xh) : ggml_cont(ctx0, xh);
+    }
+
+    return ggml_scale(ctx0, acc, 1.0f/float(hc));
+}
+
 ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         const llama_model_deepseek41 & model,
         llm_graph_input_dsv4 * inp_dsv4,
@@ -947,6 +958,13 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         if (e >= 0 && !engram_rows.empty()) {
             inpL = build_engram(model, inpL, engram_rows[e], engram_keep, il);
             cb(inpL, "engram_out", il);
+        }
+
+        // dflash target features: mean over the hc copies of the layer input
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = dsv41_hc_mean(ctx0, inpL, n_embd, hc, n_tokens);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }
 
         ggml_tensor * residual = inpL;

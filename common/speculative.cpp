@@ -1,5 +1,6 @@
 #include "speculative.h"
 
+#include "base64.hpp"
 #include "common.h"
 #include "ggml.h"
 #include "http.h"
@@ -19,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -873,6 +875,26 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
 
     int32_t n_vocab = 0;
 
+    // dflash / dspark remote sidecar
+    bool dspark = false;
+    bool weights_sent = false;
+    bool remote_weights_ready = false;
+
+    int32_t block_size = 0;
+    int32_t n_swa      = 0;
+    int32_t n_embd_tgt = 0;
+    int32_t feat_dim   = 0;
+
+    std::vector<int32_t> target_layers;
+
+    struct feat_row {
+        llama_pos pos = 0;
+        std::vector<float> data;
+        bool sent = false;
+    };
+
+    std::vector<std::deque<feat_row>> pending;
+
     struct draft_result {
         bool ok         = false;
         bool need_reset = false;
@@ -904,6 +926,14 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
         const llama_model * model_tgt = llama_get_model(this->params.ctx_tgt);
         vocab_tgt = common_speculative_get_vocab_info(llama_model_get_vocab(model_tgt));
         n_vocab = vocab_tgt.n_vocab;
+        n_embd_tgt = llama_model_n_embd(model_tgt);
+
+        pending.resize(n_seq);
+
+        // connect early: dflash needs the target layer inputs of the prompt itself
+        if (ensure_connected() && dspark) {
+            ensure_weights();
+        }
     }
 
     bool ensure_connected() {
@@ -976,7 +1006,56 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
 
             const int32_t  n_ctx_seq     = j.value("n_ctx_seq", 0);
             const uint32_t n_ctx_seq_tgt = llama_n_ctx_seq(params.ctx_tgt);
-            if (n_ctx_seq > 0 && n_ctx_seq < (int32_t) n_ctx_seq_tgt) {
+
+            dspark = j.value("dspark", false);
+            remote_weights_ready = j.value("weights_ready", false);
+            if (dspark) {
+                char arch[64] = {};
+                if (llama_model_meta_val_str(llama_get_model(params.ctx_tgt), "general.architecture", arch, sizeof(arch)) < 0 ||
+                        strcmp(arch, "deepseek41") != 0) {
+                    LOG_ERR("%s: dspark remote drafting requires a deepseek41 target, got '%s'\n", __func__, arch);
+                    dspark = false;
+                    return false;
+                }
+
+                const auto & df = j.at("dflash");
+                block_size = df.value("block_size", 0);
+                n_swa      = df.value("n_swa", 0);
+                feat_dim   = df.value("n_embd_inp_enc", 0);
+
+                target_layers.clear();
+                for (const auto & lid : df.at("target_layers")) {
+                    target_layers.push_back(lid.get<int32_t>());
+                }
+
+                if (block_size <= 0 || target_layers.empty() || feat_dim <= 0) {
+                    LOG_ERR("%s: invalid dspark metadata from the remote draft server\n", __func__);
+                    return false;
+                }
+                if ((int32_t) target_layers.size() * n_embd_tgt != feat_dim) {
+                    LOG_ERR("%s: target hidden size %d x %zu layers does not match the draft feature size %d\n",
+                            __func__, n_embd_tgt, target_layers.size(), feat_dim);
+                    return false;
+                }
+
+                for (const int32_t lid : target_layers) {
+                    if (lid < 0 || lid >= llama_model_n_layer(llama_get_model(params.ctx_tgt))) {
+                        LOG_ERR("%s: dspark target layer %d is out of range\n", __func__, lid);
+                        return false;
+                    }
+                    llama_set_embeddings_layer_inp(params.ctx_tgt, (uint32_t) lid, true);
+                }
+
+                std::string layers;
+                for (size_t i = 0; i < target_layers.size(); ++i) {
+                    layers += (i ? ", " : "") + std::to_string(target_layers[i]);
+                }
+                LOG_INF("%s: remote draft is dspark (block_size=%d, layers=[%s], n_swa=%d)\n",
+                        __func__, block_size, layers.c_str(), n_swa);
+
+                // feature payloads for a full window can be several MB
+                client.set_read_timeout(60, 0);
+            } else if (n_ctx_seq > 0 && n_ctx_seq < (int32_t) n_ctx_seq_tgt) {
                 LOG_WRN("%s: remote n_ctx_seq=%d is smaller than target n_ctx_seq=%u - long prompts will not draft\n",
                         __func__, n_ctx_seq, n_ctx_seq_tgt);
             }
@@ -992,17 +1071,159 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
         }
     }
 
+    bool ensure_weights() {
+        if (!dspark || weights_sent || remote_weights_ready) {
+            weights_sent = true;
+            return true;
+        }
+        if (!ensure_connected()) {
+            return false;
+        }
+
+        const llama_model * model_tgt = llama_get_model(params.ctx_tgt);
+
+        cli->set_read_timeout(600, 0);
+        cli->set_write_timeout(600, 0);
+
+        const size_t chunk = 32 * 1024 * 1024;
+
+        for (const char * name : { "tok_embd", "output" }) {
+            const ggml_tensor * t = llama_model_get_ext_source(model_tgt, name);
+            if (t == nullptr) {
+                LOG_ERR("%s: the target model has no '%s' tensor to send\n", __func__, name);
+                cli->set_read_timeout(60, 0);
+                cli->set_write_timeout(10, 0);
+                return false;
+            }
+
+            const size_t total = ggml_nbytes(t);
+            std::vector<char> buf;
+
+            for (size_t off = 0; off < total; off += chunk) {
+                const size_t n = std::min(chunk, total - off);
+                buf.resize(n);
+                ggml_backend_tensor_get(t, buf.data(), off, n);
+
+                const std::string url =
+                    std::string("/weights?name=") + name +
+                    "&type="   + std::to_string((int) t->type) +
+                    "&ne0="    + std::to_string(t->ne[0]) +
+                    "&ne1="    + std::to_string(t->ne[1]) +
+                    "&offset=" + std::to_string(off) +
+                    "&total="  + std::to_string(total);
+
+                if (off > 0 && off % (8 * chunk) == 0) {
+                    LOG_INF("%s: %s upload %.1f/%.1f MiB\n", __func__, name,
+                            off / 1024.0 / 1024.0, total / 1024.0 / 1024.0);
+                }
+
+                auto res = cli->Post(url, std::string(buf.data(), n), "application/octet-stream");
+                if (!res || res->status != 200) {
+                    LOG_ERR("%s: failed to send %s at offset %zu (HTTP %d)\n", __func__, name, off,
+                            res ? res->status : 0);
+                    cli->set_read_timeout(60, 0);
+                    cli->set_write_timeout(10, 0);
+                    return false;
+                }
+
+                const nlohmann::json j = nlohmann::json::parse(res->body, nullptr, false);
+                if (j.is_discarded() || !j.value("ok", false)) {
+                    LOG_ERR("%s: remote draft server rejected %s: %s\n", __func__, name,
+                            j.is_discarded() ? "invalid response" : j.value("error", std::string("unknown")).c_str());
+                    cli->set_read_timeout(60, 0);
+                    cli->set_write_timeout(10, 0);
+                    return false;
+                }
+            }
+
+            LOG_INF("%s: sent target %s (%.1f MiB)\n", __func__, name, total / 1024.0 / 1024.0);
+        }
+
+        cli->set_read_timeout(60, 0);
+        cli->set_write_timeout(10, 0);
+
+        weights_sent = true;
+        return true;
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
         if (seq_id >= 0 && seq_id < (llama_seq_id) states.size()) {
             states[seq_id].need_reset = true;
         }
+
+        if (dspark && !ensure_weights()) {
+            on_failure();
+        }
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & batch) override {
+        if (!dspark || disabled) {
+            return true;
+        }
+        if (batch.n_tokens <= 0 || batch.pos == nullptr || batch.seq_id == nullptr) {
+            return true;
+        }
+
+        const llama_model * model_tgt = llama_get_model(params.ctx_tgt);
+
+        // target layer inputs for this batch, one row per token
+        std::vector<const float *> layer_ptr;
+        layer_ptr.reserve(target_layers.size());
+
+        for (const int32_t lid : target_layers) {
+            const float * p = llama_get_embeddings_layer_inp(params.ctx_tgt, (uint32_t) lid);
+            if (p == nullptr) {
+                LOG_WRN("%s: target layer %d input is not available\n", __func__, lid);
+                return true;
+            }
+            layer_ptr.push_back(p);
+        }
+
+        const int32_t n_embd = llama_model_n_embd(model_tgt);
+        if (n_embd != n_embd_tgt) {
+            return true;
+        }
+
+        const size_t keep = (size_t) std::max(block_size, n_swa) + 16;
+
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            const llama_seq_id seq_id = batch.seq_id[i][0];
+            if (seq_id < 0 || seq_id >= (llama_seq_id) pending.size()) {
+                continue;
+            }
+
+            feat_row row;
+            row.pos = batch.pos[i];
+            row.data.resize((size_t) feat_dim);
+
+            for (size_t k = 0; k < layer_ptr.size(); ++k) {
+                std::memcpy(row.data.data() + k * (size_t) n_embd,
+                        layer_ptr[k] + (size_t) i * n_embd,
+                        (size_t) n_embd * sizeof(float));
+            }
+
+            auto & q = pending[seq_id];
+            q.push_back(std::move(row));
+
+            while (q.size() > keep) {
+                q.pop_front();
+            }
+        }
+
         return true;
     }
 
     bool reset(llama_seq_id seq_id, const llama_tokens & prompt) {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) pending.size()) {
+            auto & q = pending[seq_id];
+            while (!q.empty() && q.back().pos >= (llama_pos) prompt.size()) {
+                q.pop_back();
+            }
+            for (auto & row : q) {
+                row.sent = false;
+            }
+        }
+
         nlohmann::json req;
         req["seq"]    = seq_id;
         req["tokens"] = prompt;
@@ -1015,7 +1236,7 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
             cli.reset();
             return false;
         }
-        cli->set_read_timeout(10, 0);
+        cli->set_read_timeout(dspark ? 60 : 10, 0);
         if (res->status != 200) {
             LOG_ERR("%s: reset failed for seq %d: HTTP %d\n", __func__, (int) seq_id, res->status);
             return false;
@@ -1034,6 +1255,14 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
     draft_result draft_request(llama_seq_id seq_id, const common_speculative_draft_params & dp, int32_t n_max) {
         draft_result result;
 
+        if (dspark) {
+            if (!ensure_weights()) {
+                return result;
+            }
+            n_max = std::min(n_max, block_size);
+            cli->set_read_timeout(60, 0);
+        }
+
         nlohmann::json req;
         req["seq"]         = seq_id;
         req["n_past"]      = dp.n_past;
@@ -1044,6 +1273,36 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
         // hash the full prefix: a tail-only window can miss middle-token removals from context shifts
         req["prefix_hash"] = common_speculative_hash_to_hex(
                 common_speculative_tokens_hash(dp.prompt->data(), dp.prompt->size(), dp.prompt->size()));
+
+        if (dspark) {
+            auto & q = pending[seq_id];
+
+            while (!q.empty() && q.back().pos >= dp.n_past) {
+                q.pop_back();
+            }
+
+            std::vector<llama_pos> fpos;
+            std::string feat;
+
+            for (const auto & row : q) {
+                if (row.sent) {
+                    continue;
+                }
+                if (!fpos.empty() && row.pos != fpos.back() + 1) {
+                    // keep only the latest contiguous run; the draft cache cannot
+                    // represent gaps in the feature positions
+                    fpos.clear();
+                    feat.clear();
+                }
+                fpos.push_back(row.pos);
+                feat.append(reinterpret_cast<const char *>(row.data.data()), row.data.size() * sizeof(float));
+            }
+
+            if (!fpos.empty()) {
+                req["feat_pos"] = fpos;
+                req["feat"]     = base64::encode(feat.data(), feat.size());
+            }
+        }
 
         auto res = cli->Post("/draft", req.dump(), "application/json");
         if (!res) {
@@ -1076,6 +1335,14 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
         if (j.contains("tokens")) {
             for (const auto & id : j["tokens"]) {
                 result.tokens.push_back((llama_token) id.get<int32_t>());
+            }
+        }
+
+        if (dspark) {
+            for (auto & row : pending[seq_id]) {
+                if (row.pos < dp.n_past) {
+                    row.sent = true;
+                }
             }
         }
 

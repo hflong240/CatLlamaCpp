@@ -1189,6 +1189,11 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_h_nextn     = nullptr;
+
+    t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
+    std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1229,6 +1234,11 @@ void llm_graph_result::set_outputs() {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    for (size_t il = 0; il < t_layer_inp.size(); ++il) {
+        if (t_layer_inp[il] != nullptr) {
+            ggml_set_output(t_layer_inp[il]);
+        }
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {

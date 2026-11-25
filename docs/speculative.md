@@ -24,8 +24,12 @@ serves draft tokens over HTTP. The local `llama-server` keeps its normal
 speculative verification loop and only receives tokens. The two sides only need
 TCP connectivity and do not share an OS or a GPU vendor; for example, the draft
 server can run on macOS with Metal while the target runs on Windows with CUDA.
-Only the draft model file has to exist on the remote machine - no weights are
-transferred at runtime.
+
+For a regular draft model only token ids cross the network; the draft GGUF is
+the only file needed on the remote machine. A DFlash/DSpark sidecar additionally
+needs the target model's `tok_embd` and `output` tensors plus the target layer
+inputs at runtime. The target sends those weights once when it connects and then
+streams the layer inputs with each draft request - see the DSpark notes below.
 
 On the draft machine:
 
@@ -51,6 +55,45 @@ Notes:
   per target server, because sequences are addressed by slot id.
 - If the draft server is unreachable, the target server logs an error and disables remote
   drafting after a few failed requests; generation continues normally.
+
+#### DFlash / DSpark drafts
+
+A DFlash/DSpark sidecar (for example `dspark-DeepSeek-V4.1-Flash-1017-BF16.gguf`)
+has no token embeddings or output head of its own and consumes hidden states from
+specific target layers. `llama-draft-server` detects the sidecar from its GGUF
+metadata and switches to the extended protocol:
+
+```bash
+# draft machine, start this first
+llama-draft-server -m dspark.gguf -c 65536 -np 1 -ngl 99 --fit off --host 0.0.0.0 --port 8081
+
+# target machine (the target must be a deepseek41 model, e.g. DeepSeek-V4.1-Flash)
+llama-server -m target.gguf -c 65536 -np 1 --spec-draft-remote 192.168.1.20:8081 -fit off
+```
+
+- Both machines must run this fork revision. The target's `llama-server` is
+  what extracts the layer inputs, uploads `tok_embd`/`output` and streams the
+  features; the draft side only provides `llama-draft-server`.
+- The target uploads its `tok_embd` and `output` tensors once at startup (a few
+  hundred MiB to a few GiB depending on the target quantization), then streams
+  the hidden states of the draft's `dflash.target_layers` with each request.
+  The upload blocks the target server's startup; the draft server keeps the
+  tensors until it exits.
+- `-fit off` is required on the draft server: the external target weights are not
+  known during the fitting pass. (`llama-draft-server` now disables `-fit`
+  automatically for a dflash GGUF.)
+- Only a `deepseek41` target is supported. The target layer indices must be
+  inside the target model.
+- The draft server maps target positions into its own local range, so its `-c`
+  only needs to cover the sliding window plus the number of tokens generated in
+  one request - it does not need the target's prompt length. `-np` must still
+  match the target server.
+- `--spec-draft-n-max` is clamped to the draft's trained block size.
+  `--spec-draft-p-min` uses the sidecar's confidence head when present.
+- Unlike a regular remote draft, the first draft of each request pays for a full
+  window of target features (the draft only needs the sliding-window range, not
+  the whole prompt). Subsequent drafts in the same request send one feature row
+  per accepted token.
 
 ### n-gram Cache (`ngram-cache`)
 

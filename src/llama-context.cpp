@@ -199,6 +199,9 @@ llama_context::llama_context(
     // output_reserve() floors its request at n_seq_max, so a smaller cap would abort there
     cparams.n_outputs_max = std::max(cparams.n_outputs_max, cparams.n_seq_max);
 
+    cparams.embeddings_layer_inp.resize(model.hparams.n_layer() + 1, false);
+    embd_layer_inp.resize(model.hparams.n_layer() + 1);
+
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
@@ -997,6 +1000,14 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     }
 }
 
+float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
+    output_reorder();
+
+    GGML_ASSERT(lid < embd_layer_inp.size() && embd_layer_inp[lid].has_data());
+
+    return embd_layer_inp[lid].data;
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1182,6 +1193,15 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+}
+
+void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+    LLAMA_LOG_DEBUG("%s: lid = %u, enable = %d\n", __func__, lid, enable);
+
+    GGML_ASSERT(lid <= model.hparams.n_layer());
+
+    cparams.embeddings_layer_inp[lid] = enable;
+    sched_need_reserve = true;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1825,7 +1845,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const int64_t n_vocab = vocab.n_tokens();
     const bool mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
-    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
+    const bool enc_embd = !mtp_embd && batch_inp.embd && batch_inp.token == nullptr && hparams.n_embd_inp_enc_impl > 0;
+    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : (enc_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp());
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -2006,6 +2027,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
+
+        if (!cparams.embeddings_layer_inp.empty()) {
+            extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        }
 
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
@@ -2270,6 +2295,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_batch    = cparams.n_batch;
     const auto n_vocab    = vocab.n_tokens();
     const auto n_embd_out = hparams.n_embd_out();
+    const auto n_embd     = hparams.n_embd;
+
+    size_t embd_layer_inp_float_count = 0;
+    for (const bool enabled : cparams.embeddings_layer_inp) {
+        if (enabled) {
+            embd_layer_inp_float_count += (size_t) n_embd * n_batch;
+        }
+    }
 
     bool has_logits     = true;
     bool has_embd       = cparams.embeddings;
@@ -2309,8 +2342,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + backend_float_count) * sizeof(float) +
-        (                                               backend_token_count) * sizeof(llama_token);
+        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+        (                                                               backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2327,6 +2360,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             logits.data = nullptr;
             embd.data = nullptr;
             embd_nextn.data = nullptr;
+            for (auto & layer_inp : embd_layer_inp) {
+                layer_inp = {nullptr, 0};
+            }
         }
 
         auto * buft = ggml_backend_cpu_buffer_type();
@@ -2357,6 +2393,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
     offset += embd_nextn.size * sizeof(float);
+
+    for (size_t il = 0; il < embd_layer_inp.size(); ++il) {
+        if (il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            embd_layer_inp[il] = buffer_view<float>{(float *) (base + offset), (size_t) n_embd * n_batch};
+            offset += embd_layer_inp[il].size * sizeof(float);
+        } else {
+            embd_layer_inp[il] = buffer_view<float>{nullptr, 0};
+        }
+    }
 
     if (has_sampling) {
         sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
@@ -2461,6 +2506,42 @@ void llama_context::output_reorder() {
     output_swaps.clear();
 }
 
+bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    bool extracted = false;
+
+    for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+        if (!cparams.embeddings_layer_inp[il]) {
+            continue;
+        }
+        if (!embd_layer_inp[il].has_data()) {
+            GGML_ABORT("layer input buffer not allocated");
+        }
+
+        ggml_tensor * t = res->get_layer_inp((int) il);
+        if (!t) {
+            GGML_ABORT("layer input tensor not found");
+        }
+
+        const size_t nbytes  = ggml_nbytes(t);
+        const size_t nfloats = nbytes / sizeof(float);
+        GGML_ASSERT(n_tokens > 0);
+        GGML_ASSERT(nfloats % n_tokens == 0);
+
+        const size_t row_floats = nfloats / n_tokens;
+        GGML_ASSERT(row_floats == model.hparams.n_embd);
+        const size_t dst_offset = token_offset * row_floats;
+        GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        GGML_ASSERT(backend != nullptr);
+
+        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+        extracted = true;
+    }
+
+    return extracted;
+}
+
 //
 // graph
 //
@@ -2473,6 +2554,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         model.arch == LLM_ARCH_DEEPSEEK41 ||
+        model.arch == LLM_ARCH_DFLASH ||
         model.arch == LLM_ARCH_GLM5NEXT) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
@@ -3857,6 +3939,20 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+void llama_context_require_reserve(llama_context * ctx) {
+    ctx->require_reserve();
+}
+
+void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
+    ctx->set_embeddings_layer_inp(lid, value);
+}
+
+float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_layer_inp(lid);
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

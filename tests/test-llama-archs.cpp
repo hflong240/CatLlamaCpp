@@ -423,7 +423,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
     }
-    if (arch == LLM_ARCH_DEEPSEEK4) {
+    if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DFLASH) {
         return false;
     }
 

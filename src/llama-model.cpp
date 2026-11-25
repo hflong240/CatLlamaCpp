@@ -20,6 +20,7 @@
 #include "models/models.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -85,6 +86,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_stablelm(params);
         case LLM_ARCH_MELLUM:
             return new llama_model_mellum(params);
+        case LLM_ARCH_DFLASH:
+            return new llama_model_dflash(params);
         case LLM_ARCH_QWEN:
             return new llama_model_qwen(params);
         case LLM_ARCH_QWEN2:
@@ -1039,6 +1042,146 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+
+    for (auto * buf : ext_bufs) {
+        ggml_backend_buffer_free(buf);
+    }
+    for (auto * ctx : ext_ctxs) {
+        ggml_free(ctx);
+    }
+}
+
+bool llama_model_ext_weight_alloc(
+        struct llama_model * model,
+        const char * name,
+        int32_t type_,
+        int64_t ne0,
+        int64_t ne1) {
+    if (!model || !name || ne0 <= 0 || ne1 <= 0) {
+        return false;
+    }
+
+    ggml_tensor ** dst = nullptr;
+    if (strcmp(name, "tok_embd") == 0 || strcmp(name, "token_embd") == 0) {
+        dst = &model->tok_embd_ext;
+    } else if (strcmp(name, "output") == 0) {
+        dst = &model->output_ext;
+    } else {
+        return false;
+    }
+
+    if (*dst) {
+        // already allocated (e.g. a retried transfer)
+        return true;
+    }
+
+    ggml_backend_dev_t dev = strcmp(name, "output") == 0 ? model->dev_output() : model->dev_layer(0);
+    if (dev == nullptr) {
+        dev = model->dev_output();
+    }
+    if (dev == nullptr) {
+        return false;
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * t = ggml_new_tensor_2d(ctx, (ggml_type) type_, ne0, ne1);
+    if (!t) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, t));
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    t->buffer = buf;
+    t->data   = ggml_backend_buffer_get_base(buf);
+
+    model->ext_ctxs.push_back(ctx);
+    model->ext_bufs.push_back(buf);
+
+    *dst = t;
+
+    return true;
+}
+
+bool llama_model_ext_weight_set(
+        struct llama_model * model,
+        const char * name,
+        size_t offset,
+        const void * data,
+        size_t size) {
+    if (!model || !name || !data) {
+        return false;
+    }
+
+    ggml_tensor * t = nullptr;
+    if (strcmp(name, "tok_embd") == 0 || strcmp(name, "token_embd") == 0) {
+        t = model->tok_embd_ext;
+    } else if (strcmp(name, "output") == 0) {
+        t = model->output_ext;
+    }
+
+    if (!t || offset + size > ggml_nbytes(t)) {
+        return false;
+    }
+
+    ggml_backend_tensor_set(t, data, offset, size);
+
+    return true;
+}
+
+bool llama_model_ext_weight_ready(const struct llama_model * model, const char * name) {
+    if (!model || !name) {
+        return false;
+    }
+    if (strcmp(name, "tok_embd") == 0 || strcmp(name, "token_embd") == 0) {
+        return model->tok_embd_ext != nullptr;
+    }
+    if (strcmp(name, "output") == 0) {
+        return model->output_ext != nullptr;
+    }
+    return false;
+}
+
+bool llama_model_has_weight(const struct llama_model * model, const char * name) {
+    if (!model || !name) {
+        return false;
+    }
+    if (strcmp(name, "tok_embd") == 0 || strcmp(name, "token_embd") == 0) {
+        return model->tok_embd != nullptr;
+    }
+    if (strcmp(name, "output") == 0) {
+        return model->output != nullptr;
+    }
+    return false;
+}
+
+struct ggml_tensor * llama_model_get_ext_source(const struct llama_model * model, const char * name) {
+    if (!model || !name) {
+        return nullptr;
+    }
+    if (strcmp(name, "tok_embd") == 0 || strcmp(name, "token_embd") == 0) {
+        return model->tok_embd;
+    }
+    if (strcmp(name, "output") == 0) {
+        return model->output ? model->output : model->tok_embd;
+    }
+    return nullptr;
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -2607,6 +2750,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_HY_V3:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
+        case LLM_ARCH_DFLASH:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
@@ -2787,6 +2931,22 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+
+const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
+    return model->target_layer_ids.data();
+}
+
+uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
+    return (uint32_t) model->target_layer_ids.size();
+}
+
+uint32_t llama_model_dflash_block_size(const struct llama_model * model) {
+    return model->hparams.dflash_block_size;
+}
+
+uint32_t llama_model_n_embd_inp_enc(const struct llama_model * model) {
+    return model->hparams.n_embd_inp_enc();
+}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
