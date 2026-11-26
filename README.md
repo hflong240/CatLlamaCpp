@@ -136,12 +136,22 @@ actually reach for:
 | `LLAMA_MOE_SYNC_COVER=F` | `0.2` | Coverage early-stop on top of `SYNC_BUDGET`: skip a sync load once the resident experts already cover fraction `F` of the routed gate weight. ~+30% decode on IQ2 / ~+45% on Q4 at coherent quality. Set `0` for the fixed budget. Tuned on Hunyuan-v3; other MoEs may want a different `F`. Decode only. |
 | `LLAMA_MOE_STALE_VALUE_ZERO` | **on** | On an uncovered decode miss (a routed position the budget could not load), contribute **zero** (omit that one expert) instead of reusing a stale donor expert. The stale donor is near-orthogonal to the correct expert, so omitting it stays closer to the full-expert output: measured mean KLD 0.40 -> 0.35 and Same-top-token +2.2 points, at zero cost. Set `LLAMA_MOE_STALE_VALUE_ZERO=0` to restore stale-donor reuse. Async decode only; no effect on lossless / compaction / prefill paths. |
 | `LLAMA_MOE_PREFILL_SWEEP` | on | **Lossless prefill.** Evaluate the MoE FFN once per expert group so a prompt batch never drops experts it selected (~5.7x faster *and* more correct than the old `-ub 1` workaround on DeepSeek-V4-Flash). Set `0` to restore capacity-rationed, lossy prefill. |
+| `LLAMA_MOE_PREFILL_STAGE=1` | off | **Layer-ahead prefill staging (experimental).** Stage a layer's experts into a shared VRAM buffer and run one `mul_mat_id` over the real ids instead of the group sweep. On dsv4.1 UD-Q2_K_XL / 4090D: 1.63x at 1.17k prompt, 1.77x at 4.7k, output byte-identical to the sweep. Reserves VRAM, so `CACHE_CAP` drops. |
+| `LLAMA_MOE_STAGE_SINGLE=1` | off | One full-layer buffer instead of two. Halves the VRAM reserve (5 GiB vs 10 GiB on the 384-expert model); no layer-ahead overlap. The two-buffer default is slower on 24 GiB cards with 384 experts. |
+| `LLAMA_MOE_STAGE_ALL=0` | auto | Stage only the routed experts (union mode). Whole-layer mode is chosen from `LLAMA_MOE_STAGE_ALL_MIN_TOKENS` (default 1024) and is slower here because it reads unused experts. |
+| `LLAMA_MOE_STAGE_MIN_PICKS=N` | `1024` | Minimum `n_tokens * n_expert_used` before staging. Keep at 1024 for prefill-only; lowering it to 1 makes draft verify use staging too, which measured slower because the buffer shrinks the decode cache. |
+| `LLAMA_MOE_STAGE_KEEP=1` | off | Keep the staging buffers at the first decode token (for verify/decode use). Default releases them, matching prefill-only use. |
+| `LLAMA_MOE_STAGE_DECODE_CAP=N` | auto | Cap to rebuild after a one-shot staged prefill. Set 18 on the 384-expert dsv4.1 model so a 3-token draft verify (3 x 6 = 18) still fits the rebuilt cache. The buffers are released and the next graph rebuilds at this cap; with no value the auto sizer decides. |
+| `--no-warmup` | - | On `llama-server`, the startup warmup consumes the one-shot staged prefill; pass this flag if you want the first real prompt to use staging. |
 | `LLAMA_MOE_IO_THREADS=N` | `16` | Parallel disk-read threads for expert loads. Raise on fast NVMe. |
+| `LLAMA_MOE_H2D_RING=N` | `2` | Overlaps expert H2D with expert reads. A read submits its copy (disk staging or a RAM/mmap source) as soon as its bytes are available, instead of waiting for the whole read phase; staged slots are ringed so a slot is reused only after the device drains. `0` restores the old shape. Decode loads one unit per thread and never wraps, so `1` and `2` are identical there - use `1` to halve the pinned memory; raise to 3-4 only if a staged prefill still spends time in the drain. Costs `N x io_threads x projections x expert_slab` of pinned host memory. Measured on dsv4.1 Q2 / 4090D decode: +11% at normal system pressure, +19-27% under memory pressure, output md5 unchanged. |
 | `LLAMA_MOE_FUSED=1` | off | Fused CUDA MoE-FFN op (eliminates the per-layer scheduler split). Quality-identical, but measured decode is ~20% *slower* on the disk/H2D-bound streaming path, so it is off by default. Enable only where the split, not the load, dominates. |
 | `LLAMA_MOE_CPU_LANE_H2D_ONLY=1` | off | Decode-only CPU expert lane: compute sync-load misses on the CPU instead of H2D. Requires `LLAMA_MOE_FUSED=1`. |
 | `LLAMA_MOE_CPU_LANE_MAX_PER_LAYER=N` | all eligible | Max experts per layer handed to the CPU lane. `1` is the measured optimum on DeepSeek-V4.1. |
 | `LLAMA_MOE_CPU_LANE_THREADS=N` | `LLAMA_MOE_IO_THREADS` | CPU-lane worker threads. `12` with the background loader active. |
 | `LLAMA_MOE_DIAG=1` | off | Print decode miss-rate, per-token timing, top-2 residency, and the per-step prefill breakdown (loader time, disk vs H2D, RAM-pool hit rate). |
+
+The staging path is one-shot per process: the first staged prefill uses it, then the buffers are released and the decode caches are rebuilt at `LLAMA_MOE_STAGE_DECODE_CAP` (or auto). On `llama-server`, the startup warmup consumes that one shot unless `--no-warmup` is passed; later prefills fall back to the sweep. Measured on dsv4.1 UD-Q2_K_XL / 4090D with `STAGE_SINGLE=1`, `STAGE_ALL=0`: 1.63x at a 1.17k prompt and 1.77x at 4.7k versus the sweep, with byte-identical output.
 
 The CPU lane is not byte-identical to the GPU path: measured Mean KLD 0.0134 / Same-top 96.2% on
 DeepSeek-V4.1 with `MAX_PER_LAYER=1`, and ~1.3-1.4x decode. Leave it off when full-expert parity matters.
@@ -305,14 +315,28 @@ each request. No target weights are needed on the draft machine in advance.
 - **DSpark target.** A DFlash/DSpark sidecar requires a `deepseek41` target and must be started before the
   target server; the target sends the sidecar's `tok_embd` and `output` at startup. `--spec-draft-n-max` is
   clamped to `dflash.block_size`, and `--spec-draft-p-min` uses the sidecar's confidence head when present.
+- **DSpark p-min.** With batch verification, a sidecar confidence head helps: `--spec-draft-p-min 0.5` drops
+  low-confidence draft columns, cutting rejected columns and their expert loads. Values around 0.7 often
+  return no draft at all, so extra remote round trips can cost more than the saved verification. In
+  sequential verification p-min no longer changes target speed; 0 keeps the fewest remote calls.
+- **Sequential verification (`LLAMA_SPEC_SEQUENTIAL=1`).** Batch verification is the wrong shape for
+  streaming MoE: it loads the expert union of every draft column, so a 3-token verify costs about three
+  single-token decodes. Sequential verification decodes one anchor token on the normal single-token path,
+  runs the remote draft request on a worker thread while that decode runs, and checks drafts one by one.
+  A rejected draft never enters the target KV, so no checkpoint or rollback is needed. On dsv4.1 Q2 /
+  RTX 4090D this measured 3.34-3.45 tok/s (290-300 ms/token) versus 2.23 tok/s for batch verification,
+  with `graphs reused=127` and output md5 identical to a no-draft run. It does not beat no-draft (one
+  target decode per token is the floor); it makes remote drafting free instead of a 30-50% regression.
+  Only the remote draft implementation is affected.
 - **Matching sequence geometry.** `-c` and `-np` must give the same per-sequence context on both sides
   (`n_ctx / n_parallel`), and the draft server must expose at least as many sequences as the target's `-np`.
 - **Partial KV removal.** The draft context must support removing a partial sequence (standard attention KV
   caches do); the server refuses to start otherwise.
 - **Text-only.** Multimodal prompts are skipped (no remote draft) because image placeholders break the
   token/position mapping.
-- **Latency.** Draft generation is on the critical path: each round is one LAN round trip plus the draft
-  model's compute, and it does not overlap the target verify yet. Wired Ethernet is recommended.
+- **Latency.** Without sequential verification, draft generation is on the critical path: each round is one
+  LAN round trip plus the draft model's compute. With `LLAMA_SPEC_SEQUENTIAL=1` it overlaps the target
+  anchor decode. Wired Ethernet is recommended.
 - **First draft of a request** pays a prompt prefill on the draft server. The server reuses the longest common
   token prefix, so repeated and multi-turn prompts only pay for the new suffix.
 - **State recovery.** The target hashes the full token prefix on every draft; a context shift or slot reuse

@@ -1763,6 +1763,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // fork: staged prefill -> decode handoff. The staging buffer and the small caches sized around it
+    // are only useful for a prefill forward. Switch back before the first small batch (single-token
+    // decode or a speculative verify batch); the next graph build recreates the decode caches at the
+    // normal capacity. Wait for the finished prefill graph first - it still references those buffers.
+    if (cparams.moe_stream_async && batch_inp.n_tokens <= 8) {
+        extern bool llama_moe_stage_used(void);
+        extern bool llama_moe_prefill_stage_enabled(void);
+        extern bool llama_moe_stage_end_prefill(ggml_backend_sched_t);
+        if (llama_moe_stage_used() && llama_moe_prefill_stage_enabled()) {
+            synchronize();
+            ggml_backend_sched_reset(get_sched());
+            llama_moe_stage_end_prefill(get_sched());
+            if (gf_res_prev) { gf_res_prev->reset(); }
+        }
+    }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -2252,6 +2268,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (llama_moe_sweep_refill_pending()) {
             synchronize(); // the refill overwrites slabs the just-finished graph read
             llama_moe_refill_vram_caches();
+        }
+        // The staged prefill buffers are not used by decode. Return them once, and drop the small-cap
+        // caches that were sized around their VRAM reserve; the next graph build recreates the caches
+        // at the normal decode capacity.
+        extern void llama_moe_stage_release(void);
+        extern bool llama_moe_prefill_stage_enabled(void);
+        extern bool llama_moe_stage_end_prefill(ggml_backend_sched_t);
+        if (llama_moe_prefill_stage_enabled()) {
+            synchronize(); // the just-finished graph still referenced the cache buffers
+            ggml_backend_sched_reset(get_sched());
+            llama_moe_stage_end_prefill(get_sched());
+            gf_res_prev->reset(); // caches changed: the old graph must not be reused
+        } else {
+            llama_moe_stage_release();
         }
 
         static const int moe_boundary_budget = []() {

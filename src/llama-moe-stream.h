@@ -487,6 +487,38 @@ ggml_tensor * llama_moe_layer_cache_tier_weights(llama_moe_layer_cache * c);
 // overwrites - group g-1's slots. Pass nullptr for the first group.
 bool llama_moe_prefill_sweep_enabled(void);
 
+// fork: P1b prefill staging (LLAMA_MOE_PREFILL_STAGE). A prefill ubatch with enough picks stages a
+// layer's experts into one of two shared VRAM buffers, so the layer runs as a single mul_mat_id over
+// the real expert ids instead of the capacity-group sweep. The default union mode stages only the
+// experts this layer routed to; whole-layer mode stages every expert instead.
+bool llama_moe_prefill_stage_enabled(void);
+bool llama_moe_stage_used(void);
+int  llama_moe_prefill_stage_min_picks(void);
+int  llama_moe_prefill_stage_all_min_tokens(void);
+int  llama_moe_prefill_stage_layer_max(void);
+
+bool llama_moe_prefill_warm_enabled(void);
+int  llama_moe_prefill_warm_fetch(void);
+int  llama_moe_prefill_warm_rows(void);
+
+ggml_tensor * llama_moe_prefill_stage_gate_warm(ggml_context * ctx0, ggml_tensor * selected_experts, void * cache);
+void llama_moe_layer_cache_stage_set_wgt_dev(llama_moe_layer_cache * c, const struct ggml_tensor * wgt);
+
+bool llama_moe_layer_cache_stage_init(llama_moe_layer_cache * c);
+bool llama_moe_layer_cache_stage_ready(const llama_moe_layer_cache * c);
+ggml_tensor * llama_moe_layer_cache_stage_dev(llama_moe_layer_cache * c, const ggml_tensor * exps, int parity);
+ggml_tensor * llama_moe_layer_cache_stage_mask_view(ggml_context * ctx0, llama_moe_layer_cache * c,
+                                                    int64_t n_used, int64_t n_tokens);
+ggml_tensor * llama_moe_layer_cache_stage_sel_view(ggml_context * ctx0, llama_moe_layer_cache * c,
+                                                   int64_t n_used, int64_t n_tokens);
+void llama_moe_layer_cache_stage_set_all(llama_moe_layer_cache * c, bool all);
+void llama_moe_layer_cache_stage_set_warm(llama_moe_layer_cache * c, bool warm, int fetch);
+ggml_tensor * llama_moe_prefill_stage_gate(ggml_context * ctx0, ggml_tensor * selected_experts, void * cache);
+void llama_moe_stage_release(void);
+// One-shot phase switch: free the staging buffers and drop this context's small-cap caches so the next
+// graph build recreates them at the normal decode capacity. Caller must synchronize first.
+bool llama_moe_stage_end_prefill(ggml_backend_sched_t sched);
+
 // Zero sentinel slots per layer cache. Single source of truth shared by llama_moe_auto_capacity
 // (which must subtract these from the VRAM budget) and the cache allocation.
 int llama_moe_sentinel_count(int n_used);

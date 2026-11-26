@@ -23,7 +23,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
+#include <future>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -40,6 +42,19 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// fork: opt-in sequential verification for the remote draft. The batch verifier
+// is the right choice when target experts are resident, but streaming MoE pays
+// for the whole expert union of every draft column. Sequential verification
+// keeps the target on the single-token decode path and checks drafts one by one;
+// a rejected draft never reaches the KV cache, so no rollback is needed.
+static bool spec_sequential_enabled(const common_params & params) {
+    static const bool on = []() {
+        const char * e = getenv("LLAMA_SPEC_SEQUENTIAL");
+        return e && atoi(e) != 0;
+    }();
+    return on && !params.speculative.draft.remote_endpoint.empty();
+}
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -87,6 +102,10 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+    // fork: verify one draft column per target decode and let the remote draft
+    // request overlap with that decode. Exact for greedy sampling, and it
+    // keeps the target on the single-token streaming decode path.
+    bool spec_sequential = false;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -342,6 +361,16 @@ struct server_slot {
     }
 
     void update_batch(llama_batch & batch) {
+        if (spec_sequential) {
+            // One anchor token per target decode. Draft columns are checked
+            // against the sampled token one at a time and never enter the
+            // target KV unless accepted, so there is nothing to roll back.
+            spec_i_batch.clear();
+            i_batch = batch.n_tokens;
+            common_batch_add(batch, sampled, prompt.tokens.pos_next(), { this->id }, true);
+            prompt.tokens.push_back(sampled);
+            return;
+        }
         if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.n_tokens;
@@ -1079,6 +1108,12 @@ private:
 
         if (spec) {
             SRV_INF("%s", "speculative decoding context initialized\n");
+            if (spec_sequential_enabled(params_base)) {
+                for (auto & slot : slots) {
+                    slot.spec_sequential = true;
+                }
+                SRV_INF("%s", "sequential remote draft verification enabled\n");
+            }
         } else {
             ctx_dft.reset();
         }
@@ -2589,6 +2624,8 @@ private:
 
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
+        // remote draft request running while the target decodes the anchor token
+        std::future<void> spec_fut;
 
         // determine which slots are generating and drafting
         for (auto & slot : slots) {
@@ -2618,7 +2655,7 @@ private:
 
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
-                        if (use_ckpt_tgt) {
+                        if (use_ckpt_tgt && !slot.spec_sequential) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
                         }
                     } else {
@@ -2650,14 +2687,34 @@ private:
             }
         }
 
-        // generate the actual drafts (if any)
+        // generate the actual drafts (if any). In sequential mode the request runs
+        // on a worker while the target decodes the anchor token below.
         {
-            common_speculative_draft(spec.get());
+            bool async_started = false;
+            if (spec && !drafting.empty()) {
+                bool all_sequential = true;
+                for (auto * slot_ptr : drafting) {
+                    all_sequential = all_sequential && slot_ptr->spec_sequential;
+                }
+                if (all_sequential) {
+                    spec_fut = std::async(std::launch::async, [spec_ptr = spec.get()]() {
+                        common_speculative_draft(spec_ptr);
+                    });
+                    async_started = true;
+                }
+            }
+            if (!async_started) {
+                common_speculative_draft(spec.get());
+            }
         }
 
         // make checkpoints if needed
         for (auto * slot_ptr : drafting) {
             auto & slot = *slot_ptr;
+
+            if (slot.spec_sequential) {
+                continue; // no target checkpoint: rejected drafts never enter the target KV
+            }
 
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
@@ -3241,7 +3298,15 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
+                        const int64_t t_ck0 = ggml_time_us();
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        static uint64_t ck_us = 0, ck_n = 0;
+                        ck_us += (uint64_t) (ggml_time_us() - t_ck0);
+                        const uint64_t cn = ++ck_n;
+                        if ((cn % 16) == 0) {
+                            SLT_WRN(slot, "checkpoint create: %llu, avg %.2f ms\n",
+                                    (unsigned long long) cn, (double) ck_us / 1000.0 / (double) cn);
+                        }
                     }
                 }
 
@@ -3325,7 +3390,31 @@ private:
                 llama_moe_verify_gate_arm(moe_vgate_cols);
             }
 
+            const int64_t t_dec0 = ggml_time_us();
             const int ret = llama_decode(ctx_tgt, batch_view);
+            {
+                static uint64_t dec_us[2] = {0, 0}, dec_n[2] = {0, 0};
+                const int k = n_tokens > 1 ? 1 : 0;
+                dec_us[k] += (uint64_t) (ggml_time_us() - t_dec0);
+                const uint64_t dn = ++dec_n[k];
+                if (slot_batched && ((dec_n[0] + dec_n[1]) % 64) == 0) {
+                    SLT_WRN(*slot_batched, "decode wall: n=1 avg %.2f ms (%llu), n>1 avg %.2f ms (%llu)\n",
+                            dec_n[0] ? (double) dec_us[0] / 1000.0 / (double) dec_n[0] : 0.0,
+                            (unsigned long long) dec_n[0],
+                            dec_n[1] ? (double) dec_us[1] / 1000.0 / (double) dec_n[1] : 0.0,
+                            (unsigned long long) dec_n[1]);
+                }
+                (void) dn;
+            }
+
+            if (spec_fut.valid()) {
+                spec_fut.get();
+                for (auto * slot_ptr : drafting) {
+                    if (slot_ptr->spec_sequential) {
+                        slot_ptr->n_draft_total += (int32_t) slot_ptr->spec_draft.size();
+                    }
+                }
+            }
 
             // reads the gate's verdict and disarms it; -1 when the gate is off or was not armed
             const int32_t moe_vgate_ok = llama_moe_verify_gate_max_accept();
@@ -3502,13 +3591,33 @@ private:
                     continue; // continue loop of slots
                 }
 
-                if (slot.can_speculate() && !slot.spec_draft.empty()) {
+                if (!slot.spec_sequential && slot.can_speculate() && !slot.spec_draft.empty()) {
                     continue; // sample using speculative decoding
                 }
 
                 const int tok_idx = slot.i_batch - i;
 
                 llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+
+                if (slot.spec_sequential && !slot.spec_draft.empty()) {
+                    // One draft column was checked against this sampled token.
+                    // A hit consumes it; a miss invalidates the rest. Either
+                    // way the sampled token is the only token that advances.
+                    static const bool seqdbg = getenv("LLAMA_SPEC_SEQ_DBG") != nullptr;
+                    if (seqdbg) {
+                        SLT_WRN(slot, "seq spec pos=%d id=%d draft=%d hit=%d rem=%zu\n",
+                                slot.prompt.n_tokens(), (int) id, (int) slot.spec_draft.front(),
+                                slot.spec_draft.front() == id ? 1 : 0, slot.spec_draft.size() - 1);
+                    }
+                    if (slot.spec_draft.front() == id) {
+                        slot.spec_draft.erase(slot.spec_draft.begin());
+                        slot.n_draft_accepted += 1;
+                        common_speculative_accept(spec.get(), slot.id, 1);
+                    } else {
+                        slot.spec_draft.clear();
+                        common_speculative_accept(spec.get(), slot.id, 0);
+                    }
+                }
 
                 slot.i_batch = -1;
 
@@ -3551,6 +3660,9 @@ private:
 
             // speculative decoding - main model sample and accept
             for (auto & slot : slots) {
+                if (slot.spec_sequential) {
+                    continue; // already sampled and accepted one column above
+                }
                 if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
                     continue;
                 }
@@ -3590,6 +3702,7 @@ private:
                     // check for partial draft acceptance
                     if (n_rollback > 0) {
                         if (use_ckpt_tgt) {
+                            const int64_t t_rb0 = ggml_time_us();
                             if (trace > 0) {
                                 SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                             }
@@ -3615,6 +3728,16 @@ private:
 
                             slot.prompt.tokens.keep_first(ckpt.n_tokens);
                             slot.smpl = std::move(smpl_save);
+
+                            {
+                                static uint64_t rb_us = 0, rb_n = 0;
+                                rb_us += (uint64_t) (ggml_time_us() - t_rb0);
+                                const uint64_t rn = ++rb_n;
+                                if ((rn % 16) == 0) {
+                                    SLT_WRN(slot, "spec rollback: %llu rounds, avg %.2f ms/round\n",
+                                            (unsigned long long) rn, (double) rb_us / 1000.0 / (double) rn);
+                                }
+                            }
 
                             continue;
                         }

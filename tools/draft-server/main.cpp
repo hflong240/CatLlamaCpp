@@ -495,8 +495,12 @@ struct draft_server {
             return make_error("invalid draft length");
         }
 
+        // Decode the whole block even when the caller needs fewer columns. The extra drafts are the
+        // candidates for the next anchor; the client compares them against its sampled token to decide
+        // whether an ahead run is worth it. They cost one wider forward, not another decode.
+        const int32_t n_pred  = std::max(n_draft, block_size);
         // block layout: [anchor, mask...]; anchor-first DSpark yields block_size drafts
-        const int32_t n_block = n_draft + (sample_from_anchor ? 0 : 1);
+        const int32_t n_block = n_pred + (sample_from_anchor ? 0 : 1);
         if (block_pos + n_block >= n_ctx_seq) {
             return make_error("draft exceeds the context size");
         }
@@ -516,9 +520,11 @@ struct draft_server {
         const float * conf = has_conf ? llama_get_embeddings_nextn(ctx) : nullptr;
 
         std::vector<llama_token> out;
+        std::vector<llama_token> out_all;
         out.reserve(n_draft);
+        out_all.reserve(n_pred);
 
-        for (int32_t i = 0; i < n_draft; ++i) {
+        for (int32_t i = 0; i < n_pred; ++i) {
             const int32_t row = i + (sample_from_anchor ? 0 : 1);
 
             common_sampler_sample(smpls[seq_id].get(), ctx, row, true);
@@ -529,6 +535,11 @@ struct draft_server {
             }
 
             const llama_token id = cur_p->data[0].id;
+            out_all.push_back(id);
+
+            if (i >= n_draft) {
+                continue; // beyond the requested columns: diagnostic only
+            }
 
             if (p_min > 0.0f) {
                 if (conf != nullptr && conf[(size_t) row * n_embd_draft] < p_min) {
@@ -555,6 +566,7 @@ struct draft_server {
         json j;
         j["ok"]     = true;
         j["tokens"] = out;
+        j["all"]    = out_all;
         return j;
     }
 

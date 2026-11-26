@@ -50,6 +50,32 @@ static inline bool llama_moe_pread(FILE * fp, uint64_t off, void * dst, size_t b
     return fread(dst, 1, bytes, fp) == bytes;
 }
 
+// Private positioned-read handle for an io thread, cached for the process lifetime. The shared
+// projection handle cannot be used by several threads (one seek position), and opening a private one
+// per call cost 120-360 fopen/fclose per decode token on Windows. The path string lives in the
+// projection store, so its c_str() pointer is a stable key.
+static const bool g_moe_file_cache = []() {
+    const char * e = getenv("LLAMA_MOE_FILE_CACHE");
+    return !e || atoi(e) != 0;
+}();
+
+static FILE * llama_moe_thread_file(const std::string & path) {
+    thread_local std::unordered_map<const char *, FILE *> cache;
+    if (!g_moe_file_cache) {
+        return fopen(path.c_str(), "rb");
+    }
+    const char * key = path.c_str();
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    FILE * f = fopen(path.c_str(), "rb");
+    if (f) {
+        cache.emplace(key, f);
+    }
+    return f;
+}
+
 // The Windows CRT caps the number of concurrently open FILE streams at 512 by default. Each layer cache
 // keeps TWO private handles per projection - one for the compute thread and one for the background
 // loader's fill_ram, deliberately not shared so fill_ram cannot move the file position out from under
@@ -92,6 +118,32 @@ static inline void llama_moe_prefetch(const void * addr, size_t bytes) {
     PrefetchVirtualMemory(GetCurrentProcess(), 1, &e, 0);
 #else
     (void) madvise(const_cast<void *>(addr), bytes, MADV_WILLNEED);
+#endif
+}
+
+// One call for a batch of ranges: a decode layer touches several expert slabs, and one syscall per
+// slab was measurable on the verify path. Each range stays independent.
+static void llama_moe_prefetch_many(const void ** addrs, const size_t * bytes, size_t n) {
+    if (n == 0) {
+        return;
+    }
+#ifdef _WIN32
+    WIN32_MEMORY_RANGE_ENTRY e[32];
+    while (n > 0) {
+        const size_t k = n < 32 ? n : 32;
+        for (size_t i = 0; i < k; ++i) {
+            e[i].VirtualAddress = const_cast<void *>(addrs[i]);
+            e[i].NumberOfBytes  = bytes[i];
+        }
+        PrefetchVirtualMemory(GetCurrentProcess(), (ULONG) k, e, 0);
+        addrs += k;
+        bytes += k;
+        n     -= k;
+    }
+#else
+    for (size_t i = 0; i < n; ++i) {
+        if (addrs[i] && bytes[i]) { (void) madvise(const_cast<void *>(addrs[i]), bytes[i], MADV_WILLNEED); }
+    }
 #endif
 }
 
@@ -965,6 +1017,8 @@ int llama_moe_sentinel_count(int n_used) {
 // apart from a real model tensor when splitting the byte budget between the tiers.
 static bool llama_moe_is_low_tier(const ggml_tensor * t);
 
+static size_t llama_moe_stage_reserve_bytes(ggml_backend_buffer_type_t buft, size_t align);
+
 int llama_moe_auto_capacity(ggml_backend_sched_t sched,
                             ggml_tensor * const * exps_list, int n_proj,
                             int n_expert, int n_used, int n_moe_layers,
@@ -1105,7 +1159,25 @@ int llama_moe_auto_capacity(ggml_backend_sched_t sched,
     // layer's cache creation, before the other layer caches allocate) minus the reserve for KV/compute.
     // dev_free ~= dev_total here since streaming keeps expert weights off-device, so this is close to
     // the real ceiling; the reserve absorbs the KV + compute buffers that grow afterward.
-    const uint64_t usable = dev_free > reserve ? (uint64_t) (frac * (double) (dev_free - reserve)) : 0;
+    uint64_t usable = dev_free > reserve ? (uint64_t) (frac * (double) (dev_free - reserve)) : 0;
+    // fork: P1b prefill staging needs two full-layer buffers. Reserve them out of the cache budget so
+    // the auto-sized cache leaves room for them instead of spilling the pair over PCIe.
+    if (llama_moe_prefill_stage_enabled()) {
+        const size_t stage_need = llama_moe_stage_reserve_bytes(
+            ggml_backend_get_default_buffer_type(backend),
+            std::max<size_t>(ggml_backend_get_alignment(backend), 64));
+        if (stage_need >= usable) {
+            usable = 0;
+        } else if (stage_need > 0) {
+            usable -= stage_need;
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LLAMA_LOG_WARN("MoE stream: reserving %.2f GiB of the cache budget for the two prefill "
+                               "staging buffers.\n", (double) stage_need / (1024.0 * 1024.0 * 1024.0));
+            }
+        }
+    }
     // Out of VRAM must NOT read as "no opinion". Returning 0 leaves cap=0 at the call site, and
     // llama_moe_clamp_capacity maps 0 to FULL residency - so "nothing fits" allocated every expert, which
     // is exactly backwards. Measured on qwen3.8-flash-next + MTP: the draft context reached here with
@@ -1578,6 +1650,28 @@ struct llama_moe_layer_cache {
     // next decode token.
     bool sweep_dirty = false;
 
+    // fork: P1b prefill staging. Two full-layer device tensors per projection, aliasing one of the two
+    // shared staging buffers (layer parity). stage_ctx owns the descriptors only; the bytes live in the
+    // global buffers. ram_pin marks RAM-pool slots an in-flight stage job is reading, so the background
+    // loader's fill_ram cannot recycle them underneath it.
+    bool                    stage_ready = false;
+    bool                    stage_gate_all = false; // this graph stages the whole layer, not the union
+    bool                    stage_gate_warm = false; // warm prefill: fetch limit + drop cold picks
+    int                     stage_warm_fetch = 64;
+    ggml_tensor *           stage_mask_tensor = nullptr; // persistent [1, n_used, mask_max_tokens] f32
+    ggml_backend_buffer_t   stage_mask_buf = nullptr;
+    int                     mask_max_tokens = 0;
+    ggml_tensor *           stage_sel_tensor = nullptr; // persistent [n_used, sel_max_tokens] i32
+    ggml_backend_buffer_t   stage_sel_buf = nullptr;
+    int                     sel_max_tokens = 0;
+    ggml_tensor *           stage_wgt_host = nullptr; // persistent host [1, n_used, mask_max_tokens] f32
+    ggml_backend_buffer_t   stage_wgt_host_buf = nullptr;
+    const ggml_tensor *     stage_wgt_dev = nullptr; // this graph's weights tensor, for a direct D2H read
+    ggml_context *          stage_ctx   = nullptr;
+    std::vector<ggml_tensor *> stage_proj[2];
+    std::vector<char>       stage_have; // n_expert: experts already staged for the current forward
+    std::vector<char>       ram_pin;
+
     // Built during the recap's measurement reserve, so only slot 0 was prewarmed - slots 1..capacity-1 hold
     // garbage and no expert but 0 is marked resident. Normally the recap frees this cache before anything
     // computes with it; llama_moe_cache_defer_prewarm(false) finishes the prewarm of any cache that
@@ -1687,6 +1781,7 @@ static std::atomic<bool> g_moe_sweep_suspend{false};
 // prefill sets the flag then waits for this to drain. seq_cst on both sides makes the ordering airtight.
 static std::atomic<int> g_moe_loader_reading{0};
 
+
 // Single GLOBAL pinned host staging arena shared by all layers (LLAMA_MOE_PINNED_STAGE). Expert reads on
 // the no-mmap path land here before the H2D copy so the transfer runs at full PCIe rate. Only ever touched
 // inside parallel_load, which runs one layer at a time under g_moe_layer_mutex, so one arena suffices - a
@@ -1697,6 +1792,18 @@ static char *                g_moe_stage_base    = nullptr; // g_moe_stage_buf b
 static size_t                g_moe_stage_slot    = 0;        // bytes per staging slot (== max proj stride seen)
 static int                   g_moe_stage_nthread = 0;        // io threads the arena is currently sized for
 static int                   g_moe_stage_nproj   = 0;        // projections the arena is currently sized for
+// Slots per (io thread, projection). > 1 lets a read submit its H2D and move on to the next expert
+// while the copy is in flight; a slot is reused only after the device has drained. Decode loads at
+// most one unit per thread, so it never wraps and every staged copy is fully asynchronous. 0 restores
+// the pre-overlap behaviour (staged copies synchronous, direct copies batched after all reads).
+static const int             g_moe_stage_ring    = []() {
+    const char * e = getenv("LLAMA_MOE_H2D_RING");
+    const int v = e ? atoi(e) : 2;
+    return v < 0 ? 0 : (v > 8 ? 8 : v);
+}();
+// arena rows per (io thread, projection); a disabled ring still needs the one slot the old
+// synchronous staging used
+static const int             g_moe_stage_rows    = g_moe_stage_ring > 0 ? g_moe_stage_ring : 1;
 
 // Registered on-disk location of each expert tensor (no-mmap takeover). exps -> (path, offset0).
 struct llama_moe_expert_file { std::string path; uint64_t offset0 = 0; };
@@ -2056,6 +2163,11 @@ static std::atomic<uint64_t> g_diag_pub_cnt{0};
 // decode-path timing breakdown (under g_moe_layer_mutex); printed by the diag block, then reset.
 static uint64_t g_diag_cb_ns    = 0; // total time inside the remap callback
 static uint64_t g_diag_pl_ns    = 0; // of which, in parallel_load (disk fread + H2D of synced experts)
+// Same, restricted to speculative verify steps (n_tokens > 1), so the fixed per-batch cost of a verify
+// forward can be separated from its expert loading.
+static uint64_t g_diag_vcb_ns   = 0;
+static uint64_t g_diag_vpl_ns   = 0;
+static uint64_t g_diag_vsteps   = 0;
 static uint64_t g_diag_sync_cnt = 0; // experts sync-loaded (per layer, summed)
 static uint64_t g_diag_ram_hit  = 0; // of those, how many were served from the RAM pool (no disk)
 // Same two counters restricted to the LOW tier (--moe-expert-gguf-low). The totals above are tier-blind,
@@ -2397,6 +2509,9 @@ static int llama_moe_loader_fill_ram(std::vector<char> & scratch) {
                 bool have_empty = false;
                 float lowest = 3.4e38f;
                 for (int r = 0; r < c->ram_capacity; ++r) {
+                    if (!c->ram_pin.empty() && c->ram_pin[(size_t) r]) {
+                        continue; // an in-flight prefill stage job is reading this slot
+                    }
                     if (c->ram_expert[(size_t) r] < 0) { victim = r; have_empty = true; break; }
                     const int32_t re = c->ram_expert[(size_t) r];
                     const float   rs = (re >= 0 && re < c->n_expert) ? c->expert_score[(size_t) re] : 0.0f;
@@ -3570,6 +3685,7 @@ llama_moe_layer_cache * llama_moe_layer_cache_get(ggml_backend_sched_t sched,
                 c->ram_slot.assign((size_t) n_expert, -1);
                 c->ram_expert.assign((size_t) rc, -1);
                 c->ram_score.assign((size_t) rc, 0.0f);
+                c->ram_pin.assign((size_t) rc, 0);
                 // Once an expert is in the RAM pool, drop its mmap page-cache copy so both do not occupy
                 // RAM - but ONLY if that pool is actually PINNED. On an unpinned pool the trade runs
                 // backwards: it destroys a copy the OS could have evicted for free (and re-read from the
@@ -3853,7 +3969,7 @@ static void llama_moe_ensure_stage(llama_moe_layer_cache * c, int n_threads) {
     if (g_moe_stage_buf) { ggml_backend_buffer_free(g_moe_stage_buf); g_moe_stage_buf = nullptr; g_moe_stage_base = nullptr; }
     ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(c->stage_dev);
     if (!hbuft) { return; } // device has no pinned host buffer type; caller uses pageable fallback
-    const size_t n_slots = (size_t) new_thread * (size_t) new_proj;
+    const size_t n_slots = (size_t) new_thread * (size_t) new_proj * (size_t) g_moe_stage_rows;
     ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(hbuft, n_slots * new_slot);
     if (!buf) { return; }
     g_moe_stage_buf     = buf;
@@ -3897,14 +4013,23 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return load_e[a] < load_e[b]; });
 
     // hint the OS to stream the slabs in, in ascending-offset order (skip experts already in the RAM
-    // pool, and skip entirely in no-mmap mode where we never touch the mmap file)
-    for (size_t idx = 0; idx < nl; ++idx) {
-        const int e = load_e[order[idx]];
-        for (size_t pi = 0; pi < c->proj.size(); ++pi) {
-            if (!c->proj[pi].fp && !(c->proj[pi].ram && c->ram_slot[(size_t) e] >= 0)) {
-                llama_moe_prefetch((const char *) c->proj[pi].src->data + (size_t) e * c->proj[pi].stride, c->proj[pi].stride);
+    // pool, and skip entirely in no-mmap mode where we never touch the mmap file). Collected first so
+    // one syscall covers the layer's ranges.
+    {
+        std::vector<const void *> pf_addr;
+        std::vector<size_t>       pf_len;
+        pf_addr.reserve(nl * c->proj.size());
+        pf_len.reserve(nl * c->proj.size());
+        for (size_t idx = 0; idx < nl; ++idx) {
+            const int e = load_e[order[idx]];
+            for (size_t pi = 0; pi < c->proj.size(); ++pi) {
+                if (!c->proj[pi].fp && !(c->proj[pi].ram && c->ram_slot[(size_t) e] >= 0)) {
+                    pf_addr.push_back((const char *) c->proj[pi].src->data + (size_t) e * c->proj[pi].stride);
+                    pf_len.push_back((size_t) c->proj[pi].stride);
+                }
             }
         }
+        llama_moe_prefetch_many(pf_addr.data(), pf_len.data(), pf_addr.size());
     }
 
     // The work unit is (expert, projection), not (expert). At decode a layer loads 0-1 experts per token,
@@ -3960,16 +4085,30 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
     struct pending_h2d { ggml_tensor * dev; size_t off; const char * src; size_t bytes; };
     std::vector<pending_h2d> pend;
     std::mutex pend_mu;
+    // Copies submitted from the io threads, so the final synchronize below must also fire when the
+    // direct-source queue is empty (a disk-only load still has copies in flight).
+    std::atomic<uint64_t> staged_async{0};
+    // LLAMA_MOE_H2D_RING=0 restores the old shape for an A/B: every copy waits for the whole read phase.
+    const bool h2d_overlap = async_h2d && g_moe_stage_ring > 0;
+    const int  stage_ring  = h2d_overlap ? g_moe_stage_ring : 1;
+    // Direct (RAM pool / mmap) sources are stable for the whole call, so they can also be submitted
+    // while the remaining reads run. Unlocked callers (the prefetch drain) keep the deferred queue:
+    // their source pool can move underneath an in-flight copy.
+    const bool submit_direct_now = h2d_overlap && allow_pinned;
 
     auto load_range = [&](size_t lo, size_t hi, int tid) {
         std::vector<char> scratch;                 // pageable fallback when no pinned arena
         std::vector<pending_h2d> local;            // this thread's landed H2Ds (async mode)
         std::vector<FILE *> tfp;                   // this thread's private no-mmap handles (per proj)
+        std::vector<int>    ring_pos;              // per-proj next staging slot (pinned arena only)
         const bool par_read = fast && any_fp;      // this thread does its own file reads
         if (par_read) {
             // opened lazily below: a unit-split thread usually touches ONE projection, so eagerly opening
             // all of them cost n_proj fopen per thread per call for handles that were never used.
             tfp.resize(c->proj.size(), nullptr);
+        }
+        if (use_pinned) {
+            ring_pos.assign(c->proj.size(), 0);
         }
         for (size_t u = lo; u < hi; ++u) {
             const size_t idx = u / np;
@@ -3982,21 +4121,40 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
                 // Prefer a directly-addressable source (RAM pool or mmap): H2D straight from it.
                 const char * sp = llama_moe_layer_src(c, pi, e);
                 if (sp) {
-                    if (async_h2d) { local.push_back({pr.dev, (size_t) slot * stride, sp, stride}); }
-                    else { ggml_backend_tensor_set(pr.dev, sp, (size_t) slot * stride, stride); }
+                    if (submit_direct_now) {
+                        ggml_backend_tensor_set_async(c->dev_backend, pr.dev, sp, (size_t) slot * stride, stride);
+                        staged_async.fetch_add(1, std::memory_order_relaxed);
+                    } else if (async_h2d) {
+                        local.push_back({pr.dev, (size_t) slot * stride, sp, stride});
+                    } else {
+                        ggml_backend_tensor_set(pr.dev, sp, (size_t) slot * stride, stride);
+                    }
                     continue;
                 }
                 // no-mmap: read expert bytes into a (pinned, if available) staging slot, then H2D.
                 char * stg = nullptr;
                 if (use_pinned) {
                     const size_t si = ((size_t) tid * c->proj.size() + pi); // unique per (thread,proj)
-                    stg = g_moe_stage_base + si * g_moe_stage_slot;
+                    size_t rp = 0;
+                    if (h2d_overlap) {
+                        int & rnext = ring_pos[pi];
+                        if (rnext >= stage_ring) {
+                            // ring full: every slot of this (thread,proj) has a copy in flight. Drain
+                            // before the next read overwrites one. Decode loads one unit per thread, so
+                            // only a prefill batch wraps here.
+                            ggml_backend_synchronize(c->dev_backend);
+                            rnext = 0;
+                        }
+                        rp = (size_t) rnext++;
+                    }
+                    // without overlap rp stays 0 and the synchronous copy lands before the next read
+                    stg = g_moe_stage_base + (si * (size_t) g_moe_stage_rows + rp) * g_moe_stage_slot;
                 } else {
                     scratch.resize(stride);
                     stg = scratch.data();
                 }
                 if (par_read && !tfp[pi] && !pr.fpath.empty()) {
-                    tfp[pi] = fopen(pr.fpath.c_str(), "rb"); // first unit of this projection on this thread
+                    tfp[pi] = llama_moe_thread_file(pr.fpath); // first unit of this projection on this thread
                 }
                 bool ok;
                 const int64_t t_rd0 = diag ? ggml_time_us() : 0;
@@ -4013,13 +4171,16 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
                     else            { g_diag_read_ns     += dt; g_diag_read_bytes += by; }
                 }
                 if (ok) {
-                    // NOTE: in async mode a pinned staging slot is reused per (thread,proj) across
-                    // experts, so we must issue its H2D before the next expert overwrites it. With the
-                    // pinned arena the async copy reads the slot immediately on enqueue on the same
-                    // stream, but to be safe against reuse we issue staged H2D synchronously here and
-                    // only async-batch the direct-source (RAM/mmap, stable pointer) copies above.
+                    // Submit the pinned copy as soon as its bytes land so the next read overlaps it.
+                    // The ring above guarantees the source slot is not overwritten while in flight. The
+                    // pageable fallback buffer is reused by the very next read, so it stays synchronous.
                     const int64_t t_h0 = diag ? ggml_time_us() : 0;
-                    ggml_backend_tensor_set(pr.dev, stg, (size_t) slot * stride, stride);
+                    if (h2d_overlap && use_pinned) {
+                        ggml_backend_tensor_set_async(c->dev_backend, pr.dev, stg, (size_t) slot * stride, stride);
+                        staged_async.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        ggml_backend_tensor_set(pr.dev, stg, (size_t) slot * stride, stride);
+                    }
                     if (diag) {
                         const uint64_t dt = (uint64_t) (ggml_time_us() - t_h0);
                         if (from_loader) { g_diag_ldr_h2d_ns += dt; }
@@ -4028,7 +4189,9 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
                 }
             }
         }
-        for (FILE * f : tfp) { if (f) { fclose(f); } }
+        if (!g_moe_file_cache) {
+            for (FILE * f : tfp) { if (f) { fclose(f); } }
+        }
         if (async_h2d && !local.empty()) {
             std::lock_guard<std::mutex> lk(pend_mu);
             pend.insert(pend.end(), local.begin(), local.end());
@@ -4070,8 +4233,10 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
 
     // async H2D batch: issue all direct-source copies on the device stream from THIS thread, then a
     // single synchronize (instead of one cudaStreamSynchronize per copy). Sources are stable host
-    // pointers (RAM pool / mmap), safe to read after the reads completed above.
-    if (async_h2d && !pend.empty()) {
+    // pointers (RAM pool / mmap), safe to read after the reads completed above. The staged copies were
+    // already submitted by the io threads, so the synchronize must run whenever either kind is in
+    // flight - a disk-only load leaves `pend` empty and would otherwise return before the experts land.
+    if (async_h2d && (!pend.empty() || staged_async.load(std::memory_order_relaxed) > 0)) {
         const int64_t t_b0 = diag ? ggml_time_us() : 0;
         for (const auto & p : pend) {
             ggml_backend_tensor_set_async(c->dev_backend, p.dev, p.src, p.off, p.bytes);
@@ -4085,6 +4250,1181 @@ static void llama_moe_layer_parallel_load(llama_moe_layer_cache *   c,
             else             { g_diag_h2d_wall_ns += dt; }
         }
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// fork: P1b prefill staging.
+//
+// The prefill sweep evaluates the FFN once per capacity-sized expert group. Each group's experts are
+// loaded synchronously into the same cache slots, so a layer's disk reads never overlap its GPU
+// compute. Staging instead keeps two full-layer buffers and fills the NEXT layer's buffer while the
+// current layer computes:
+//
+//   layer L callback:  wait for L's staged bytes, copy L+1's experts on host worker threads
+//   layer L compute:   runs while those workers read/H2D L+1
+//   layer L+1 callback: wait, then start L+2
+//
+// The callback is a map_custom1 on selected_experts. That op forces a device-to-host copy of the ids,
+// which already synchronizes the compute stream through L's routing. By the time it runs, layer L is
+// past its router and L-1's expert matmuls have retired, so the parity-(L+1) buffer (last read by
+// L-1) can be overwritten with no extra event. The ids are copied unchanged: every expert is staged
+// in expert-index order, so the real id is also the staging slot id.
+// Defined with the sweep scorer below: seeds expert_score/freq_ranked from one prefill ubatch so the
+// post-prefill VRAM refill warms decode with the prompt's experts.
+static void llama_moe_stage_score_prefill(llama_moe_layer_cache * c, const int32_t * flat, int n_used, int n_tokens);
+
+struct llama_moe_stage_job {
+    llama_moe_layer_cache * c = nullptr;
+    int parity = 0;
+    int n_expert = 0;
+    int n_proj = 0;
+    std::vector<int32_t> experts; // experts to stage; empty means all
+    bool ram_only = false;        // hint job: skip experts that are not RAM/mmap-addressable
+    bool mark_all = false;        // after the job, mark every listed expert as staged
+    std::vector<char> staged;     // n_expert: all projections had a RAM/VRAM source
+    std::vector<char> ram_src;    // n_proj*n_expert: source is the RAM pool (not mmap)
+    std::vector<int32_t> vram_slot; // n_expert: VRAM cache slot, or -1; preferred over RAM/disk
+    std::vector<const char *> src; // n_proj*n_expert source pointers, null => read from file
+    std::vector<std::thread> threads;
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> ram_experts{0};
+    std::atomic<uint64_t> vram_experts{0};
+    std::atomic<uint64_t> disk_experts{0};
+    std::atomic<uint64_t> read_ns{0};
+    std::atomic<uint64_t> failed{0};
+};
+
+static std::mutex g_stage_mu;
+static bool g_stage_tried = false;
+static bool g_stage_ok = false;
+static bool g_stage_bufs_ready = false;
+static ggml_backend_t g_stage_backend = nullptr;
+static ggml_backend_buffer_type_t g_stage_buft = nullptr;
+static ggml_backend_dev_t g_stage_dev = nullptr;
+static ggml_backend_sched_t g_stage_owner = nullptr;
+static ggml_backend_buffer_t g_stage_buf[2] = { nullptr, nullptr };
+static size_t g_stage_buf_bytes = 0;
+static size_t g_stage_align = 0;
+static size_t g_stage_host_slot = 0;
+static int g_stage_nthreads = 0;
+// Diagnostic: one full-layer buffer instead of two. Trades the layer-ahead overlap for half the VRAM,
+// which matters on 24 GiB cards with 384-expert layers.
+static const bool g_stage_single = moe_env_on("LLAMA_MOE_STAGE_SINGLE", false);
+// Set once the one-shot staged prefill has ended and its buffers were returned. Later prefills use the
+// sweep; this keeps the decode cache from being sized around buffers that no longer exist.
+static std::atomic<bool> g_stage_retired{false};
+// Set by the staging gate when a staged forward actually ran. The context switches back to the decode
+// cache before the next small batch (single-token decode OR a speculative verify batch).
+static std::atomic<bool> g_stage_prefill_used{false};
+// Host slots per worker: disk reads are grouped into batches so one stream synchronize amortizes
+// over several experts instead of one, which matters when the disk is latency-bound.
+static constexpr int g_stage_batch = 4;
+static ggml_backend_buffer_t g_stage_host_buf = nullptr;
+static char * g_stage_host_base = nullptr;
+static bool g_stage_host_heap = false;
+static llama_moe_stage_job * g_stage_job = nullptr;
+static std::atomic<uint64_t> g_stage_stat_jobs{0};
+static std::atomic<uint64_t> g_stage_stat_bytes{0};
+static std::atomic<uint64_t> g_stage_stat_ram{0};
+static std::atomic<uint64_t> g_stage_stat_disk{0};
+
+bool llama_moe_prefill_stage_enabled(void) {
+    static const bool on = moe_env_on("LLAMA_MOE_PREFILL_STAGE", false);
+    return on && !g_stage_retired.load(std::memory_order_relaxed);
+}
+
+bool llama_moe_stage_used(void) {
+    return g_stage_prefill_used.load(std::memory_order_relaxed);
+}
+
+int llama_moe_prefill_stage_min_picks(void) {
+    static const int v = []() {
+        const char * e = getenv("LLAMA_MOE_STAGE_MIN_PICKS");
+        return e ? atoi(e) : 1024;
+    }();
+    return v > 0 ? v : 1;
+}
+
+bool llama_moe_prefill_warm_enabled(void) {
+    // The warm policy is implemented, but the ggml scheduler hands the warm gate a truncated CPU copy
+    // of the selected-id tensor: ~6 unique ids instead of the ~190 the exact path sees. This is a
+    // scheduler/copy issue, not the policy; enabling it would drop most experts. Refuse until fixed.
+    // LLAMA_MOE_WARM_DIAG=1 forces the policy on for diagnosis only.
+    static const bool requested = moe_env_on("LLAMA_MOE_PREFILL_WARM", false);
+    static const bool diag      = moe_env_on("LLAMA_MOE_WARM_DIAG", false);
+    if (requested && !diag) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("MoE warm prefill is disabled: the scheduler truncates the warm gate's "
+                           "selected-id input copy. Use exact staging until this is fixed.\n");
+        }
+        return false;
+    }
+    return requested;
+}
+
+int llama_moe_prefill_warm_fetch(void) {
+    static const int v = []() {
+        const char * e = getenv("LLAMA_MOE_STAGE_WARM_FETCH");
+        return e ? atoi(e) : 64;
+    }();
+    return v > 0 ? v : 1;
+}
+
+int llama_moe_prefill_warm_rows(void) {
+    static const int v = []() {
+        const char * e = getenv("LLAMA_MOE_STAGE_WARM_ROWS");
+        return e ? atoi(e) : 1024;
+    }();
+    return v > 0 ? v : 1;
+}
+
+int llama_moe_prefill_stage_all_min_tokens(void) {
+    static const int v = []() {
+        const char * e = getenv("LLAMA_MOE_STAGE_ALL_MIN_TOKENS");
+        return e ? atoi(e) : 1024;
+    }();
+    return v > 0 ? v : 1;
+}
+
+int llama_moe_prefill_stage_layer_max(void) {
+    static const int v = []() {
+        const char * e = getenv("LLAMA_MOE_STAGE_LAYERS");
+        return e ? atoi(e) : INT_MAX;
+    }();
+    return v;
+}
+
+// Largest per-layer expert byte count over every registered expert tensor, and the largest single
+// expert stride. Both buffers are sized to the maximum so every layer can alias the same base.
+static size_t llama_moe_stage_scan(ggml_backend_buffer_type_t buft, size_t align, size_t * max_stride) {
+    size_t max_total = 0;
+    *max_stride = 0;
+    std::unordered_map<int, size_t> per_layer;
+    for (const auto & kv : g_moe_expert_files) {
+        const ggml_tensor * t = kv.first;
+        if (!t || !t->name[0]) { continue; }
+        const char * n = t->name;
+        if (!strstr(n, "ffn_gate_exps.weight") && !strstr(n, "ffn_up_exps.weight") &&
+            !strstr(n, "ffn_down_exps.weight") && !strstr(n, "ffn_gate_up_exps.weight")) {
+            continue;
+        }
+        int il = -1;
+        if (sscanf(n, "blk.%d.", &il) != 1 || il < 0) { continue; }
+        // The staging tensor is a fresh contiguous tensor of the same type/shape; the backend's
+        // alloc size (not ggml_nbytes) is what ggml_backend_tensor_alloc checks, and the CUDA buffer
+        // adds a MATRIX_ROW_PADDING row when ne0 is not a multiple of it.
+        const size_t bytes = ggml_backend_buft_get_alloc_size(buft, t);
+        per_layer[il] += GGML_PAD(bytes, align);
+        if ((size_t) t->nb[2] > *max_stride) { *max_stride = (size_t) t->nb[2]; }
+    }
+    for (const auto & kv : per_layer) { max_total = std::max(max_total, kv.second); }
+    return max_total;
+}
+
+static size_t llama_moe_stage_reserve_bytes(ggml_backend_buffer_type_t buft, size_t align) {
+    if (!llama_moe_prefill_stage_enabled()) { return 0; }
+    size_t max_stride = 0;
+    const size_t need = llama_moe_stage_scan(buft, align, &max_stride);
+    if (need == 0) { return 0; }
+    return (g_stage_single ? 1 : 2) * GGML_PAD(need, align);
+}
+
+static void llama_moe_stage_free_locked() {
+    for (int p = 0; p < 2; ++p) {
+        if (g_stage_buf[p]) { ggml_backend_buffer_free(g_stage_buf[p]); g_stage_buf[p] = nullptr; }
+    }
+    if (g_stage_host_buf) {
+        ggml_backend_buffer_free(g_stage_host_buf);
+        g_stage_host_buf = nullptr;
+    }
+    if (g_stage_host_heap && g_stage_host_base) { free(g_stage_host_base); }
+    g_stage_host_base = nullptr;
+    g_stage_host_heap = false;
+    if (g_stage_backend) { ggml_backend_free(g_stage_backend); g_stage_backend = nullptr; }
+    g_stage_buft = nullptr;
+    g_stage_dev  = nullptr;
+    g_stage_owner = nullptr;
+    g_stage_ok = false;
+    g_stage_bufs_ready = false;
+}
+
+// Caller holds g_stage_mu.
+static bool llama_moe_stage_mgr_init_locked(ggml_backend_t compute) {
+    if (g_stage_tried) { return g_stage_ok; }
+    g_stage_tried = true;
+    if (!compute) { return false; }
+    ggml_backend_dev_t dev = ggml_backend_get_device(compute);
+    if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) { return false; }
+
+    size_t max_stride = 0;
+    g_stage_align = std::max<size_t>(ggml_backend_get_alignment(compute), 64);
+    g_stage_buft = ggml_backend_get_default_buffer_type(compute);
+    const size_t need = llama_moe_stage_scan(g_stage_buft, g_stage_align, &max_stride);
+    if (need == 0) {
+        LLAMA_LOG_WARN("MoE prefill stage: no registered expert tensors; staging disabled.\n");
+        return false;
+    }
+    g_stage_buf_bytes = GGML_PAD(need, g_stage_align);
+
+    ggml_backend_buffer_type_t buft = g_stage_buft;
+    bool ok = true;
+    const int n_buf = g_stage_single ? 1 : 2;
+    for (int p = 0; p < n_buf && ok; ++p) {
+        g_stage_buf[p] = ggml_backend_buft_alloc_buffer(buft, g_stage_buf_bytes);
+        ok = g_stage_buf[p] != nullptr;
+        if (ok) { ggml_backend_buffer_clear(g_stage_buf[p], 0); }
+    }
+    g_stage_bufs_ready = ok;
+    if (ok) {
+        g_stage_backend = ggml_backend_dev_init(dev, nullptr);
+        ok = g_stage_backend != nullptr;
+    }
+    if (ok) {
+        // Create the staging stream before any worker thread can use it (the lazy stream creation in
+        // the backend is not thread-safe).
+        ggml_backend_synchronize(g_stage_backend);
+        int nt = 0;
+        if (const char * e = getenv("LLAMA_MOE_STAGE_THREADS")) { nt = atoi(e); }
+        else if (const char * e = getenv("LLAMA_MOE_IO_THREADS")) { nt = atoi(e); }
+        if (nt <= 0) { nt = 16; }
+        if (nt > 32) { nt = 32; }
+        g_stage_nthreads = nt;
+        g_stage_host_slot = GGML_PAD(max_stride, 64);
+        const size_t host_bytes = (size_t) nt * g_stage_batch * g_stage_host_slot;
+        ggml_backend_buffer_type_t hbt = ggml_backend_dev_host_buffer_type(dev);
+        if (hbt) {
+            g_stage_host_buf = ggml_backend_buft_alloc_buffer(hbt, host_bytes);
+        }
+        if (g_stage_host_buf) {
+            g_stage_host_base = (char *) ggml_backend_buffer_get_base(g_stage_host_buf);
+        } else {
+            g_stage_host_base = (char *) malloc(host_bytes);
+            g_stage_host_heap = g_stage_host_base != nullptr;
+        }
+        ok = g_stage_host_base != nullptr;
+    }
+    if (!ok) {
+        llama_moe_stage_free_locked();
+        LLAMA_LOG_WARN("MoE prefill stage: could not allocate the staging buffers; staging disabled.\n");
+        return false;
+    }
+    g_stage_ok = true;
+    g_stage_dev = dev;
+    LLAMA_LOG_INFO("MoE prefill stage: 2 x %.0f MiB VRAM, %d host threads, %.0f MiB host arena\n",
+                   (double) g_stage_buf_bytes / (1024.0 * 1024.0), g_stage_nthreads,
+                   (double) ((size_t) g_stage_nthreads * g_stage_batch * g_stage_host_slot) / (1024.0 * 1024.0));
+    return true;
+}
+
+bool llama_moe_layer_cache_stage_init(llama_moe_layer_cache * c) {
+    const bool dbg = getenv("LLAMA_MOE_STAGE_DBG") != nullptr;
+    if (!c || !llama_moe_prefill_stage_enabled() || !c->dev_backend) {
+        if (dbg) { LLAMA_LOG_WARN("MoE stage init: bad arg c=%p enabled=%d backend=%p\n", (void *) c,
+                                  llama_moe_prefill_stage_enabled() ? 1 : 0, c ? (void *) c->dev_backend : nullptr); }
+        return false;
+    }
+    if (llama_moe_recap_pending()) {
+        if (dbg) { LLAMA_LOG_WARN("MoE stage init: recap pending\n"); }
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(g_stage_mu);
+    if (c->stage_ready) { return true; }
+    if (!llama_moe_stage_mgr_init_locked(c->dev_backend)) {
+        if (dbg) { LLAMA_LOG_WARN("MoE stage init: mgr init failed\n"); }
+        return false;
+    }
+    if (g_stage_dev != ggml_backend_get_device(c->dev_backend)) { return false; }
+    if (!g_stage_owner) { g_stage_owner = c->sched; }
+    if (g_stage_owner != c->sched) { return false; }
+    if (!g_stage_bufs_ready) {
+        bool ok = true;
+        const int n_buf = g_stage_single ? 1 : 2;
+        for (int p = 0; p < n_buf && ok; ++p) {
+            g_stage_buf[p] = ggml_backend_buft_alloc_buffer(g_stage_buft, g_stage_buf_bytes);
+            ok = g_stage_buf[p] != nullptr;
+            if (ok) { ggml_backend_buffer_clear(g_stage_buf[p], 0); }
+        }
+        if (!ok) {
+            for (int p = 0; p < 2; ++p) {
+                if (g_stage_buf[p]) { ggml_backend_buffer_free(g_stage_buf[p]); g_stage_buf[p] = nullptr; }
+            }
+            return false;
+        }
+        g_stage_bufs_ready = true;
+    }
+    if (c->proj.empty()) { return false; }
+
+    std::vector<size_t> off(c->proj.size(), 0);
+    size_t total = 0;
+    for (size_t i = 0; i < c->proj.size(); ++i) {
+        const ggml_tensor * src = c->proj[i].src;
+        if (!src || src->ne[2] != c->n_expert || (size_t) c->proj[i].stride > g_stage_host_slot) {
+            return false;
+        }
+        total = GGML_PAD(total, g_stage_align);
+        off[i] = total;
+        const size_t bytes = ggml_backend_buft_get_alloc_size(g_stage_buft, src);
+        total += GGML_PAD(bytes, g_stage_align);
+    }
+    if (total > g_stage_buf_bytes) {
+        LLAMA_LOG_WARN("MoE prefill stage: layer %d needs %.0f MiB, buffer holds %.0f MiB; using the sweep.\n",
+                       c->il, (double) total / (1024.0 * 1024.0),
+                       (double) g_stage_buf_bytes / (1024.0 * 1024.0));
+        return false;
+    }
+
+    struct ggml_init_params ip = { (c->proj.size() * 2 + 10) * ggml_tensor_overhead(), nullptr, true };
+    c->stage_ctx = ggml_init(ip);
+    if (!c->stage_ctx) { return false; }
+    bool ok = true;
+    const int n_buf = g_stage_single ? 1 : 2;
+    for (int p = 0; p < n_buf && ok; ++p) {
+        c->stage_proj[p].assign(c->proj.size(), nullptr);
+        char * base = (char *) ggml_backend_buffer_get_base(g_stage_buf[p]);
+        for (size_t i = 0; i < c->proj.size() && ok; ++i) {
+            const ggml_tensor * src = c->proj[i].src;
+            ggml_tensor * t = ggml_new_tensor_3d(c->stage_ctx, src->type, src->ne[0], src->ne[1], src->ne[2]);
+            GGML_ASSERT(t && t->nb[2] == src->nb[2] && "staging tensor layout must match the expert slab");
+            ok = t && ggml_backend_tensor_alloc(g_stage_buf[p], t, base + off[i]) == GGML_STATUS_SUCCESS;
+            if (ok) { c->stage_proj[p][i] = t; }
+        }
+    }
+    if (ok && llama_moe_prefill_warm_enabled()) {
+        int max_tok = 32768;
+        if (const char * e = getenv("LLAMA_MOE_STAGE_WGT_MAX")) {
+            const int v = atoi(e);
+            if (v > 0) { max_tok = v; }
+        }
+        c->stage_mask_tensor = ggml_new_tensor_3d(c->stage_ctx, GGML_TYPE_F32, 1, c->n_used, max_tok);
+        const size_t mask_bytes = c->stage_mask_tensor ? ggml_nbytes(c->stage_mask_tensor) : 0;
+        c->stage_mask_buf = mask_bytes ? ggml_backend_buft_alloc_buffer(g_stage_buft, mask_bytes) : nullptr;
+        ok = c->stage_mask_buf && ggml_backend_tensor_alloc(
+                c->stage_mask_buf, c->stage_mask_tensor,
+                ggml_backend_buffer_get_base(c->stage_mask_buf)) == GGML_STATUS_SUCCESS;
+        if (ok) {
+            c->mask_max_tokens = max_tok;
+            ggml_backend_buffer_clear(c->stage_mask_buf, 0);
+            c->stage_sel_tensor = ggml_new_tensor_2d(c->stage_ctx, GGML_TYPE_I32, c->n_used, max_tok);
+            const size_t sel_bytes = c->stage_sel_tensor ? ggml_nbytes(c->stage_sel_tensor) : 0;
+            // Device-resident: the warm gate rewrites it with safe routing ids and mul_mat_id consumes
+            // the view directly, so no cross-backend copy of the ids occurs.
+            c->stage_sel_buf = sel_bytes ? ggml_backend_buft_alloc_buffer(g_stage_buft, sel_bytes) : nullptr;
+            ok = c->stage_sel_buf && ggml_backend_tensor_alloc(
+                    c->stage_sel_buf, c->stage_sel_tensor,
+                    ggml_backend_buffer_get_base(c->stage_sel_buf)) == GGML_STATUS_SUCCESS;
+            if (ok) {
+                c->sel_max_tokens = max_tok;
+                ggml_backend_buffer_clear(c->stage_sel_buf, 0);
+                c->stage_wgt_host = ggml_new_tensor_3d(c->stage_ctx, GGML_TYPE_F32, 1, c->n_used, max_tok);
+                const size_t wh_bytes = c->stage_wgt_host ? ggml_nbytes(c->stage_wgt_host) : 0;
+                c->stage_wgt_host_buf = wh_bytes ? ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), wh_bytes) : nullptr;
+                ok = c->stage_wgt_host_buf && ggml_backend_tensor_alloc(
+                        c->stage_wgt_host_buf, c->stage_wgt_host,
+                        ggml_backend_buffer_get_base(c->stage_wgt_host_buf)) == GGML_STATUS_SUCCESS;
+            }
+        }
+    }
+    if (!ok) {
+        if (c->stage_wgt_host_buf) { ggml_backend_buffer_free(c->stage_wgt_host_buf); c->stage_wgt_host_buf = nullptr; }
+        c->stage_wgt_host = nullptr;
+        if (c->stage_sel_buf) { ggml_backend_buffer_free(c->stage_sel_buf); c->stage_sel_buf = nullptr; }
+        c->stage_sel_tensor = nullptr;
+        if (c->stage_mask_buf) { ggml_backend_buffer_free(c->stage_mask_buf); c->stage_mask_buf = nullptr; }
+        c->stage_mask_tensor = nullptr;
+        ggml_free(c->stage_ctx);
+        c->stage_ctx = nullptr;
+        c->stage_proj[0].clear();
+        c->stage_proj[1].clear();
+        return false;
+    }
+    c->stage_ready = true;
+    c->stage_have.assign((size_t) c->n_expert, 0);
+    LLAMA_LOG_INFO("MoE prefill stage: layer %d ready (%zu expert bytes per layer)\n", c->il, total);
+    return true;
+}
+
+bool llama_moe_layer_cache_stage_ready(const llama_moe_layer_cache * c) {
+    return c && c->stage_ready;
+}
+
+ggml_tensor * llama_moe_layer_cache_stage_sel_view(ggml_context * ctx0, llama_moe_layer_cache * c,
+                                                   int64_t n_used, int64_t n_tokens) {
+    if (!c || !c->stage_sel_tensor || n_used != c->n_used || n_tokens <= 0 ||
+        n_tokens > c->sel_max_tokens) {
+        return nullptr;
+    }
+    return ggml_view_2d(ctx0, c->stage_sel_tensor, n_used, n_tokens, c->stage_sel_tensor->nb[1], 0);
+}
+
+ggml_tensor * llama_moe_layer_cache_stage_mask_view(ggml_context * ctx0, llama_moe_layer_cache * c,
+                                                     int64_t n_used, int64_t n_tokens) {
+    if (!c || !c->stage_mask_tensor || n_used != c->n_used || n_tokens <= 0 ||
+        n_tokens > c->mask_max_tokens) {
+        return nullptr;
+    }
+    return ggml_view_3d(ctx0, c->stage_mask_tensor, 1, n_used, n_tokens,
+                        c->stage_mask_tensor->nb[1], c->stage_mask_tensor->nb[2], 0);
+}
+
+ggml_tensor * llama_moe_layer_cache_stage_dev(llama_moe_layer_cache * c, const ggml_tensor * exps, int parity) {
+    if (!c || !c->stage_ready || parity < 0 || parity > 1) { return nullptr; }
+    const int p = g_stage_single ? 0 : parity;
+    for (size_t i = 0; i < c->proj.size(); ++i) {
+        if (c->proj[i].src == exps) { return c->stage_proj[p][i]; }
+    }
+    return nullptr;
+}
+
+static void llama_moe_stage_worker(llama_moe_stage_job * job, int tid, int nt) {
+    llama_moe_layer_cache * c = job->c;
+    std::vector<FILE *> files((size_t) job->n_proj, nullptr);
+    char * host = g_stage_host_base + (size_t) tid * g_stage_batch * g_stage_host_slot;
+
+    struct pending_h2d { ggml_tensor * dst; size_t off; size_t bytes; int slot; };
+    std::vector<pending_h2d> pend;
+    pend.reserve((size_t) g_stage_batch);
+
+    const int64_t total = (int64_t) job->experts.size() * job->n_proj;
+    const int64_t lo = (int64_t) tid * total / nt;
+    const int64_t hi = (int64_t) (tid + 1) * total / nt;
+    for (int64_t base = lo; base < hi; base += g_stage_batch) {
+        const int64_t end = std::min<int64_t>(base + g_stage_batch, hi);
+        pend.clear();
+        for (int64_t u = base; u < end; ++u) {
+            const int e  = job->experts[(size_t) (u / job->n_proj)];
+            const int pi = (int) (u % job->n_proj);
+            const llama_moe_proj_store & pr = c->proj[(size_t) pi];
+            ggml_tensor * dst = c->stage_proj[job->parity][(size_t) pi];
+            const size_t stride = (size_t) pr.stride;
+            const size_t off    = (size_t) e * stride;
+            const char * sp = job->src[(size_t) pi * job->n_expert + e];
+            const int32_t vs = job->vram_slot[(size_t) e];
+            if (job->ram_only && !job->ram_src[(size_t) pi * job->n_expert + e] && vs < 0) {
+                continue; // hint job: only RAM/VRAM-cache sources, no mmap faults or disk reads
+            }
+            if (vs >= 0) {
+                ggml_tensor src_slice = *c->proj[(size_t) pi].dev;
+                src_slice.ne[2] = 1;
+                src_slice.nb[3] = src_slice.nb[2];
+                src_slice.data  = (char *) src_slice.data + (size_t) vs * stride;
+
+                ggml_tensor dst_slice = *dst;
+                dst_slice.ne[2] = 1;
+                dst_slice.nb[3] = dst_slice.nb[2];
+                dst_slice.data  = (char *) dst_slice.data + off;
+
+                ggml_backend_tensor_copy(&src_slice, &dst_slice);
+                job->bytes.fetch_add(stride, std::memory_order_relaxed);
+                job->vram_experts.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (sp) {
+                // RAM or mmap: the pointer is stable while the job's pins are held, so the copy can
+                // read it directly.
+                ggml_backend_tensor_set_async(g_stage_backend, dst, sp, off, stride);
+                job->bytes.fetch_add(stride, std::memory_order_relaxed);
+                job->ram_experts.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (!files[(size_t) pi] && !pr.fpath.empty()) {
+                files[(size_t) pi] = fopen(pr.fpath.c_str(), "rb");
+            }
+            const int slot = (int) (u - base);
+            char * h = host + (size_t) slot * g_stage_host_slot;
+            const int64_t t0 = ggml_time_us();
+            const bool ok = files[(size_t) pi] &&
+                            llama_moe_pread(files[(size_t) pi], pr.foff0 + (uint64_t) e * stride, h, stride);
+            job->read_ns.fetch_add((uint64_t) (ggml_time_us() - t0), std::memory_order_relaxed);
+            if (!ok) {
+                memset(h, 0, stride);
+                job->failed.fetch_add(1, std::memory_order_relaxed);
+            }
+            pend.push_back({ dst, off, stride, slot });
+            job->bytes.fetch_add(stride, std::memory_order_relaxed);
+            job->disk_experts.fetch_add(1, std::memory_order_relaxed);
+        }
+        // One synchronize per batch instead of per expert: the host slots are reused only after the
+        // staging stream has consumed every copy of this batch.
+        for (const pending_h2d & p : pend) {
+            ggml_backend_tensor_set_async(g_stage_backend, p.dst,
+                                          host + (size_t) p.slot * g_stage_host_slot, p.off, p.bytes);
+        }
+        if (!pend.empty()) {
+            ggml_backend_synchronize(g_stage_backend);
+        }
+    }
+    for (FILE * f : files) { if (f) { fclose(f); } }
+}
+
+// Caller holds g_stage_mu.
+static bool llama_moe_stage_start_locked(llama_moe_layer_cache * c,
+                                         const std::vector<int32_t> * experts,
+                                         bool ram_only, bool clear_have, bool mark_all) {
+    if (!c || !c->stage_ready || g_stage_job) { return false; }
+    if (experts && experts->empty()) { return false; }
+    llama_moe_stage_job * job = new llama_moe_stage_job();
+    job->c        = c;
+    job->parity   = g_stage_single ? 0 : ((c->il >= 0 ? c->il : 0) & 1);
+    job->n_expert = c->n_expert;
+    job->n_proj   = (int) c->proj.size();
+    job->ram_only = ram_only;
+    job->mark_all = mark_all;
+    job->src.assign((size_t) job->n_expert * job->n_proj, nullptr);
+    job->ram_src.assign((size_t) job->n_expert * job->n_proj, 0);
+    job->vram_slot.assign((size_t) job->n_expert, -1);
+    job->staged.assign((size_t) job->n_expert, 0);
+    if (experts) {
+        job->experts = *experts;
+    } else {
+        job->experts.resize((size_t) job->n_expert);
+        for (int e = 0; e < job->n_expert; ++e) { job->experts[(size_t) e] = e; }
+    }
+    if (clear_have && (int) c->stage_have.size() == job->n_expert) {
+        std::fill(c->stage_have.begin(), c->stage_have.end(), 0);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_moe_layer_mutex);
+        for (int pi = 0; pi < job->n_proj; ++pi) {
+            const llama_moe_proj_store & pr = c->proj[(size_t) pi];
+            for (int e = 0; e < job->n_expert; ++e) {
+                const char * sp = llama_moe_layer_src(c, (size_t) pi, e);
+                job->src[(size_t) pi * job->n_expert + e] = sp;
+                if (sp && pr.ram) {
+                    const int32_t rs = c->ram_slot[(size_t) e];
+                    if (rs >= 0) {
+                        job->ram_src[(size_t) pi * job->n_expert + e] = 1;
+                        if (!c->ram_pin.empty() && rs < (int32_t) c->ram_pin.size()) {
+                            c->ram_pin[(size_t) rs] = 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Prefer an expert already in the VRAM cache: it is one device-to-device copy instead of a
+        // RAM H2D or a disk read. Pin the slot for this job's generation so the loader cannot recycle
+        // it mid-copy; the next job bumps pin_gen and retires these pins.
+        if ((int) c->expert_slot.size() == job->n_expert && (int) c->slot_pin.size() == c->capacity) {
+            const uint64_t gen = ++c->pin_gen;
+            for (int e = 0; e < job->n_expert; ++e) {
+                const int32_t vs = c->expert_slot[(size_t) e];
+                if (vs >= 0 && vs < c->capacity) {
+                    job->vram_slot[(size_t) e] = vs;
+                    c->slot_pin[(size_t) vs] = gen;
+                }
+            }
+        }
+    }
+    // An expert counts as staged by the hint job only when every projection has a cheap source
+    // (VRAM cache or RAM). mmap sources are left for the union job so a cold page cache does not turn
+    // the hint into a disk read.
+    for (int e = 0; e < job->n_expert; ++e) {
+        bool all_src = true;
+        for (int pi = 0; pi < job->n_proj; ++pi) {
+            if (!job->ram_src[(size_t) pi * job->n_expert + e] && job->vram_slot[(size_t) e] < 0) {
+                all_src = false;
+                break;
+            }
+        }
+        job->staged[(size_t) e] = all_src ? 1 : 0;
+    }
+
+    int nt = g_stage_nthreads;
+    const int units = (int) job->experts.size() * job->n_proj;
+    if (nt > units) { nt = units; }
+    if (nt < 1) { nt = 1; }
+    for (int t = 0; t < nt; ++t) {
+        job->threads.emplace_back(llama_moe_stage_worker, job, t, nt);
+    }
+    g_stage_job = job;
+    return true;
+}
+
+static void llama_moe_stage_finish(llama_moe_stage_job * job) {
+    if (!job) { return; }
+    for (auto & th : job->threads) { th.join(); }
+    ggml_backend_synchronize(g_stage_backend);
+    {
+        std::lock_guard<std::mutex> lk(g_moe_layer_mutex);
+        if (job->c && !job->c->ram_pin.empty()) {
+            std::fill(job->c->ram_pin.begin(), job->c->ram_pin.end(), 0);
+        }
+    }
+    if (job->c && (int) job->c->stage_have.size() == job->n_expert) {
+        for (const int32_t e : job->experts) {
+            if (e >= 0 && e < job->n_expert && (job->mark_all || job->staged[(size_t) e])) {
+                job->c->stage_have[(size_t) e] = 1;
+            }
+        }
+    }
+    const uint64_t bytes = job->bytes.load();
+    const uint64_t ram   = job->ram_experts.load();
+    const uint64_t vram  = job->vram_experts.load();
+    const uint64_t disk  = job->disk_experts.load();
+    const uint64_t fail  = job->failed.load();
+    g_stage_stat_jobs.fetch_add(1, std::memory_order_relaxed);
+    g_stage_stat_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    g_stage_stat_ram.fetch_add(ram, std::memory_order_relaxed);
+    g_stage_stat_disk.fetch_add(disk, std::memory_order_relaxed);
+    if (getenv("LLAMA_MOE_STAGEDBG")) {
+        LLAMA_LOG_WARN("MoE STAGE il=%d units=%llu VRAM=%llu RAM=%llu DISK=%llu fail=%llu bytes=%.0f MiB read=%.0fms\n",
+                       job->c ? job->c->il : -1, (unsigned long long) (ram + vram + disk),
+                       (unsigned long long) vram, (unsigned long long) ram,
+                       (unsigned long long) disk, (unsigned long long) fail,
+                       (double) bytes / (1024.0 * 1024.0), (double) job->read_ns.load() / 1000.0);
+    }
+    delete job;
+}
+
+static bool llama_moe_prefill_stage_wait_pending(llama_moe_layer_cache * c) {
+    if (!c) { return false; }
+    llama_moe_stage_job * job = nullptr;
+    bool matched = false;
+    {
+        std::lock_guard<std::mutex> lk(g_stage_mu);
+        if (g_stage_job) {
+            job = g_stage_job;
+            g_stage_job = nullptr;
+            matched = job->c == c;
+        }
+    }
+    if (job) { llama_moe_stage_finish(job); }
+    return matched;
+}
+
+static void llama_moe_prefill_stage_wait(llama_moe_layer_cache * c) {
+    if (!c || !c->stage_ready) { return; }
+    bool matched = llama_moe_prefill_stage_wait_pending(c);
+    if (!matched) {
+        // First staged layer of a forward, or a layer whose submit was skipped: stage it inline.
+        llama_moe_stage_job * job = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_stage_mu);
+            if (llama_moe_stage_start_locked(c, nullptr, false, true, true)) {
+                job = g_stage_job;
+                g_stage_job = nullptr;
+            }
+        }
+        if (job) { llama_moe_stage_finish(job); }
+    }
+}
+
+static void llama_moe_prefill_stage_submit_next(llama_moe_layer_cache * c, bool ram_only) {
+    if (g_stage_single) { return; } // one buffer: no layer-ahead overlap
+    // Diagnostic: stage each layer inline in its own callback, with no layer-ahead overlap.
+    static const bool no_overlap = getenv("LLAMA_MOE_STAGE_NO_OVERLAP") != nullptr;
+    if (no_overlap) { return; }
+    if (!c || c->il < 0) { return; }
+    llama_moe_layer_cache * next = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_moe_layer_mutex);
+        for (const auto & kv : g_moe_layer_caches) {
+            llama_moe_layer_cache * n = kv.second;
+            if (n && n->sched == c->sched && n->il == c->il + 1 && n->stage_ready) { next = n; break; }
+        }
+    }
+    if (!next) { return; }
+    std::lock_guard<std::mutex> lk(g_stage_mu);
+    if (!g_stage_job) { llama_moe_stage_start_locked(next, nullptr, ram_only, true, false); }
+}
+
+void llama_moe_layer_cache_stage_set_all(llama_moe_layer_cache * c, bool all) {
+    if (c) { c->stage_gate_all = all; }
+}
+
+void llama_moe_layer_cache_stage_set_warm(llama_moe_layer_cache * c, bool warm, int fetch) {
+    if (!c) { return; }
+    c->stage_gate_warm = warm;
+    if (fetch > 0) { c->stage_warm_fetch = fetch; }
+}
+
+void llama_moe_layer_cache_stage_set_wgt_dev(llama_moe_layer_cache * c, const struct ggml_tensor * wgt) {
+    if (c) { c->stage_wgt_dev = wgt; }
+}
+
+// Fork diagnostic: dump the layout and contents of a routed-id tensor as the CPU callback sees it.
+// LLAMA_MOE_STAGE_IDSDBG=1 logs one row per layer, >1 logs three rows.
+static void llama_moe_dbg_ids(const char * tag, const ggml_tensor * ids, int il) {
+    const char * env = getenv("LLAMA_MOE_STAGE_IDSDBG");
+    if (!env || !ids || !ids->data) { return; }
+    const int64_t n_used = ids->ne[0];
+    const int64_t n_tok  = ids->ne[1];
+    std::vector<int32_t> flat;
+    llama_moe_flatten_ids(ids, flat);
+    std::vector<int32_t> uniq = flat;
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+    const bool host = ids->buffer && ggml_backend_buffer_is_host(ids->buffer);
+    LLAMA_LOG_WARN("MoE IDSDBG %s il=%d name=%s ne=[%d,%d] nb=[%zu,%zu,%zu,%zu] type=%d host=%d buf=%s uniq=%zu\n",
+                   tag, il, ids->name, (int) n_used, (int) n_tok,
+                   ids->nb[0], ids->nb[1], ids->nb[2], ids->nb[3], (int) ids->type,
+                   host ? 1 : 0, ids->buffer ? ggml_backend_buffer_name(ids->buffer) : "-", uniq.size());
+    const int rows = atoi(env) > 1 ? 3 : 1;
+    for (int64_t t = 0; t < n_tok && t < rows; ++t) {
+        char row[192] = {0};
+        int off = 0;
+        for (int64_t e = 0; e < n_used && e < 8 && off < (int) sizeof(row) - 16; ++e) {
+            const int32_t v = *(const int32_t *) ((const char *) ids->data + t * ids->nb[1] + e * ids->nb[0]);
+            off += snprintf(row + off, sizeof(row) - off, "%d,", v);
+        }
+        LLAMA_LOG_WARN("MoE IDSDBG   t=%d ids=[%s]\n", (int) t, row);
+    }
+}
+
+static void llama_moe_prefill_stage_gate_cb(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0 || !dst || !dst->data) { return; }
+    *(float *) dst->data = 1.0f;
+    llama_moe_layer_cache * c = (llama_moe_layer_cache *) userdata;
+    const ggml_tensor * sel = dst->src[0];
+    if (!c || !c->stage_ready || !sel || !sel->data) { return; }
+    g_stage_prefill_used.store(true, std::memory_order_relaxed);
+    if (getenv("LLAMA_MOE_STAGE_DBG") && c->il == 0) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1, std::memory_order_relaxed) < 4) {
+            LLAMA_LOG_WARN("MoE stage gate ran il=%d n_tokens=%d all=%d\n", c->il,
+                           (int) sel->ne[1], c->stage_gate_all ? 1 : 0);
+        }
+    }
+    llama_moe_dbg_ids("exact", sel, c->il);
+
+    if (c->stage_gate_all) {
+        // Whole-layer mode: the ahead job read every expert into the next parity while the previous
+        // layer computed, so this wait is normally already satisfied. Score from the routed ids so
+        // the first decode token starts on the prompt's hot set.
+        llama_moe_prefill_stage_wait(c);
+        std::vector<int32_t> flat;
+        llama_moe_flatten_ids(sel, flat);
+        {
+            std::lock_guard<std::mutex> lk(g_moe_layer_mutex);
+            llama_moe_stage_score_prefill(c, flat.data(), (int) sel->ne[0], (int) sel->ne[1]);
+        }
+        llama_moe_prefill_stage_submit_next(c, false);
+        return;
+    }
+
+    // Union mode: the hint job, if any, staged this layer's RAM/VRAM-resident experts one layer
+    // ahead. Anything it did not cover is staged here: the union of the experts this layer actually
+    // routed to. Unselected experts keep whatever the buffer held; mul_mat_id skips experts with no
+    // routed tokens.
+    const bool have_ahead = llama_moe_prefill_stage_wait_pending(c);
+    if (!have_ahead && (int) c->stage_have.size() == c->n_expert) {
+        std::fill(c->stage_have.begin(), c->stage_have.end(), 0);
+    }
+
+    std::vector<int32_t> missing;
+    std::vector<char> seen((size_t) c->n_expert, 0);
+    std::vector<int32_t> flat;
+    llama_moe_flatten_ids(sel, flat);
+    const int32_t * ids = flat.data();
+    const int64_t n = (int64_t) flat.size();
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= c->n_expert || seen[(size_t) e]) { continue; }
+        seen[(size_t) e] = 1;
+        if ((int) c->stage_have.size() != c->n_expert || !c->stage_have[(size_t) e]) {
+            missing.push_back(e);
+        }
+    }
+
+    {
+        // Same lock the sweep's scorer holds; the background loader reads expert_score under it.
+        std::lock_guard<std::mutex> lk(g_moe_layer_mutex);
+        llama_moe_stage_score_prefill(c, ids, (int) sel->ne[0], (int) sel->ne[1]);
+    }
+
+    if (!missing.empty()) {
+        llama_moe_stage_job * job = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_stage_mu);
+            if (!g_stage_job && llama_moe_stage_start_locked(c, &missing, false, false, true)) {
+                job = g_stage_job;
+                g_stage_job = nullptr;
+            }
+        }
+        if (job) { llama_moe_stage_finish(job); }
+    }
+    llama_moe_prefill_stage_submit_next(c, true);
+}
+
+ggml_tensor * llama_moe_prefill_stage_gate(ggml_context * ctx0, ggml_tensor * selected_experts, void * cache) {
+    if (getenv("LLAMA_MOE_STAGE_IDSDBG")) {
+        LLAMA_LOG_WARN("MoE IDSDBG build-exact name=%s ne=[%d,%d] nb=[%zu,%zu,%zu,%zu] view=%d\n",
+                       selected_experts->name, (int) selected_experts->ne[0], (int) selected_experts->ne[1],
+                       selected_experts->nb[0], selected_experts->nb[1], selected_experts->nb[2],
+                       selected_experts->nb[3], selected_experts->view_src ? 1 : 0);
+    }
+    ggml_tensor * args[1] = { selected_experts };
+    return ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, 1, 1, 1, args, 1,
+                          llama_moe_prefill_stage_gate_cb, 1, cache);
+}
+
+static void llama_moe_prefill_stage_wcopy_cb(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0 || !dst || !dst->data) { return; }
+    *(float *) dst->data = 0.0f;
+    llama_moe_layer_cache * c = (llama_moe_layer_cache *) userdata;
+    const ggml_tensor * w = dst->src[0];
+    if (!c || !c->stage_wgt_host || !w || !w->data) { return; }
+    const int n_used   = (int) w->ne[1];
+    const int n_tokens = (int) w->ne[2];
+    if (n_tokens > c->mask_max_tokens) { return; }
+    float * host = (float *) c->stage_wgt_host->data;
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int u = 0; u < n_used; ++u) {
+            host[(size_t) (t * n_used + u)] =
+                *(const float *) ((const char *) w->data + (size_t) t * w->nb[2] + (size_t) u * w->nb[1]);
+        }
+    }
+}
+
+ggml_tensor * llama_moe_prefill_stage_wcopy(ggml_context * ctx0, ggml_tensor * weights, void * cache) {
+    ggml_tensor * args[1] = { weights };
+    return ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, 1, 1, 1, args, 1,
+                          llama_moe_prefill_stage_wcopy_cb, 1, cache);
+}
+
+static void llama_moe_prefill_stage_gate_warm_cb(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0 || !dst || !dst->data) { return; }
+    *(float *) dst->data = 1.0f;
+    llama_moe_layer_cache * c = (llama_moe_layer_cache *) userdata;
+    const ggml_tensor * sel = dst->src[0];
+    if (!c || !c->stage_ready || !sel || !sel->data || !c->stage_wgt_host) { return; }
+    llama_moe_dbg_ids("warm", sel, c->il);
+    const int n_used   = (int) sel->ne[0];
+    const int n_tokens = (int) sel->ne[1];
+    if (n_tokens > c->mask_max_tokens) { return; }
+
+    // Read the routing weights from this graph's device tensor. The scheduler's CPU copies of the
+    // strided id view are unreliable here, so the weights are fetched explicitly.
+    std::vector<float> wv((size_t) n_used * n_tokens, 0.0f);
+    const ggml_tensor * wdev = c->stage_wgt_dev;
+    if (wdev && wdev->buffer) {
+        const ggml_tensor * root = wdev;
+        size_t off = 0;
+        while (root->view_src) { off += root->view_offs; root = root->view_src; }
+        size_t span = ggml_type_size(wdev->type);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) { span += (size_t) (wdev->ne[d] - 1) * wdev->nb[d]; }
+        if (off + span <= ggml_backend_buffer_get_size(root->buffer)) {
+            const size_t ts = ggml_type_size(root->type);
+            ggml_tensor tmp = *root;
+            const size_t need = off + span;
+            tmp.ne[0] = (int64_t) ((need + ts - 1) / ts);
+            tmp.ne[1] = tmp.ne[2] = tmp.ne[3] = 1;
+            tmp.nb[0] = ts; tmp.nb[1] = tmp.nb[2] = tmp.nb[3] = (size_t) tmp.ne[0] * ts;
+            tmp.data = root->data; tmp.buffer = root->buffer; tmp.view_src = nullptr; tmp.view_offs = 0;
+            std::vector<char> host(need);
+            if (c->dev_backend) { ggml_backend_synchronize(c->dev_backend); }
+            ggml_backend_tensor_get(&tmp, host.data(), 0, need);
+            for (int t = 0; t < n_tokens; ++t) {
+                for (int u = 0; u < n_used; ++u) {
+                    wv[(size_t) (t * n_used + u)] =
+                        *(const float *) (host.data() + off + (size_t) t * wdev->nb[2] + (size_t) u * wdev->nb[1]);
+                }
+            }
+        }
+    }
+
+    std::vector<int32_t> flat;
+    llama_moe_flatten_ids(sel, flat);
+    const bool have_ahead = llama_moe_prefill_stage_wait_pending(c);
+    if (!have_ahead && (int) c->stage_have.size() == c->n_expert) {
+        std::fill(c->stage_have.begin(), c->stage_have.end(), 0);
+    }
+
+    std::vector<int32_t> unique;
+    std::vector<char> seen((size_t) c->n_expert, 0);
+    for (int64_t i = 0; i < (int64_t) flat.size(); ++i) {
+        const int32_t e = flat[(size_t) i];
+        if (e < 0 || e >= c->n_expert || seen[(size_t) e]) { continue; }
+        seen[(size_t) e] = 1;
+        unique.push_back(e);
+    }
+    std::vector<char> hot((size_t) c->n_expert, 0);
+    {
+        std::lock_guard<std::mutex> lk(g_moe_layer_mutex);
+        for (const int32_t e : unique) {
+            const bool staged = (int) c->stage_have.size() == c->n_expert && c->stage_have[(size_t) e];
+            const bool vram   = (int) c->expert_slot.size() == c->n_expert && c->expert_slot[(size_t) e] >= 0;
+            const bool ram    = (int) c->ram_slot.size() == c->n_expert && c->ram_slot[(size_t) e] >= 0;
+            hot[(size_t) e] = (staged || vram || ram) ? 1 : 0;
+        }
+    }
+
+    std::vector<double> score((size_t) c->n_expert, 0.0);
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int u = 0; u < n_used; ++u) {
+            const int32_t e = flat[(size_t) (t * n_used + u)];
+            if (e >= 0 && e < c->n_expert) { score[(size_t) e] += wv[(size_t) (t * n_used + u)]; }
+        }
+    }
+    std::vector<int32_t> cold;
+    for (const int32_t e : unique) {
+        if (!hot[(size_t) e]) { cold.push_back(e); }
+    }
+    std::sort(cold.begin(), cold.end(), [&](int32_t x, int32_t y) {
+        return score[(size_t) x] != score[(size_t) y] ? score[(size_t) x] > score[(size_t) y] : x < y;
+    });
+    // At least n_used cold experts are kept, so the stand-in pool below always has n_used distinct
+    // staged experts whenever this layer drops anything.
+    const int fetch = std::max(c->stage_warm_fetch > 0 ? c->stage_warm_fetch : 64, (int) n_used);
+    if ((int) cold.size() > fetch) { cold.resize((size_t) fetch); }
+
+    std::vector<char> keep((size_t) c->n_expert, 0);
+    for (const int32_t e : unique) { if (hot[(size_t) e]) { keep[(size_t) e] = 1; } }
+    for (const int32_t e : cold)   { keep[(size_t) e] = 1; }
+
+    std::vector<char> keep_pos((size_t) n_used * n_tokens, 0);
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int u = 0; u < n_used; ++u) {
+            const int32_t e = flat[(size_t) (t * n_used + u)];
+            keep_pos[(size_t) (t * n_used + u)] =
+                (e >= 0 && e < c->n_expert && keep[(size_t) e]) ? 1 : 0;
+        }
+    }
+
+    // Diagnostic: LLAMA_MOE_WARM_STAGE_ALL=1 stages every routed expert while keeping the warm mask,
+    // to separate stale-slab reads from the mask arithmetic itself.
+    static const bool warm_stage_all = moe_env_on("LLAMA_MOE_WARM_STAGE_ALL", false);
+    std::vector<int32_t> stage_list;
+    for (const int32_t e : unique) {
+        if (!warm_stage_all && !keep[(size_t) e]) { continue; }
+        if ((int) c->stage_have.size() == c->n_expert && c->stage_have[(size_t) e]) { continue; }
+        stage_list.push_back(e);
+    }
+    // Top up the staged set to at least n_used experts. The zeroed routing weights of dropped
+    // positions need stand-in experts that are definitely present in the staging buffer; see below.
+    {
+        int have = (int) stage_list.size();
+        for (int e = 0; e < c->n_expert && have < n_used; ++e) {
+            if ((int) c->stage_have.size() == c->n_expert && c->stage_have[(size_t) e]) { continue; }
+            if (std::find(stage_list.begin(), stage_list.end(), e) != stage_list.end()) { continue; }
+            stage_list.push_back(e);
+            ++have;
+        }
+    }
+    if (getenv("LLAMA_MOE_STAGE_WARMDbg")) {
+        LLAMA_LOG_WARN("MoE WARM il=%d n_used=%d n_tok=%d unique=%zu hot=%zu cold=%zu fetch=%d stage=%zu\n",
+                       c->il, n_used, n_tokens, unique.size(),
+                       (size_t) std::count(hot.begin(), hot.end(), 1), cold.size(), fetch, stage_list.size());
+    }
+    if (!stage_list.empty()) {
+        llama_moe_stage_job * job = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_stage_mu);
+            if (!g_stage_job && llama_moe_stage_start_locked(c, &stage_list, false, false, true)) {
+                job = g_stage_job;
+                g_stage_job = nullptr;
+            }
+        }
+        if (job) { llama_moe_stage_finish(job); }
+    }
+
+    // A dropped position keeps its routing id, so mul_mat_id still evaluates it against a slab this
+    // layer did not refresh - stale bytes whose quantized decode can be NaN/Inf, and 0 * NaN poisons
+    // the token. Route every dropped position to a distinct staged stand-in instead: the mask weight
+    // is zero, so its contribution is exactly zero and no stale slab is read.
+    if (c->stage_sel_tensor) {
+        std::vector<int32_t> pool;
+        for (int e = 0; e < c->n_expert; ++e) {
+            if ((int) c->stage_have.size() == c->n_expert && c->stage_have[(size_t) e]) { pool.push_back(e); }
+        }
+        if ((int) pool.size() >= n_used) {
+            // mul_mat_id requires the ids of one token to be distinct, so each stand-in must also
+            // avoid the experts this token already routes to.
+            std::vector<int32_t> ids_out((size_t) n_used * n_tokens);
+            std::vector<char> used((size_t) c->n_expert, 0);
+            for (int t = 0; t < n_tokens; ++t) {
+                std::fill(used.begin(), used.end(), 0);
+                const size_t base = (size_t) t * n_used;
+                for (int u = 0; u < n_used; ++u) {
+                    const int32_t e = flat[base + u];
+                    if (keep_pos[base + u] && e >= 0 && e < c->n_expert) { used[(size_t) e] = 1; }
+                }
+                size_t next = 0;
+                for (int u = 0; u < n_used; ++u) {
+                    const size_t pos = base + u;
+                    if (keep_pos[pos]) { ids_out[pos] = flat[pos]; continue; }
+                    while (next < pool.size() && used[(size_t) pool[next]]) { ++next; }
+                    const int32_t e = next < pool.size() ? pool[next] : pool[(size_t) u % pool.size()];
+                    if (next < pool.size()) { ++next; }
+                    ids_out[pos] = e;
+                    used[(size_t) e] = 1;
+                }
+            }
+            ggml_backend_tensor_set(c->stage_sel_tensor, ids_out.data(), 0, ids_out.size() * sizeof(int32_t));
+            if (getenv("LLAMA_MOE_STAGE_IDSDBG")) {
+                std::vector<int32_t> chk(ids_out.size());
+                ggml_backend_tensor_get(c->stage_sel_tensor, chk.data(), 0, chk.size() * sizeof(int32_t));
+                int mn = c->n_expert, mx = -1;
+                for (const int32_t e : chk) { if (e < mn) { mn = e; } if (e > mx) { mx = e; } }
+                LLAMA_LOG_WARN("MoE IDSDBG warm-ids il=%d n=%zu first=[%d,%d,%d,%d,%d,%d] min=%d max=%d match=%d\n",
+                               c->il, chk.size(), chk[0], chk[1], chk[2], chk[3], chk[4], chk[5], mn, mx,
+                               chk == ids_out ? 1 : 0);
+            }
+        } else if (getenv("LLAMA_MOE_STAGE_IDSDBG")) {
+            LLAMA_LOG_WARN("MoE IDSDBG warm il=%d stage pool %zu < n_used %d\n",
+                           c->il, pool.size(), (int) n_used);
+        }
+    }
+
+    std::vector<float> wout((size_t) n_used * n_tokens, 0.0f);
+    int n_all_drop = 0;
+    double scale_min = 1e30, scale_max = 0.0;
+    for (int t = 0; t < n_tokens; ++t) {
+        double total = 0.0;
+        double kept  = 0.0;
+        for (int u = 0; u < n_used; ++u) {
+            const float ww = wv[(size_t) (t * n_used + u)];
+            total += ww;
+            if (keep_pos[(size_t) (t * n_used + u)]) { kept += ww; }
+        }
+        const double scale = kept > 0.0 ? total / kept : 0.0;
+        if (kept <= 0.0) { ++n_all_drop; }
+        if (scale < scale_min) { scale_min = scale; }
+        if (scale > scale_max) { scale_max = scale; }
+        for (int u = 0; u < n_used; ++u) {
+            const float ww = wv[(size_t) (t * n_used + u)];
+            wout[(size_t) (t * n_used + u)] =
+                keep_pos[(size_t) (t * n_used + u)] ? (float) (ww * scale) : 0.0f;
+        }
+    }
+    if (getenv("LLAMA_MOE_STAGE_IDSDBG")) {
+        LLAMA_LOG_WARN("MoE IDSDBG warm-mask il=%d w0=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f] drop_pos=%d/%d all_drop_tok=%d scale=[%.4f,%.4f]\n",
+                       c->il, wv[0], wv[1], wv[2], wv[3], wv[4], wv[5],
+                       n_used * n_tokens - (int) std::count(keep_pos.begin(), keep_pos.end(), 1),
+                       n_used * n_tokens, n_all_drop, scale_min, scale_max);
+    }
+    if (c->stage_mask_tensor) {
+        ggml_backend_tensor_set(c->stage_mask_tensor, wout.data(), 0, wout.size() * sizeof(float));
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_moe_layer_mutex);
+        llama_moe_stage_score_prefill(c, flat.data(), n_used, n_tokens);
+    }
+    llama_moe_prefill_stage_submit_next(c, true);
+}
+
+ggml_tensor * llama_moe_prefill_stage_gate_warm(ggml_context * ctx0, ggml_tensor * selected_experts, void * cache) {
+    if (getenv("LLAMA_MOE_STAGE_IDSDBG")) {
+        LLAMA_LOG_WARN("MoE IDSDBG build-warm name=%s ne=[%d,%d] nb=[%zu,%zu,%zu,%zu] view=%d\n",
+                       selected_experts->name, (int) selected_experts->ne[0], (int) selected_experts->ne[1],
+                       selected_experts->nb[0], selected_experts->nb[1], selected_experts->nb[2],
+                       selected_experts->nb[3], selected_experts->view_src ? 1 : 0);
+    }
+    ggml_tensor * args[1] = { selected_experts };
+    return ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, 1, 1, 1, args, 1,
+                          llama_moe_prefill_stage_gate_warm_cb, 1, cache);
+}
+
+void llama_moe_stage_release(void) {
+    if (moe_env_on("LLAMA_MOE_STAGE_KEEP", false)) { return; } // keep the buffers for verify/decode
+    if (!g_stage_ok || !g_stage_bufs_ready) { return; }
+    std::lock_guard<std::mutex> lk(g_stage_mu);
+    if (g_stage_job) {
+        llama_moe_stage_job * job = g_stage_job;
+        g_stage_job = nullptr;
+        for (auto & th : job->threads) { th.join(); }
+        if (g_stage_backend) { ggml_backend_synchronize(g_stage_backend); }
+        delete job;
+    }
+    if (!g_stage_ok || !g_stage_bufs_ready) { return; }
+    {
+        std::lock_guard<std::mutex> lk2(g_moe_layer_mutex);
+        for (auto & kv : g_moe_layer_caches) {
+            llama_moe_layer_cache * c = kv.second;
+            if (!c) { continue; }
+            if (c->stage_wgt_host_buf) { ggml_backend_buffer_free(c->stage_wgt_host_buf); c->stage_wgt_host_buf = nullptr; }
+            c->stage_wgt_host = nullptr;
+            if (c->stage_sel_buf) { ggml_backend_buffer_free(c->stage_sel_buf); c->stage_sel_buf = nullptr; }
+            c->stage_sel_tensor = nullptr;
+            c->sel_max_tokens = 0;
+            if (c->stage_mask_buf) { ggml_backend_buffer_free(c->stage_mask_buf); c->stage_mask_buf = nullptr; }
+            c->stage_mask_tensor = nullptr;
+            c->mask_max_tokens = 0;
+            if (c->stage_ctx) { ggml_free(c->stage_ctx); c->stage_ctx = nullptr; }
+            c->stage_proj[0].clear();
+            c->stage_proj[1].clear();
+            c->stage_ready = false;
+        }
+    }
+    const size_t freed = g_stage_buf_bytes;
+    if (g_stage_backend) { ggml_backend_synchronize(g_stage_backend); }
+    for (int p = 0; p < 2; ++p) {
+        if (g_stage_buf[p]) { ggml_backend_buffer_free(g_stage_buf[p]); g_stage_buf[p] = nullptr; }
+    }
+    g_stage_bufs_ready = false;
+    g_stage_retired.store(true, std::memory_order_relaxed);
+    // Keep the staging backend and the small host arena: only the device buffers are returned.
+    // Later prefills fall back to the sweep; decode sizes its cache without the staging reserve.
+    LLAMA_LOG_INFO("MoE prefill stage: released %.0f MiB of staging VRAM after prefill.\n",
+                   (double) ((g_stage_single ? 1 : 2) * freed) / (1024.0 * 1024.0));
+}
+
+// One-shot phase switch: drop the staged-prefill buffers AND the small-cap caches built around their
+// reserve, so the next graph build recreates the caches at the normal (no-staging) capacity. The caller
+// must synchronize first: the just-finished graph still referenced those cache buffers.
+bool llama_moe_stage_end_prefill(ggml_backend_sched_t sched) {
+    if (moe_env_on("LLAMA_MOE_STAGE_KEEP", false)) { return false; }
+    if (!llama_moe_prefill_stage_enabled() || !g_stage_bufs_ready) { return false; }
+    {
+        std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
+        bool owned = false;
+        for (auto & kv : g_moe_layer_caches) {
+            if (kv.second && kv.second->sched == sched) { owned = true; break; }
+        }
+        if (!owned) { return false; }
+    }
+    // The loader reads RAM slots and publishes into cache slots that are about to disappear.
+    if (g_moe_loader_run.exchange(false)) {
+        if (g_moe_loader_thread.joinable()) {
+            g_moe_loader_thread.join();
+        }
+    }
+    llama_moe_stage_release(); // frees the device buffers and retires the staging reserve
+    std::lock_guard<std::mutex> lock(g_moe_layer_mutex);
+    std::vector<const llama_moe_layer_cache *> dropped;
+    for (auto it = g_moe_layer_caches.begin(); it != g_moe_layer_caches.end(); ) {
+        llama_moe_layer_cache * c = it->second;
+        if (!c || c->sched != sched) { ++it; continue; }
+        for (auto & pr : c->proj) {
+            if (pr.ram) {
+                llama_moe_ram_free(pr.ram, (size_t) c->ram_capacity * (size_t) pr.stride);
+                pr.ram = nullptr;
+            }
+            if (pr.fp)    { fclose(pr.fp);    pr.fp    = nullptr; }
+            if (pr.fp_ld) { fclose(pr.fp_ld); pr.fp_ld = nullptr; }
+        }
+        if (c->buffer) {
+            const uint64_t sz = (uint64_t) ggml_backend_buffer_get_size(c->buffer);
+            g_moe_layer_vram_bytes = g_moe_layer_vram_bytes > sz ? g_moe_layer_vram_bytes - sz : 0;
+            ggml_backend_buffer_free(c->buffer);
+            c->buffer = nullptr;
+        }
+        if (c->ctx) { ggml_free(c->ctx); c->ctx = nullptr; }
+        dropped.push_back(c);
+        delete c;
+        it = g_moe_layer_caches.erase(it);
+    }
+    for (auto & kv : g_moe_layer_caches) {
+        llama_moe_layer_cache * c = kv.second;
+        if (!c || !c->tier_lo) { continue; }
+        for (const llama_moe_layer_cache * d : dropped) {
+            if (c->tier_lo == d) { c->tier_lo = nullptr; break; }
+        }
+    }
+    g_stage_prefill_used.store(false, std::memory_order_relaxed);
+    int decode_cap = 0;
+    if (const char * e = getenv("LLAMA_MOE_STAGE_DECODE_CAP")) { decode_cap = atoi(e); }
+    g_moe_cached_cap    = decode_cap > 0 ? decode_cap : 0;
+    g_moe_cached_cap_lo = decode_cap > 0 ? decode_cap : 0;
+    g_moe_autocap_logged = false;
+    LLAMA_LOG_INFO("MoE prefill stage: retired; decode caches will rebuild (cap=%s).\n",
+                   decode_cap > 0 ? std::to_string(decode_cap).c_str() : "auto");
+    return true;
 }
 
 // map_custom1 callback: remap this step's routing ids [n_used,n_tokens] to cache-slot ids,
@@ -4319,6 +5659,19 @@ static std::atomic<uint64_t> g_vgate_sum_r{0};   // sum of the VRAM-or-RAM count
 static std::atomic<uint64_t> g_vgate_skip{0};    // draft-column misses skipped (would have been disk reads)
 static std::atomic<uint64_t> g_vgate_ram{0};     // draft-column misses loaded from the RAM pool
 static std::atomic<uint64_t> g_vgate_c0{0};      // column-0 misses loaded (the unavoidable set)
+// fork: disk-budget admission (LLAMA_MOE_VERIFY_DISK_MAX=N, with LLAMA_MOE_VERIFY_GATE=1). The first
+// reporting layer counts the union's disk-only misses; over the budget the batch serves column 0 only
+// (draft experts are never inspected or loaded) and no draft is accepted. Unlike the residency rule
+// above this needs no per-column exactness: it bounds the extra loading instead of forbidding it.
+static std::atomic<int32_t>  g_vgate_disk_max{-1}; // N, or -1 = residency rule only
+static std::atomic<int32_t>  g_vgate_decided{0};
+static std::atomic<int32_t>  g_vgate_draft_ok{1};
+static std::atomic<uint64_t> g_vgate_disk_sum{0};
+static std::atomic<uint64_t> g_vgate_reject{0};
+
+static bool llama_moe_verify_gate_budget_enabled(void) {
+    return g_vgate_disk_max.load(std::memory_order_relaxed) >= 0;
+}
 
 static bool llama_moe_verify_gate_enabled(void) {
     static const bool on = []() {
@@ -4364,6 +5717,13 @@ void llama_moe_verify_gate_arm(int32_t n_cols) {
     g_vgate_depth.store(n_cols - 1, std::memory_order_relaxed);
     g_vgate_depth_v.store(n_cols - 1, std::memory_order_relaxed);
     g_vgate_depth_r.store(n_cols - 1, std::memory_order_relaxed);
+    static const int32_t disk_max = []() {
+        const char * e = getenv("LLAMA_MOE_VERIFY_DISK_MAX");
+        return e ? (int32_t) atoi(e) : -1;
+    }();
+    g_vgate_disk_max.store(disk_max, std::memory_order_relaxed);
+    g_vgate_decided.store(0, std::memory_order_relaxed);
+    g_vgate_draft_ok.store(1, std::memory_order_relaxed);
     g_vgate_cols.store(n_cols, std::memory_order_release);
 }
 
@@ -4371,6 +5731,22 @@ int32_t llama_moe_verify_gate_max_accept(void) {
     const int32_t cols = g_vgate_cols.exchange(0, std::memory_order_acq_rel); // disarm
     if (cols < 2) {
         return -1; // gate off or not armed: no limit
+    }
+    if (llama_moe_verify_gate_budget_enabled()) {
+        const bool     ok = g_vgate_draft_ok.load(std::memory_order_acquire) != 0;
+        const uint64_t nb = g_vgate_batches.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!ok) { g_vgate_reject.fetch_add(1, std::memory_order_relaxed); }
+        if ((nb % 16) == 0) {
+            const double n = (double) nb;
+            LLAMA_LOG_WARN("MoE verify budget: max=%d | rejected %llu/%llu batches (%.0f%%) | "
+                           "union disk miss mean %.1f/layer\n",
+                           (int) g_vgate_disk_max.load(std::memory_order_relaxed),
+                           (unsigned long long) g_vgate_reject.load(std::memory_order_relaxed),
+                           (unsigned long long) nb,
+                           100.0 * (double) g_vgate_reject.load(std::memory_order_relaxed) / n,
+                           (double) g_vgate_disk_sum.load(std::memory_order_relaxed) / n);
+        }
+        return ok ? -1 : 0;
     }
     const int32_t  d  = g_vgate_depth.load(std::memory_order_relaxed);
     const int32_t  dv = g_vgate_depth_v.load(std::memory_order_relaxed);
@@ -4450,6 +5826,33 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     // if the callback is stalling on the mutex vs doing its own work. Printed in the timing block below.
     if (getenv("LLAMA_MOE_DIAG")) { g_diag_lockwait_ns += (uint64_t) (diag_t0 - diag_lock0); }
 
+    // fork disk-budget admission (LLAMA_MOE_VERIFY_DISK_MAX): decided once per verify batch, on the
+    // first reporting layer, from the union's disk-only misses. A rejected batch below inspects column 0
+    // only, so no draft expert is loaded and every draft position falls to a sentinel.
+    const bool vgate = llama_moe_verify_gate_enabled() && n_tokens > 1 &&
+                       g_vgate_cols.load(std::memory_order_acquire) == (int32_t) n_tokens;
+    const bool vgate_budget = vgate && llama_moe_verify_gate_budget_enabled();
+    bool vgate_draft_ok = true;
+    if (vgate_budget) {
+        if (g_vgate_decided.exchange(1, std::memory_order_acq_rel) == 0) {
+            int disk_miss = 0;
+            std::vector<char> seen((size_t) c->n_expert, 0);
+            for (int64_t p = 0; p < n; ++p) {
+                const int32_t e = flat[(size_t) p];
+                if (e < 0 || e >= c->n_expert || seen[(size_t) e]) { continue; }
+                seen[(size_t) e] = 1;
+                if (c->expert_slot[(size_t) e] < 0 && (c->ram_slot.empty() || c->ram_slot[(size_t) e] < 0)) {
+                    disk_miss++;
+                }
+            }
+            const int32_t dm = g_vgate_disk_max.load(std::memory_order_relaxed);
+            g_vgate_disk_sum.fetch_add((uint64_t) disk_miss, std::memory_order_relaxed);
+            g_vgate_draft_ok.store(disk_miss <= dm ? 1 : 0, std::memory_order_release);
+        }
+        vgate_draft_ok = g_vgate_draft_ok.load(std::memory_order_acquire) != 0;
+    }
+    const int64_t n_scan = (vgate_budget && !vgate_draft_ok) ? n_used : n;
+
     // new pin generation for this step; slots pinned by the previous step are now releasable
     const uint64_t gen = ++c->pin_gen;
 
@@ -4467,9 +5870,9 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         c->cpu_h2d_skip.assign((size_t) c->n_expert, 0);
     }
 
-    // per-expert selection frequency this step
+    // per-expert selection frequency this step (column 0 only for a rejected verify batch)
     std::vector<int> freq((size_t) c->n_expert, 0);
-    for (int64_t p = 0; p < n; ++p) {
+    for (int64_t p = 0; p < n_scan; ++p) {
         const int32_t e = flat[(size_t) p];
         if (e >= 0 && e < c->n_expert) {
             freq[(size_t) e]++;
@@ -4559,7 +5962,7 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         do_sync = true; // budget mode always loads its top-N misses (threshold no longer gates)
         pos_ranked.reserve((size_t) n_unique);
         std::vector<char> seen((size_t) c->n_expert, 0);
-        for (int64_t p = 0; p < n; ++p) {
+        for (int64_t p = 0; p < n_scan; ++p) {
             const int32_t e = flat[(size_t) p];
             if (e >= 0 && e < c->n_expert && !seen[(size_t) e]) {
                 seen[(size_t) e] = 1;
@@ -4650,11 +6053,9 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     // fork verify gate (LLAMA_MOE_VERIFY_GATE): armed only around a speculative verify llama_decode, so a
     // prefill ubatch of the same width can never reach this. vg_col0 marks the experts the committed
     // column needs - those are loaded unconditionally, exactly as a decode step would load them.
-    const bool vgate = llama_moe_verify_gate_enabled() && n_tokens > 1 &&
-                       g_vgate_cols.load(std::memory_order_acquire) == (int32_t) n_tokens;
     const bool vgate_ram = vgate && llama_moe_verify_gate_ram();
     std::vector<char> vg_col0;
-    if (vgate) {
+    if (vgate && !vgate_budget) {
         vg_col0.assign((size_t) c->n_expert, 0);
         for (int64_t u = 0; u < n_used; ++u) {
             const int32_t e = flat[(size_t) u];
@@ -4705,8 +6106,9 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
         }
         // fork verify gate: this miss belongs to a draft column only. A RAM-pool hit is a cheap H2D and
         // is still worth loading (it keeps the column exact, so it can be accepted); a disk-only miss is
-        // not, so skip it and let the post-load verdict below refuse the columns that needed it.
-        if (vgate && !vg_col0[(size_t) e]) {
+        // not, so skip it and let the post-load verdict below refuse the columns that needed it. Budget
+        // mode replaces this per-column rule: an admitted batch loads the whole union.
+        if (vgate && !vgate_budget && !vg_col0[(size_t) e]) {
             if (!vgate_ram || c->ram_slot.empty() || c->ram_slot[(size_t) e] < 0) {
                 g_vgate_skip.fetch_add(1, std::memory_order_relaxed);
                 continue;
@@ -4857,7 +6259,8 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     }
     llama_moe_layer_parallel_load(c, load_e, load_slot);
     c->step_cover = 0.0f; // consumed for this step; cov_cb re-sets it next step if coverage mode is on
-    g_diag_pl_ns    += (uint64_t) (ggml_time_us() - diag_pl0);
+    if (n_tokens > 1) { g_diag_vpl_ns += (uint64_t) (ggml_time_us() - diag_pl0); }
+    else              { g_diag_pl_ns  += (uint64_t) (ggml_time_us() - diag_pl0); }
     g_diag_sync_cnt += (uint64_t) load_e.size();
     // fork verify gate: per-column verdict AFTER this step's loads. expert_slot was already claimed for
     // every expert the loop decided to load, and left at -1 for every one it skipped (and for everything
@@ -5169,7 +6572,8 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
     // and no residual can be derived from them; H2D-batch is wall on the issuing thread. The LOADER line
     // is the background thread's own disk work over the same window: it is NOT part of parallel_load, so
     // it must be read as competition for the device and the disk, never as a component of the callback.
-    g_diag_cb_ns += (uint64_t) (ggml_time_us() - diag_t0);
+    if (n_tokens > 1) { g_diag_vcb_ns += (uint64_t) (ggml_time_us() - diag_t0); g_diag_vsteps++; }
+    else              { g_diag_cb_ns += (uint64_t) (ggml_time_us() - diag_t0); }
 
     // Always-on spill watch (NOT gated on LLAMA_MOE_DIAG). The startup audit only sees the state right
     // after allocation; the driver can start spilling later, once the graph's transients and the KV cache
@@ -5284,7 +6688,17 @@ static void llama_moe_layer_remap_cb(ggml_tensor * dst, const ggml_tensor * a, i
                                100.0 * (double) g_diag_ram_hit_lo / (double) g_diag_sync_cnt_lo,
                                (unsigned long long) (g_diag_sync_cnt_lo - g_diag_ram_hit_lo));
             }
+            if (g_diag_vsteps > 0) {
+                LLAMA_LOG_WARN("MoE verify timing: %llu layer-calls, callback avg %.2f ms, parallel_load "
+                               "%.2f ms (%.0f%% loading, %.2f ms other)\n",
+                               (unsigned long long) g_diag_vsteps,
+                               (double) g_diag_vcb_ns / 1000.0 / (double) g_diag_vsteps,
+                               (double) g_diag_vpl_ns / 1000.0 / (double) g_diag_vsteps,
+                               g_diag_vcb_ns ? 100.0 * (double) g_diag_vpl_ns / (double) g_diag_vcb_ns : 0.0,
+                               (double) (g_diag_vcb_ns - g_diag_vpl_ns) / 1000.0 / (double) g_diag_vsteps);
+            }
             g_diag_cb_ns = g_diag_pl_ns = g_diag_sync_cnt = g_diag_ram_hit = g_diag_lockwait_ns = g_diag_publish_ns = 0;
+            g_diag_vcb_ns = g_diag_vpl_ns = g_diag_vsteps = 0;
             g_diag_sync_cnt_lo = g_diag_ram_hit_lo = 0;
             g_diag_read_ns = 0; g_diag_h2d_ns = 0; g_diag_h2d_wall_ns = 0;
             g_diag_ldr_read_ns = 0; g_diag_ldr_h2d_ns = 0; g_diag_ldr_cnt = 0;
@@ -5654,6 +7068,43 @@ static std::atomic<uint64_t> g_sweep_passes{0};
 // on the experts it actually used. See llama_moe_refill_vram_caches.
 static std::atomic<bool> g_moe_sweep_dirty{false};
 
+static void llama_moe_stage_score_prefill(llama_moe_layer_cache * c, const int32_t * flat, int n_used, int n_tokens) {
+    if (!c || !c->weighted_evict || n_used <= 0 || n_tokens <= 0) { return; }
+    if ((int) c->expert_score.size() != c->n_expert) {
+        c->expert_score.assign((size_t) c->n_expert, 0.0f);
+    }
+    const float d = 0.97f;
+    float dn = 1.0f;
+    for (int t = 0; t < n_tokens; ++t) { dn *= d; }
+    for (float & s : c->expert_score) { s *= dn; }
+    float w = 1.0f;
+    for (int t = n_tokens - 1; t >= 0; --t) {
+        for (int u = 0; u < n_used; ++u) {
+            const int32_t e = flat[(size_t) (t * n_used + u)];
+            if (e >= 0 && e < c->n_expert) { c->expert_score[(size_t) e] += w / (float) (u + 1); }
+        }
+        w *= d;
+    }
+    std::vector<int> freq((size_t) c->n_expert, 0);
+    for (int64_t p = 0; p < (int64_t) n_used * n_tokens; ++p) {
+        const int32_t e = flat[(size_t) p];
+        if (e >= 0 && e < c->n_expert) { freq[(size_t) e]++; }
+    }
+    std::vector<int32_t> ranked;
+    ranked.reserve((size_t) c->n_expert);
+    for (int e = 0; e < c->n_expert; ++e) {
+        if (freq[(size_t) e] > 0) { ranked.push_back(e); }
+    }
+    std::sort(ranked.begin(), ranked.end(), [&](int32_t x, int32_t y) {
+        return freq[(size_t) x] != freq[(size_t) y] ? freq[(size_t) x] > freq[(size_t) y] : x < y;
+    });
+    if ((int) ranked.size() > c->capacity) { ranked.resize((size_t) c->capacity); }
+    c->freq_ranked = std::move(ranked);
+    c->sweep_dirty = true;
+    g_moe_sweep_dirty.store(true, std::memory_order_relaxed);
+}
+
+
 // fork: one pass of the prefill expert-group sweep (see llama_moe_layer_cache_remap_group in
 // llama-moe-stream.h for the design). Resolves residency for the experts of ONE static index group
 // and writes this group's slot ids. Deliberately much simpler than llama_moe_layer_remap_cb: no
@@ -5669,6 +7120,13 @@ static void llama_moe_layer_remap_group_cb(ggml_tensor * dst, const ggml_tensor 
     }
     const llama_moe_group_ud * ud = (const llama_moe_group_ud *) userdata;
     llama_moe_layer_cache *    c  = ud->c;
+    if (getenv("LLAMA_MOE_STAGE_DBG") && c && c->il == 0 && ud->e_lo == 0) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1, std::memory_order_relaxed) < 4) {
+            LLAMA_LOG_WARN("MoE SWEEP callback ran il=%d n_tokens=%d group_lo=%d\n", c->il,
+                           (int) a->ne[1], ud->e_lo);
+        }
+    }
 
     const int64_t n_used   = a->ne[0];
     const int64_t n_tokens = a->ne[1];

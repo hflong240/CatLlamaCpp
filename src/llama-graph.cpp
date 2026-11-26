@@ -2094,6 +2094,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // per-group ids tensor, so nothing is ever dropped. Only useful when capacity < n_expert (otherwise
     // there is one group and the plain path is already lossless).
     bool moe_prefill_sweep = false;
+    // fork: P1b prefill staging. A large prefill stages every expert of each layer into one of two
+    // shared VRAM buffers, one layer ahead of the compute. The graph then runs a single mul_mat_id over
+    // the real expert ids instead of the capacity-group sweep.
+    bool moe_prefill_stage = false;
+    bool moe_stage_all = false;
+    ggml_tensor * moe_stage_ids = nullptr;
+    int moe_stage_parity = 0;
     // A multi-token batch only needs the sweep if its expert union can OVERFLOW the cache. MTP /
     // speculative verify batches are k+1 fused decode steps, not prefill: their union fits, so the
     // ordinary remap is lossless (see the threshold override below) and - unlike the sweep - it does
@@ -2101,7 +2108,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // refill. n_tokens * n_expert_used is the zero-overlap worst case, which is what a static graph
     // decision has to assume: the real unique count is only known inside the callback.
     bool moe_union_fits = false;
-    if (moe_lc && moe_stream && moe_stream_async && n_tokens > 1 && llama_moe_prefill_sweep_enabled()) {
+    if (moe_lc && moe_stream && moe_stream_async && n_tokens > 1) {
         const int cap = llama_moe_layer_cache_capacity(moe_lc);
         // Every projection must resolve to a device cache tensor. If any does not, mm_id_exps would fall
         // through to the compaction gather, which builds the FULL expert set - each group would then
@@ -2110,8 +2117,37 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                             (!gate_exps    || llama_moe_layer_cache_dev(moe_lc, gate_exps))    &&
                             (!up_exps      || llama_moe_layer_cache_dev(moe_lc, up_exps))      &&
                             (!down_exps    || llama_moe_layer_cache_dev(moe_lc, down_exps));
-        moe_union_fits    = cap > 0 && (int64_t) n_tokens * n_expert_used <= (int64_t) cap;
-        moe_prefill_sweep = cap > 0 && cap < (int) n_expert && dev_ok && !moe_union_fits;
+        moe_union_fits = cap > 0 && (int64_t) n_tokens * n_expert_used <= (int64_t) cap;
+        const bool stage_candidate =
+            llama_moe_prefill_stage_enabled() && il >= 0 && il < llama_moe_prefill_stage_layer_max() &&
+            (int64_t) n_tokens * n_expert_used >= (int64_t) llama_moe_prefill_stage_min_picks() &&
+            cap > 0 && cap < (int) n_expert && !moe_union_fits && dev_ok;
+        const bool stage_init_ok = stage_candidate && llama_moe_layer_cache_stage_init(moe_lc);
+        if (getenv("LLAMA_MOE_STAGE_DBG") && il == 0) {
+            LLAMA_LOG_WARN("MoE stage dbg: n_tokens=%d enabled=%d recap=%d cap=%d union=%d dev_ok=%d "
+                           "candidate=%d init=%d\n", (int) n_tokens,
+                           llama_moe_prefill_stage_enabled() ? 1 : 0,
+                           llama_moe_recap_pending() ? 1 : 0, cap, moe_union_fits ? 1 : 0,
+                           dev_ok ? 1 : 0, stage_candidate ? 1 : 0, stage_init_ok ? 1 : 0);
+        }
+        if (stage_init_ok) {
+            const int parity = (il >= 0 ? il : 0) & 1;
+            const bool proj_ok =
+                (!gate_up_exps || llama_moe_layer_cache_stage_dev(moe_lc, gate_up_exps, parity)) &&
+                (!gate_exps    || llama_moe_layer_cache_stage_dev(moe_lc, gate_exps, parity))    &&
+                (!up_exps      || llama_moe_layer_cache_stage_dev(moe_lc, up_exps, parity))      &&
+                (!down_exps    || llama_moe_layer_cache_stage_dev(moe_lc, down_exps, parity));
+            if (proj_ok) {
+                moe_prefill_stage = true;
+                moe_stage_parity  = parity;
+                const char * all_env = getenv("LLAMA_MOE_STAGE_ALL");
+                moe_stage_all = all_env ? moe_env_on("LLAMA_MOE_STAGE_ALL", true)
+                                        : n_tokens >= llama_moe_prefill_stage_all_min_tokens();
+            }
+        }
+        if (!moe_prefill_stage && llama_moe_prefill_sweep_enabled()) {
+            moe_prefill_sweep = cap > 0 && cap < (int) n_expert && dev_ok && !moe_union_fits;
+        }
         if (moe_prefill_sweep && n_tokens <= 64 && llama_moe_layer_cache_decoded(moe_lc)) {
             // Small multi-token batch arriving after decode has started: a speculative/MTP verify
             // batch too wide for the cache. Every such step sweeps AND dirties the caches, so the next
@@ -2163,7 +2199,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // path chain so a decline falls back cleanly to the ordinary paths.
         ggml_tensor * moe_pack = nullptr;
         ggml_tensor * moe_tw   = nullptr;
-        if (!moe_prefill_sweep && moe_lc_lo && n_tokens <= 1 && ok_shape) {
+        if (!moe_prefill_sweep && !moe_prefill_stage && moe_lc_lo && n_tokens <= 1 && ok_shape) {
             // Fuse the two tiers into one ggml_mul_mat_id_2t per projection when both caches are on CUDA
             // (the only backend that implements the op). On by default: byte-identical to the two-pass path
             // below (verified at runtime, --temp 0, fixed seed, NOLOADER=1). LLAMA_MOE_TIER_FUSED=0 forces
@@ -2178,8 +2214,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 moe_tw = llama_moe_layer_cache_tier_weights(moe_lc);
             }
         }
-        if (moe_prefill_sweep) {
-            // ids are built per expert group further down; leave moe_cache_ids null
+        if (moe_prefill_sweep || moe_prefill_stage) {
+            // ids are built per expert group / staging buffer further down; leave moe_cache_ids null
         } else if (moe_pack && moe_tier_fused) {
             // FUSED: row block 0 = unified ids, row block 1 = tier selector. One build_experts pass
             // (further down) feeds both to ggml_mul_mat_id_2t; no mask / complement / sum.
@@ -2281,6 +2317,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // assignment for the whole layer (moe_cache_ids), shared across gate/up/down: a CPU
         // threshold sync-load on prefill, a pure-GPU get_rows on decode.
         if (moe_stream_async) {
+            // fork: P1b prefill staging. The staging buffer holds every expert in expert-index order,
+            // so the real ids are also the slot ids and no remap table is involved.
+            if (moe_prefill_stage && ids == moe_stage_ids) {
+                ggml_tensor * staged = llama_moe_layer_cache_stage_dev(moe_lc, exps, moe_stage_parity);
+                if (staged) {
+                    return ggml_mul_mat_id(ctx0, staged, input, ids);
+                }
+            }
             if (moe_lc && ids) {
                 ggml_tensor * dev = llama_moe_layer_cache_dev(moe_lc, exps);
                 if (dev) {
@@ -2395,6 +2439,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // expert-matmul input x for offline substitution analysis. Byte-identical no-op when the env is unset,
     // and placed AFTER the router logits (computed above) so routing is never perturbed by the capture.
     ggml_tensor * moe_in = llama_moe_trace_capture_x(ctx0, cur, il);
+
+    if (moe_prefill_stage) {
+        // The staging gate waits for this layer's staged experts and starts staging layer il+1. It is
+        // a 1.0 multiplier on the MoE input, so it is exact and the scheduler must run it before the
+        // expert matmuls. The routing ids stay the device tensor selected_experts; staging is
+        // expert-index ordered, so the real ids are also the staging slots.
+        llama_moe_layer_cache_stage_set_all(moe_lc, moe_stage_all);
+        ggml_tensor * gate = llama_moe_prefill_stage_gate(ctx0, selected_experts, moe_lc);
+        moe_in = ggml_mul(ctx0, moe_in, gate);
+        cb(moe_in, "ffn_moe_stage_gate", il);
+        moe_stage_ids = selected_experts;
+    }
 
     auto build_experts = [&](ggml_tensor * ids) -> ggml_tensor * {
     cur = moe_in;
@@ -2635,6 +2691,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (experts) {
             cb(experts, "ffn_moe_sweep_sum", il);
         }
+    }
+    if (!experts && moe_prefill_stage) {
+        experts = build_experts(moe_stage_ids);
     }
     if (!experts && moe_ids_lo && moe_mask) {
         // fork: TWO-TIER DECODE SUM (--moe-expert-gguf-low). The same FFN is evaluated twice - once

@@ -895,6 +895,19 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
 
     std::vector<std::deque<feat_row>> pending;
 
+    // Draft-ahead diagnostic (dspark): the remote decodes the whole block, so its drafts past the
+    // requested columns predict the next anchor. Count how often the target's sampled token actually
+    // matches that prediction; that ratio is what decides whether an ahead run can skip a sync.
+    struct ahead_prev {
+        std::vector<llama_token> all;
+        int  n_draft = 0;
+        bool full    = false;
+    };
+
+    std::vector<ahead_prev> ahead;
+    uint64_t ahead_n   = 0;
+    uint64_t ahead_hit = 0;
+
     struct draft_result {
         bool ok         = false;
         bool need_reset = false;
@@ -910,6 +923,7 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
                 this->params.n_max, this->params.n_min, this->params.p_min, this->params.remote_endpoint.c_str());
 
         states.resize(n_seq);
+        ahead.resize(n_seq);
 
         if (this->params.remote_endpoint.empty()) {
             LOG_ERR("%s: no remote endpoint specified, disabling remote drafting\n", __func__);
@@ -1255,6 +1269,23 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
     draft_result draft_request(llama_seq_id seq_id, const common_speculative_draft_params & dp, int32_t n_max) {
         draft_result result;
 
+        if (dspark && seq_id >= 0 && seq_id < (llama_seq_id) ahead.size()) {
+            auto & ap = ahead[seq_id];
+            if (ap.full && ap.all.size() > (size_t) ap.n_draft) {
+                ++ahead_n;
+                if (dp.id_last == ap.all[(size_t) ap.n_draft]) {
+                    ++ahead_hit;
+                }
+                if ((ahead_n % 16) == 0) {
+                    LOG_WRN("%s: draft-ahead anchor match %llu/%llu (%.0f%%), n_draft=%d block=%zu\n",
+                            __func__, (unsigned long long) ahead_hit, (unsigned long long) ahead_n,
+                            100.0 * (double) ahead_hit / (double) ahead_n, ap.n_draft, ap.all.size());
+                }
+            }
+            ap.full = false;
+            ap.all.clear();
+        }
+
         if (dspark) {
             if (!ensure_weights()) {
                 return result;
@@ -1343,6 +1374,14 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
                 if (row.pos < dp.n_past) {
                     row.sent = true;
                 }
+            }
+            if (seq_id >= 0 && seq_id < (llama_seq_id) ahead.size() && j.contains("all")) {
+                auto & ap = ahead[seq_id];
+                ap.all.clear();
+                for (const auto & id : j["all"]) {
+                    ap.all.push_back((llama_token) id.get<int32_t>());
+                }
+                ap.n_draft = (int) result.tokens.size();
             }
         }
 
@@ -1444,8 +1483,17 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (is_other || seq_id < 0 || seq_id >= (llama_seq_id) ahead.size()) {
+            return;
+        }
+        auto & ap = ahead[seq_id];
+        // an ahead continuation is only meaningful when every requested column was accepted: otherwise
+        // the next anchor is the target's own sample, not the next draft, and the chain must resync
+        ap.full = !ap.all.empty() && (int) n_accepted == ap.n_draft;
+        if (!ap.full) {
+            ap.all.clear();
+        }
     }
 
     bool need_embd() const override {
