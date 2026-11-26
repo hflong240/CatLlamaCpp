@@ -1023,6 +1023,8 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
 
             dspark = j.value("dspark", false);
             remote_weights_ready = j.value("weights_ready", false);
+            // a restarted draft server has no weights: upload again on reconnect
+            weights_sent = remote_weights_ready;
             if (dspark) {
                 char arch[64] = {};
                 if (llama_model_meta_val_str(llama_get_model(params.ctx_tgt), "general.architecture", arch, sizeof(arch)) < 0 ||
