@@ -19,8 +19,43 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
+
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
+
+// Append raw bytes for the feature-dump diagnostic. Win32 handles on Windows: a streaming MoE process
+// already sits at the CRT fd/stream limit and both fopen and _open fail with EMFILE there.
+static bool common_spec_dump_append(const char * path, const void * data, size_t bytes) {
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    const BOOL ok = WriteFile(h, data, (DWORD) bytes, &written, nullptr);
+    CloseHandle(h);
+    return ok && written == (DWORD) bytes;
+#else
+    FILE * f = fopen(path, "ab");
+    if (!f) {
+        return false;
+    }
+    const bool ok = fwrite(data, 1, bytes, f) == bytes;
+    fclose(f);
+    return ok;
+#endif
+}
 #include <deque>
 #include <iomanip>
 #include <map>
@@ -913,6 +948,9 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
     // transfer cost (the request carries the target features).
     double   gen_ms_sum  = 0.0;
     double   wall_ms_sum = 0.0;
+    double   inj_ms_sum  = 0.0;
+    double   dec_ms_sum  = 0.0;
+    double   smp_ms_sum  = 0.0;
     uint64_t gen_n       = 0;
 
     struct draft_result {
@@ -1339,11 +1377,23 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
             }
 
             if (!fpos.empty()) {
+                // Diagnostic (LLAMA_SPEC_FEAT_DUMP=path): sample raw feature payloads for offline
+                // lossless-compression experiments. First 8 requests only.
+                static const char * dump_path = getenv("LLAMA_SPEC_FEAT_DUMP");
+                static int          dump_n    = 0;
+                if (dump_path && dump_n < 8 && !feat.empty()) {
+                    const bool ok = common_spec_dump_append(dump_path, feat.data(), feat.size() * sizeof(float));
+                    LOG_WRN("%s: feat dump %d -> '%s': %s (%zu floats)\n", __func__, dump_n, dump_path,
+                            ok ? "ok" : strerror(errno), feat.size());
+                    ++dump_n;
+                }
                 // The payload dominates a slow link (61 KB/token as f32, plus base64). f16 halves it and
                 // the drafter's inputs tolerate the precision. LLAMA_SPEC_FEAT_F16=0 sends f32.
+                // Default off: on dsv4.1 it halved the link payload (100 -> 50 ms/call) but dropped
+                // acceptance from 94% to 50% - the drafter's feature injection is precision-sensitive.
                 static const bool feat_f16 = []() {
                     const char * e = getenv("LLAMA_SPEC_FEAT_F16");
-                    return !e || atoi(e) != 0;
+                    return e && atoi(e) != 0;
                 }();
                 if (feat_f16) {
                     std::vector<ggml_fp16_t> h(feat.size());
@@ -1413,11 +1463,15 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
             if (gen_ms >= 0.0) {
                 gen_ms_sum  += gen_ms;
                 wall_ms_sum += wall_ms;
+                inj_ms_sum  += j.value("inj_ms", 0.0);
+                dec_ms_sum  += j.value("dec_ms", 0.0);
+                smp_ms_sum  += j.value("smp_ms", 0.0);
                 const uint64_t gn = ++gen_n;
                 if ((gn % 16) == 0) {
-                    LOG_WRN("%s: remote draft timing: gen avg %.1f ms, wall avg %.1f ms (net+transfer %.1f ms)\n",
-                            __func__, gen_ms_sum / gn, wall_ms_sum / gn,
-                            (wall_ms_sum - gen_ms_sum) / gn);
+                    LOG_WRN("%s: remote draft timing: gen avg %.1f ms (inject %.1f, decode %.1f, "
+                            "sample %.1f), wall avg %.1f ms (net+transfer %.1f ms)\n",
+                            __func__, gen_ms_sum / gn, inj_ms_sum / gn, dec_ms_sum / gn,
+                            smp_ms_sum / gn, wall_ms_sum / gn, (wall_ms_sum - gen_ms_sum) / gn);
                 }
             }
         }

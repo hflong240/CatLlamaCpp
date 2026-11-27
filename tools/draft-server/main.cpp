@@ -431,6 +431,7 @@ struct draft_server {
         }
 
         llama_memory_t mem = llama_get_memory(ctx);
+        const auto t_inj0 = std::chrono::steady_clock::now();
 
         for (size_t i = 0; i < feat_pos.size(); ++i) {
             if (feat_pos[i] < 0 || feat_pos[i] >= n_past) {
@@ -485,6 +486,9 @@ struct draft_server {
             cache_max = rel_pos.back();
         }
 
+        const double inj_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_inj0).count();
+
         if (block_pos < 0) {
             return make_error("invalid draft position");
         }
@@ -524,10 +528,14 @@ struct draft_server {
             common_batch_add(batch, i == 0 ? id_last : mask_token_id, block_pos + i, { seq_id }, true);
         }
 
+        const auto t_dec0 = std::chrono::steady_clock::now();
         if (llama_decode(ctx, batch) != 0) {
             return make_error("failed to decode the draft block");
         }
+        const double dec_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_dec0).count();
 
+        const auto t_smp0 = std::chrono::steady_clock::now();
         common_sampler_reset(smpls[seq_id].get());
 
         const float * conf = has_conf ? llama_get_embeddings_nextn(ctx) : nullptr;
@@ -566,6 +574,8 @@ struct draft_server {
             common_sampler_accept(smpls[seq_id].get(), id, true);
             out.push_back(id);
         }
+        const double smp_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_smp0).count();
 
         if ((int32_t) out.size() < std::max(0, std::min(n_min, n_max))) {
             out.clear();
@@ -581,6 +591,9 @@ struct draft_server {
         j["tokens"] = out;
         j["all"]    = out_all;
         j["gen_ms"] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_gen0).count();
+        j["inj_ms"] = inj_ms;
+        j["dec_ms"] = dec_ms;
+        j["smp_ms"] = smp_ms;
         return j;
     }
 
