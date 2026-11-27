@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <clocale>
 #include <cstdlib>
 #include <cstring>
@@ -350,6 +351,7 @@ struct draft_server {
     }
 
     json handle_draft_dspark(const json & req) {
+        const auto t_gen0 = std::chrono::steady_clock::now();
         const int32_t seq_id  = req.value("seq", -1);
         const int32_t n_past  = req.value("n_past", -1);
         const int32_t id_last = req.value("id_last", -1);
@@ -567,6 +569,7 @@ struct draft_server {
         j["ok"]     = true;
         j["tokens"] = out;
         j["all"]    = out_all;
+        j["gen_ms"] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_gen0).count();
         return j;
     }
 

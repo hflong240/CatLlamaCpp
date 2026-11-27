@@ -145,16 +145,68 @@ actually reach for:
 | `--no-warmup` | - | On `llama-server`, the startup warmup consumes the one-shot staged prefill; pass this flag if you want the first real prompt to use staging. |
 | `LLAMA_MOE_IO_THREADS=N` | `16` | Parallel disk-read threads for expert loads. Raise on fast NVMe. |
 | `LLAMA_MOE_H2D_RING=N` | `2` | Overlaps expert H2D with expert reads. A read submits its copy (disk staging or a RAM/mmap source) as soon as its bytes are available, instead of waiting for the whole read phase; staged slots are ringed so a slot is reused only after the device drains. `0` restores the old shape. Decode loads one unit per thread and never wraps, so `1` and `2` are identical there - use `1` to halve the pinned memory; raise to 3-4 only if a staged prefill still spends time in the drain. Costs `N x io_threads x projections x expert_slab` of pinned host memory. Measured on dsv4.1 Q2 / 4090D decode: +11% at normal system pressure, +19-27% under memory pressure, output md5 unchanged. |
-| `LLAMA_MOE_FUSED=1` | off | Fused CUDA MoE-FFN op (eliminates the per-layer scheduler split). Quality-identical, but measured decode is ~20% *slower* on the disk/H2D-bound streaming path, so it is off by default. Enable only where the split, not the load, dominates. |
+| `LLAMA_MOE_FUSED=1` | off | Fused CUDA MoE-FFN op (eliminates the per-layer scheduler split). Quality-identical. Measured -2 to -3% on the current H2D-overlap decode path (it was ~20% slower before that overlap), so it is off by default. Enable only where the split, not the load, dominates. |
 | `LLAMA_MOE_CPU_LANE_H2D_ONLY=1` | off | Decode-only CPU expert lane: compute sync-load misses on the CPU instead of H2D. Requires `LLAMA_MOE_FUSED=1`. |
-| `LLAMA_MOE_CPU_LANE_MAX_PER_LAYER=N` | all eligible | Max experts per layer handed to the CPU lane. `1` is the measured optimum on DeepSeek-V4.1. |
+| `LLAMA_MOE_CPU_LANE_MAX_PER_LAYER=N` | all eligible | Max experts per layer handed to the CPU lane. On dsv4.1 UD-Q2_K_XL / 4090D the lane measured negative in every shape tested (0.76-1.09x), so no value is recommended there. |
 | `LLAMA_MOE_CPU_LANE_THREADS=N` | `LLAMA_MOE_IO_THREADS` | CPU-lane worker threads. `12` with the background loader active. |
 | `LLAMA_MOE_DIAG=1` | off | Print decode miss-rate, per-token timing, top-2 residency, and the per-step prefill breakdown (loader time, disk vs H2D, RAM-pool hit rate). |
+
+### Recommended profiles
+
+Measured on DeepSeek-V4.1-Flash UD-Q2_K_XL (40 layers, 384 experts, 6 used) / RTX 4090D 24 GB / 64 GB RAM,
+`llama-server -c 8192 -np 1 -ub 2048 -fa on -ngl 99 -fit off --moe-stream-async`. Decode quality is the
+full-expert setting (`SYNC_BUDGET=6 SYNC_COVER=0`); other MoEs and other VRAM/RAM sizes need their own sweep.
+
+**Decode (production, full experts).**
+
+```sh
+LLAMA_MOE_SYNC_BUDGET=6 LLAMA_MOE_SYNC_COVER=0 \
+LLAMA_MOE_H2D_RING=2 \
+llama-server -m <shard-1-of-N> --moe-stream-async -fit off -c 8192 -np 1 -ub 2048 -fa on -ngl 99
+```
+
+Warm decode 3.4-3.9 tok/s on the reference machine. `H2D_RING=2` overlaps expert copies with the reads
+(+11% warm, +19-27% when the machine is under memory pressure; output md5 unchanged). `CACHE_CAP` and
+`RAM_CAP` are left to the auto sizer - sweep them on the target device, because a cap past the real
+headroom makes the driver page the working set and run slower.
+
+**Long prompts (agentic prefill).** Layer-ahead staging, one shot per process:
+
+```sh
+LLAMA_MOE_PREFILL_STAGE=1 LLAMA_MOE_STAGE_SINGLE=1 LLAMA_MOE_STAGE_ALL=0 \
+llama-server -m <shard-1-of-N> --moe-stream-async -fit off -c 8192 -np 1 -ub 2048 -fa on -ngl 99 --no-warmup
+```
+
+1.63x prefill at 1.17k tokens, 1.77x at 4.7k, byte-identical to the sweep. The startup warmup consumes
+the one-shot staging, hence `--no-warmup`. If the first prompt is followed by drafting, set
+`LLAMA_MOE_STAGE_DECODE_CAP` to `(n_max + 1) * n_expert_used` so the rebuilt decode cache still fits the
+verify batch; otherwise the auto sizer decides.
+
+**Remote draft.** Sequential verification is the only mode that does not lose to no-draft:
+
+```sh
+LLAMA_SPEC_SEQUENTIAL=1 LLAMA_MOE_H2D_RING=2 \
+  --spec-draft-remote HOST:PORT --spec-draft-n-max 2 --spec-draft-p-min 0
+```
+
+3.75-3.79 tok/s with output md5 identical to a no-draft run; the remote request is hidden behind the
+anchor decode. Batch verification (the default when `LLAMA_SPEC_SEQUENTIAL` is unset) measures 2.3-2.5
+tok/s here: every draft column loads its own expert union and the remote round trip is on the critical
+path.
+
+**Measured negative - leave these off on this class of hardware.** Batch verify (2.3-2.5 vs 3.75
+sequential); `LLAMA_MOE_VERIFY_GATE` / `LLAMA_MOE_VERIFY_DISK_MAX` (96-97% of drafts rejected, 0.92
+tok/s); `LLAMA_MOE_FUSED=1` (-2 to -3%); the CPU expert lane in every tested shape (0.76-1.09x: the
+per-layer join serializes once the CPU GEMV outlasts the GPU matmul); `--spec-draft-n-max 1` (0.98-1.00x);
+`--no-mmap` (needs a 191 GB host buffer and fails to load); `LLAMA_DSV41_SPARSE=0` (neutral).
 
 The staging path is one-shot per process: the first staged prefill uses it, then the buffers are released and the decode caches are rebuilt at `LLAMA_MOE_STAGE_DECODE_CAP` (or auto). On `llama-server`, the startup warmup consumes that one shot unless `--no-warmup` is passed; later prefills fall back to the sweep. Measured on dsv4.1 UD-Q2_K_XL / 4090D with `STAGE_SINGLE=1`, `STAGE_ALL=0`: 1.63x at a 1.17k prompt and 1.77x at 4.7k versus the sweep, with byte-identical output.
 
 The CPU lane is not byte-identical to the GPU path: measured Mean KLD 0.0134 / Same-top 96.2% on
-DeepSeek-V4.1 with `MAX_PER_LAYER=1`, and ~1.3-1.4x decode. Leave it off when full-expert parity matters.
+DeepSeek-V4.1 with `MAX_PER_LAYER=1`. The earlier ~1.3-1.4x decode figure came from a different
+model/engine; on dsv4.1 UD-Q2_K_XL / 4090D it measured 0.76-1.09x across MAX_PER_LAYER, lane-thread and
+IO-thread combinations, because the per-layer join serializes whenever the CPU GEMV outlasts the GPU
+matmul. Leave it off when full-expert parity matters.
 
 If the auto sizer overcommits (OOM) or leaves too little headroom (paging), nudge `LLAMA_MOE_VRAM_RESERVE_MB`
 (VRAM held free, default 3072) or `LLAMA_MOE_RAM_RESERVE_MB` (system RAM held free, default 5120). Further
@@ -324,10 +376,11 @@ each request. No target weights are needed on the draft machine in advance.
   single-token decodes. Sequential verification decodes one anchor token on the normal single-token path,
   runs the remote draft request on a worker thread while that decode runs, and checks drafts one by one.
   A rejected draft never enters the target KV, so no checkpoint or rollback is needed. On dsv4.1 Q2 /
-  RTX 4090D this measured 3.34-3.45 tok/s (290-300 ms/token) versus 2.23 tok/s for batch verification,
-  with `graphs reused=127` and output md5 identical to a no-draft run. It does not beat no-draft (one
-  target decode per token is the floor); it makes remote drafting free instead of a 30-50% regression.
-  Only the remote draft implementation is affected.
+  RTX 4090D this measured 3.75-3.79 tok/s versus 2.3-2.5 tok/s for batch verification (an earlier
+  3.34-3.45 was a colder system state), with output md5 identical to a no-draft run. See
+  "Recommended profiles" above for the full command. It does not beat no-draft (one target decode per
+  token is the floor); it makes remote drafting free instead of a 30-50% regression. Only the remote
+  draft implementation is affected.
 - **Matching sequence geometry.** `-c` and `-np` must give the same per-sequence context on both sides
   (`n_ctx / n_parallel`), and the draft server must expose at least as many sequences as the target's `-np`.
 - **Partial KV removal.** The draft context must support removing a partial sequence (standard attention KV

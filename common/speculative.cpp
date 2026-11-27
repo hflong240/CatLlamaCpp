@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <iomanip>
@@ -908,6 +909,12 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
     uint64_t ahead_n   = 0;
     uint64_t ahead_hit = 0;
 
+    // Remote timing split: the server reports its own generate time, so wall - gen is the network and
+    // transfer cost (the request carries the target features).
+    double   gen_ms_sum  = 0.0;
+    double   wall_ms_sum = 0.0;
+    uint64_t gen_n       = 0;
+
     struct draft_result {
         bool ok         = false;
         bool need_reset = false;
@@ -1337,7 +1344,9 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
             }
         }
 
+        const auto t_req0 = std::chrono::steady_clock::now();
         auto res = cli->Post("/draft", req.dump(), "application/json");
+        const double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_req0).count();
         if (!res) {
             LOG_ERR("%s: draft request failed for seq %d: %s\n", __func__, (int) seq_id,
                     httplib::to_string(res.error()).c_str());
@@ -1384,6 +1393,17 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
                     ap.all.push_back((llama_token) id.get<int32_t>());
                 }
                 ap.n_draft = (int) result.tokens.size();
+            }
+            const double gen_ms = j.value("gen_ms", -1.0);
+            if (gen_ms >= 0.0) {
+                gen_ms_sum  += gen_ms;
+                wall_ms_sum += wall_ms;
+                const uint64_t gn = ++gen_n;
+                if ((gn % 16) == 0) {
+                    LOG_WRN("%s: remote draft timing: gen avg %.1f ms, wall avg %.1f ms (net+transfer %.1f ms)\n",
+                            __func__, gen_ms_sum / gn, wall_ms_sum / gn,
+                            (wall_ms_sum - gen_ms_sum) / gn);
+                }
             }
         }
 
