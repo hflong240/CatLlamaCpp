@@ -6,6 +6,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "llama.h"
+#include "ggml.h"
 
 #include "../src/llama-ext.h"
 
@@ -408,11 +409,21 @@ struct draft_server {
         std::vector<float> feat;
         if (req.contains("feat") && req["feat"].is_string()) {
             const std::string raw = base64::decode(req["feat"].get<std::string>());
-            if (raw.size() % sizeof(float) != 0) {
-                return make_error("invalid feature payload");
+            const bool feat_f16 = req.value("feat_f16", false);
+            if (feat_f16) {
+                if (raw.size() % sizeof(ggml_fp16_t) != 0) {
+                    return make_error("invalid feature payload");
+                }
+                const size_t n = raw.size() / sizeof(ggml_fp16_t);
+                feat.resize(n);
+                ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(raw.data()), feat.data(), (int64_t) n);
+            } else {
+                if (raw.size() % sizeof(float) != 0) {
+                    return make_error("invalid feature payload");
+                }
+                feat.resize(raw.size() / sizeof(float));
+                std::memcpy(feat.data(), raw.data(), raw.size());
             }
-            feat.resize(raw.size() / sizeof(float));
-            std::memcpy(feat.data(), raw.data(), raw.size());
 
             if (feat.size() != feat_pos.size() * (size_t) feat_dim) {
                 return make_error("feature payload does not match feat_pos");

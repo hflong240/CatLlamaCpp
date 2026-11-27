@@ -1322,7 +1322,7 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
             }
 
             std::vector<llama_pos> fpos;
-            std::string feat;
+            std::vector<float>     feat;
 
             for (const auto & row : q) {
                 if (row.sent) {
@@ -1335,12 +1335,27 @@ struct common_speculative_impl_draft_remote : public common_speculative_impl {
                     feat.clear();
                 }
                 fpos.push_back(row.pos);
-                feat.append(reinterpret_cast<const char *>(row.data.data()), row.data.size() * sizeof(float));
+                feat.insert(feat.end(), row.data.begin(), row.data.end());
             }
 
             if (!fpos.empty()) {
+                // The payload dominates a slow link (61 KB/token as f32, plus base64). f16 halves it and
+                // the drafter's inputs tolerate the precision. LLAMA_SPEC_FEAT_F16=0 sends f32.
+                static const bool feat_f16 = []() {
+                    const char * e = getenv("LLAMA_SPEC_FEAT_F16");
+                    return !e || atoi(e) != 0;
+                }();
+                if (feat_f16) {
+                    std::vector<ggml_fp16_t> h(feat.size());
+                    ggml_fp32_to_fp16_row(feat.data(), h.data(), (int64_t) feat.size());
+                    req["feat_f16"] = true;
+                    req["feat"]     = base64::encode(reinterpret_cast<const char *>(h.data()),
+                                                     h.size() * sizeof(ggml_fp16_t));
+                } else {
+                    req["feat"] = base64::encode(reinterpret_cast<const char *>(feat.data()),
+                                                 feat.size() * sizeof(float));
+                }
                 req["feat_pos"] = fpos;
-                req["feat"]     = base64::encode(feat.data(), feat.size());
             }
         }
 
