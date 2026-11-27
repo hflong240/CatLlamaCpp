@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <clocale>
 #include <cstdlib>
 #include <cstring>
@@ -547,32 +548,44 @@ struct draft_server {
 
         for (int32_t i = 0; i < n_pred; ++i) {
             const int32_t row = i + (sample_from_anchor ? 0 : 1);
-
-            common_sampler_sample(smpls[seq_id].get(), ctx, row, true);
-
-            const llama_token_data_array * cur_p = common_sampler_get_candidates(smpls[seq_id].get(), true);
-            if (cur_p == nullptr || cur_p->size == 0) {
+            const float * logits = llama_get_logits_ith(ctx, row);
+            if (logits == nullptr) {
                 break;
             }
-
-            const llama_token id = cur_p->data[0].id;
-            out_all.push_back(id);
+            // The sampler is top_k = 1, so argmax is exactly the sampled token. The generic sampler
+            // builds and sorts the full 128k candidate list for every row (~9 ms each here).
+            int32_t id   = 0;
+            float   best = logits[0];
+            for (int32_t v = 1; v < n_vocab; ++v) {
+                if (logits[v] > best) {
+                    best = logits[v];
+                    id   = v;
+                }
+            }
+            out_all.push_back((llama_token) id);
 
             if (i >= n_draft) {
                 continue; // beyond the requested columns: diagnostic only
             }
 
             if (p_min > 0.0f) {
-                if (conf != nullptr && conf[(size_t) row * n_embd_draft] < p_min) {
-                    break;
-                }
-                if (conf == nullptr && cur_p->data[0].p < p_min) {
-                    break;
+                if (conf != nullptr) {
+                    if (conf[(size_t) row * n_embd_draft] < p_min) {
+                        break;
+                    }
+                } else {
+                    double s = 0.0;
+                    for (int32_t v = 0; v < n_vocab; ++v) {
+                        s += std::exp((double) (logits[v] - best));
+                    }
+                    if (s <= 0.0 || (float) (1.0 / s) < p_min) {
+                        break;
+                    }
                 }
             }
 
-            common_sampler_accept(smpls[seq_id].get(), id, true);
-            out.push_back(id);
+            common_sampler_accept(smpls[seq_id].get(), (llama_token) id, true);
+            out.push_back((llama_token) id);
         }
         const double smp_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_smp0).count();
